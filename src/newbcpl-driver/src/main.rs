@@ -70,7 +70,19 @@ fn main() -> ExitCode {
                 ExitCode::from(2)
             }
         },
-        "dump-cfg" | "dump-ir" | "dump-llvm" | "dump-asm" => {
+        "dump-ir" => match args.next() {
+            Some(path_arg) => {
+                let path = PathBuf::from(path_arg);
+                println!("{}", newbcpl_ir::dump_ir(&path));
+                ExitCode::SUCCESS
+            }
+            None => {
+                eprintln!("dump-ir: missing source path");
+                print_usage();
+                ExitCode::from(2)
+            }
+        },
+        "dump-cfg" | "dump-llvm" | "dump-asm" => {
             // Honour the same calling convention as dump-tokens so a script
             // that already invokes `newbcpl-driver dump-X foo.bcl` keeps
             // working as the phases come online.

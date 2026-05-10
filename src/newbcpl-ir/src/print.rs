@@ -1,0 +1,167 @@
+//! Stable textual dump of a NewBCPL IR `Module`.
+//!
+//! Output shape is roughly LLVM-flavoured but BCPL-specific. One
+//! function block per `Function`, each block labelled, instructions
+//! indented, terminator on its own line. SSA values render as
+//! `%N`, blocks as `bbN`.
+//!
+//! This format is what `dump-ir` emits — it's the canonical artifact
+//! for review and regression testing.
+
+use std::fmt::Write as _;
+
+use crate::ir::*;
+
+pub fn render(module: &Module) -> String {
+    let mut out = String::new();
+    writeln!(out, "module {}", module.name).unwrap();
+    if !module.layouts.is_empty() {
+        writeln!(out, "  layouts: {}", module.layouts.len()).unwrap();
+    }
+    for f in &module.functions {
+        out.push('\n');
+        render_function(f, &mut out);
+    }
+    out
+}
+
+fn render_function(f: &Function, out: &mut String) {
+    let params: Vec<String> = f
+        .params
+        .iter()
+        .map(|p| format!("%{} : {}  ({})", p.in_value.0, p.hint.as_str(), p.name))
+        .collect();
+    writeln!(
+        out,
+        "function {} ({}) -> {}",
+        f.name,
+        params.join(", "),
+        f.return_hint.as_str()
+    )
+    .unwrap();
+    for block in &f.blocks {
+        render_block(block, out);
+    }
+}
+
+fn render_block(block: &BasicBlock, out: &mut String) {
+    writeln!(out, "  bb{}: {}", block.id.0, block.label).unwrap();
+    for instr in &block.instrs {
+        writeln!(out, "    {}", render_instr(instr)).unwrap();
+    }
+    writeln!(out, "    {}", render_terminator(&block.terminator)).unwrap();
+}
+
+fn render_instr(i: &Instr) -> String {
+    match i {
+        Instr::Const { dst, value, hint } => {
+            format!(
+                "%{} = const {} : {}",
+                dst.0,
+                render_const(value),
+                hint.as_str()
+            )
+        }
+        Instr::Alloca { dst, hint, name } => {
+            format!("%{} = alloca {} ({})", dst.0, hint.as_str(), name)
+        }
+        Instr::Load { dst, slot, hint } => {
+            format!("%{} = load %{} : {}", dst.0, slot.0, hint.as_str())
+        }
+        Instr::Store { slot, value } => {
+            format!("store {} -> %{}", render_value(value), slot.0)
+        }
+        Instr::BinOp {
+            dst,
+            op,
+            lhs,
+            rhs,
+            hint,
+        } => {
+            format!(
+                "%{} = {} {}, {} : {}",
+                dst.0,
+                op.as_str(),
+                render_value(lhs),
+                render_value(rhs),
+                hint.as_str()
+            )
+        }
+        Instr::UnaryOp {
+            dst,
+            op,
+            operand,
+            hint,
+        } => {
+            format!(
+                "%{} = {} {} : {}",
+                dst.0,
+                op.as_str(),
+                render_value(operand),
+                hint.as_str()
+            )
+        }
+        Instr::Call {
+            dst,
+            callee,
+            args,
+            hint,
+        } => {
+            let args_str = args
+                .iter()
+                .map(render_value)
+                .collect::<Vec<_>>()
+                .join(", ");
+            match dst {
+                Some(d) => format!(
+                    "%{} = call {}({}) : {}",
+                    d.0,
+                    render_value(callee),
+                    args_str,
+                    hint.as_str()
+                ),
+                None => format!("call {}({})", render_value(callee), args_str),
+            }
+        }
+    }
+}
+
+fn render_terminator(t: &Terminator) -> String {
+    match t {
+        Terminator::Return(None) => "return".to_string(),
+        Terminator::Return(Some(v)) => format!("return {}", render_value(v)),
+        Terminator::Branch(b) => format!("br bb{}", b.0),
+        Terminator::CondBranch {
+            cond,
+            then_block,
+            else_block,
+        } => {
+            format!(
+                "br {} ? bb{} : bb{}",
+                render_value(cond),
+                then_block.0,
+                else_block.0
+            )
+        }
+        Terminator::Unreachable => "unreachable".to_string(),
+    }
+}
+
+fn render_value(v: &Value) -> String {
+    match v {
+        Value::Const(c) => render_const(c),
+        Value::Local(id) => format!("%{}", id.0),
+        Value::Function(name) => format!("@{name}"),
+        Value::Unit => "<unit>".to_string(),
+    }
+}
+
+fn render_const(c: &Const) -> String {
+    match c {
+        Const::Int(v) => format!("{v}"),
+        Const::Float(v) => format!("{v}"),
+        Const::Bool(b) => format!("{b}"),
+        Const::Null => "?".to_string(),
+        Const::String(s) => s.clone(),
+    }
+}

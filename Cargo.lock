@@ -109,6 +109,7 @@ dependencies = [
 name = "newbcpl-ir"
 version = "0.1.0"
 dependencies = [
+ "newbcpl-parser",
  "newbcpl-sema",
 ]
 

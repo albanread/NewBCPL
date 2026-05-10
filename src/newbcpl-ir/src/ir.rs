@@ -1,0 +1,261 @@
+//! NewBCPL typed IR.
+//!
+//! Sits between the typed AST (`newbcpl-parser` + `newbcpl-sema`) and
+//! LLVM IR emission. Designed to be LLVM-friendly:
+//!
+//! - Each function is a CFG of basic blocks. Blocks end in a single
+//!   terminator. No fallthrough — control flow is explicit.
+//! - Locals are stack slots produced by `Alloca`; reading a local is
+//!   an explicit `Load`, writing is a `Store`. This avoids the need
+//!   for phi nodes in the front-end IR; LLVM's mem2reg pass promotes
+//!   the slots to registers later.
+//! - Every `ValueId` is single-assignment. Mutation of a source-level
+//!   variable goes through stores to its slot.
+//! - Every instruction that produces a value records its `TypeHint`
+//!   so codegen can pick LLVM types directly without re-deriving.
+//!
+//! Object layouts come along from sema as `ClassLayout` records;
+//! they're passed to codegen alongside the Module.
+
+use newbcpl_sema::ClassLayout;
+use newbcpl_sema::TypeHint;
+
+/// Every `Module` corresponds to one .bcl translation unit.
+#[derive(Debug, Clone)]
+pub struct Module {
+    pub name: String,
+    pub functions: Vec<Function>,
+    pub layouts: Vec<ClassLayout>,
+}
+
+/// Stable, monotonically-allocated identifier for a value produced
+/// inside a function. Renders as `%N` in dumps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ValueId(pub u32);
+
+/// Stable identifier for a basic block within a function. Renders
+/// as `bb<N>` in dumps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct BlockId(pub u32);
+
+#[derive(Debug, Clone)]
+pub struct Function {
+    pub name: String,
+    /// Parameters in declaration order. Each carries its own
+    /// alloca'd slot so the body can store into it on entry.
+    pub params: Vec<Param>,
+    /// Inferred result hint from sema. Routines are `Word`.
+    pub return_hint: TypeHint,
+    pub blocks: Vec<BasicBlock>,
+    pub entry: BlockId,
+}
+
+#[derive(Debug, Clone)]
+pub struct Param {
+    pub name: String,
+    pub hint: TypeHint,
+    /// Stack slot allocated for this parameter at function entry,
+    /// so the body sees it through the same Load/Store dance as
+    /// local LET bindings.
+    pub slot: ValueId,
+    /// SSA value representing the incoming parameter; the entry
+    /// block stores this into `slot`.
+    pub in_value: ValueId,
+}
+
+#[derive(Debug, Clone)]
+pub struct BasicBlock {
+    pub id: BlockId,
+    pub label: String,
+    pub instrs: Vec<Instr>,
+    pub terminator: Terminator,
+}
+
+#[derive(Debug, Clone)]
+pub enum Instr {
+    /// Pure constant materialisation. Most uses inline constants
+    /// directly in `Value::Const`; this exists for cases where
+    /// codegen prefers a named slot.
+    Const {
+        dst: ValueId,
+        value: Const,
+        hint: TypeHint,
+    },
+    /// Allocate a stack slot for a local or parameter.
+    Alloca {
+        dst: ValueId,
+        hint: TypeHint,
+        name: String,
+    },
+    /// Load from a stack slot.
+    Load {
+        dst: ValueId,
+        slot: ValueId,
+        hint: TypeHint,
+    },
+    /// Store to a stack slot.
+    Store {
+        slot: ValueId,
+        value: Value,
+    },
+    /// Binary operator. The op encodes int / float family already so
+    /// codegen doesn't need to look at operand hints again.
+    BinOp {
+        dst: ValueId,
+        op: IrBinOp,
+        lhs: Value,
+        rhs: Value,
+        hint: TypeHint,
+    },
+    UnaryOp {
+        dst: ValueId,
+        op: IrUnOp,
+        operand: Value,
+        hint: TypeHint,
+    },
+    /// Direct call. `callee` is either a `Value::Function(name)` for
+    /// a known function or a `Value::Local(...)` for an indirect call.
+    Call {
+        dst: Option<ValueId>,
+        callee: Value,
+        args: Vec<Value>,
+        hint: TypeHint,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub enum Terminator {
+    /// Return from the function. `Some(v)` for functions; routines
+    /// return `None`.
+    Return(Option<Value>),
+    /// Unconditional branch.
+    Branch(BlockId),
+    /// Conditional branch on `cond` (treated as nonzero = true).
+    CondBranch {
+        cond: Value,
+        then_block: BlockId,
+        else_block: BlockId,
+    },
+    /// Marker for blocks reached only via fallthrough that we never
+    /// expect to execute (e.g. dead block after `RETURN`). Codegen
+    /// emits an `unreachable` instruction.
+    Unreachable,
+}
+
+#[derive(Debug, Clone)]
+pub enum Value {
+    Const(Const),
+    /// SSA local — a value produced by a previous instruction.
+    Local(ValueId),
+    /// Reference to a function by source-level name. Codegen
+    /// resolves to the actual function pointer (intra-module link
+    /// or extern symbol).
+    Function(String),
+    /// `Unit` — for routine call results that don't produce a value.
+    /// Codegen ignores this when it appears as a function arg
+    /// (shouldn't happen in well-formed programs).
+    Unit,
+}
+
+#[derive(Debug, Clone)]
+pub enum Const {
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+    Null,
+    /// Raw lexeme including surrounding quotes and unprocessed
+    /// `*`-escape sequences. Codegen cooks the escapes when
+    /// emitting the string-table entry.
+    String(String),
+}
+
+/// IR binary operations. The op variant encodes integer-vs-float
+/// family choice that sema's flow analysis settled on, so codegen
+/// just maps directly to the corresponding LLVM instruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IrBinOp {
+    // Integer arithmetic
+    IAdd,
+    ISub,
+    IMul,
+    IDiv,
+    IRem,
+    // Float arithmetic
+    FAdd,
+    FSub,
+    FMul,
+    FDiv,
+    // Bitwise / logical
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
+    // Integer relational (result is Int 0 or 1)
+    ICmpEq,
+    ICmpNe,
+    ICmpLt,
+    ICmpLe,
+    ICmpGt,
+    ICmpGe,
+    // Float relational
+    FCmpEq,
+    FCmpNe,
+    FCmpLt,
+    FCmpLe,
+    FCmpGt,
+    FCmpGe,
+}
+
+impl IrBinOp {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IrBinOp::IAdd => "iadd",
+            IrBinOp::ISub => "isub",
+            IrBinOp::IMul => "imul",
+            IrBinOp::IDiv => "idiv",
+            IrBinOp::IRem => "irem",
+            IrBinOp::FAdd => "fadd",
+            IrBinOp::FSub => "fsub",
+            IrBinOp::FMul => "fmul",
+            IrBinOp::FDiv => "fdiv",
+            IrBinOp::BitAnd => "and",
+            IrBinOp::BitOr => "or",
+            IrBinOp::BitXor => "xor",
+            IrBinOp::Shl => "shl",
+            IrBinOp::Shr => "shr",
+            IrBinOp::ICmpEq => "icmp.eq",
+            IrBinOp::ICmpNe => "icmp.ne",
+            IrBinOp::ICmpLt => "icmp.lt",
+            IrBinOp::ICmpLe => "icmp.le",
+            IrBinOp::ICmpGt => "icmp.gt",
+            IrBinOp::ICmpGe => "icmp.ge",
+            IrBinOp::FCmpEq => "fcmp.eq",
+            IrBinOp::FCmpNe => "fcmp.ne",
+            IrBinOp::FCmpLt => "fcmp.lt",
+            IrBinOp::FCmpLe => "fcmp.le",
+            IrBinOp::FCmpGt => "fcmp.gt",
+            IrBinOp::FCmpGe => "fcmp.ge",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IrUnOp {
+    /// Integer / word negation.
+    INeg,
+    /// Float negation.
+    FNeg,
+    /// Bitwise NOT.
+    Not,
+}
+
+impl IrUnOp {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IrUnOp::INeg => "ineg",
+            IrUnOp::FNeg => "fneg",
+            IrUnOp::Not => "not",
+        }
+    }
+}
