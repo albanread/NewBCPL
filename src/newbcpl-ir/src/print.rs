@@ -157,6 +157,29 @@ fn render_instr(i: &Instr) -> String {
             byte_offset,
             render_value(value)
         ),
+        Instr::IndirectLoad { dst, addr, hint } => format!(
+            "%{} = iload [{}] : {}",
+            dst.0,
+            render_value(addr),
+            hint.as_str()
+        ),
+        Instr::IndirectStore { addr, value } => format!(
+            "istore [{}], {}",
+            render_value(addr),
+            render_value(value)
+        ),
+        Instr::Gep {
+            dst,
+            base,
+            index,
+            element_bytes,
+        } => format!(
+            "%{} = gep {}, {} * {}",
+            dst.0,
+            render_value(base),
+            render_value(index),
+            element_bytes
+        ),
         Instr::MethodCall {
             dst,
             receiver,

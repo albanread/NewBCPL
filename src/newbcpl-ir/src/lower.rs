@@ -589,13 +589,11 @@ impl<'a> Lowerer<'a> {
                     }
                 }
                 Expr::Binary {
-                    op: newbcpl_parser::BinaryOp::Dot,
+                    op: BinaryOp::Dot,
                     lhs,
                     rhs,
                     ..
                 } => {
-                    // `obj.field := value` — resolve field offset
-                    // from the receiver's class layout.
                     if let (Some(class_name), Expr::Ident { name: field, .. }) =
                         (self.class_name_of_expr(lhs), rhs.as_ref())
                     {
@@ -610,8 +608,40 @@ impl<'a> Lowerer<'a> {
                         }
                     }
                 }
+                Expr::Binary {
+                    op,
+                    lhs,
+                    rhs,
+                    ..
+                } if subscript_stride_and_hint(*op).is_some() => {
+                    // `v!i := value`, `v%i := value`, `v.%i := value`.
+                    // Compute the address via GEP and emit an
+                    // IndirectStore — symmetric with the rvalue path.
+                    let stride = subscript_stride_and_hint(*op).unwrap().0;
+                    let addr = self.lower_subscript_address(lhs, rhs, stride);
+                    self.b().emit(Instr::IndirectStore { addr, value: v });
+                }
+                Expr::Unary {
+                    op: UnaryOp::Indirection,
+                    operand,
+                    ..
+                } => {
+                    // `!ptr := value`.
+                    let addr = self.lower_expr(operand);
+                    self.b().emit(Instr::IndirectStore { addr, value: v });
+                }
+                Expr::Unary {
+                    op: UnaryOp::CharIndirection,
+                    operand,
+                    ..
+                } => {
+                    // `%ptr := value` — codegen handles the byte-store.
+                    let addr = self.lower_expr(operand);
+                    self.b().emit(Instr::IndirectStore { addr, value: v });
+                }
                 _ => {
-                    // Subscript / indirection lvalues fall through.
+                    // Other lvalue forms (lane access, bitfield write)
+                    // not yet lowered.
                 }
             }
         }
@@ -769,6 +799,19 @@ impl<'a> Lowerer<'a> {
     }
 
     fn lower_binary(&mut self, op: BinaryOp, lhs: &Expr, rhs: &Expr, hint: TypeHint) -> Value {
+        // Subscript family: `v ! i` / `v % i` / `v .% i` lower to
+        // GEP + IndirectLoad. The element stride and result hint
+        // depend on the subscript variant.
+        if let Some((stride, load_hint)) = subscript_stride_and_hint(op) {
+            let addr = self.lower_subscript_address(lhs, rhs, stride);
+            let dst = self.b().alloc_value();
+            self.b().emit(Instr::IndirectLoad {
+                dst,
+                addr,
+                hint: load_hint,
+            });
+            return Value::Local(dst);
+        }
         // Member access (`obj.field`) lowers through the class
         // layout, not the generic binary-op path. RHS is an Ident.
         if matches!(op, BinaryOp::Dot | BinaryOp::Of) {
@@ -811,16 +854,78 @@ impl<'a> Lowerer<'a> {
     }
 
     fn lower_unary(&mut self, op: UnaryOp, operand: &Expr, hint: TypeHint) -> Value {
-        let v = self.lower_expr(operand);
-        let Some(ir_op) = unop_to_ir(op, operand.hint()) else {
-            return Value::Const(Const::Null);
-        };
+        match op {
+            UnaryOp::Indirection => {
+                // `!ptr` — load a word from address ptr.
+                let addr = self.lower_expr(operand);
+                let dst = self.b().alloc_value();
+                self.b().emit(Instr::IndirectLoad {
+                    dst,
+                    addr,
+                    hint: TypeHint::Word,
+                });
+                Value::Local(dst)
+            }
+            UnaryOp::AddressOf => {
+                // `@x` — for a local Ident, the alloca'd slot IS the
+                // address (LLVM-style). Other forms (`@v!i`,
+                // `@obj.field`) need GEP-style address compute,
+                // deferred for now.
+                if let Expr::Ident { name, .. } = operand {
+                    if let Some(slot) = self.b().lookup_local_slot(name) {
+                        return Value::Local(slot);
+                    }
+                }
+                Value::Const(Const::Null)
+            }
+            UnaryOp::CharIndirection => {
+                // `%ptr` — load a single byte from address ptr,
+                // zero-extended to a word. Codegen emits `i8 load
+                // -> zext i64`.
+                let addr = self.lower_expr(operand);
+                let dst = self.b().alloc_value();
+                self.b().emit(Instr::IndirectLoad {
+                    dst,
+                    addr,
+                    hint: TypeHint::Int,
+                });
+                Value::Local(dst)
+            }
+            _ => {
+                let v = self.lower_expr(operand);
+                let Some(ir_op) = unop_to_ir(op, operand.hint()) else {
+                    return Value::Const(Const::Null);
+                };
+                let dst = self.b().alloc_value();
+                self.b().emit(Instr::UnaryOp {
+                    dst,
+                    op: ir_op,
+                    operand: v,
+                    hint,
+                });
+                Value::Local(dst)
+            }
+        }
+    }
+
+    /// Compute an element address for `base SUBSCRIPT index`. Used
+    /// by the subscript family for both rvalue loads and lvalue
+    /// stores. `element_bytes` controls the stride (1 for chars,
+    /// 8 for words / floats / pointers).
+    fn lower_subscript_address(
+        &mut self,
+        base: &Expr,
+        index: &Expr,
+        element_bytes: usize,
+    ) -> Value {
+        let base_v = self.lower_expr(base);
+        let index_v = self.lower_expr(index);
         let dst = self.b().alloc_value();
-        self.b().emit(Instr::UnaryOp {
+        self.b().emit(Instr::Gep {
             dst,
-            op: ir_op,
-            operand: v,
-            hint,
+            base: base_v,
+            index: index_v,
+            element_bytes,
         });
         Value::Local(dst)
     }
@@ -1025,6 +1130,21 @@ fn binop_to_ir(op: BinaryOp, lhs: TypeHint, rhs: TypeHint) -> Option<IrBinOp> {
         Subscript | Bitfield | CharSubscript | FloatSubscript | Dot | Of | LaneAccess => {
             return None;
         }
+    })
+}
+
+/// Map a subscript-family `BinaryOp` to its `(element_bytes, load_hint)`
+/// pair. Word vectors (`v!i`) use 8-byte stride and load WORD; char
+/// vectors (`v%i`) use 1-byte stride and load INT (zero-extended);
+/// float vectors (`v.%i`) use 8-byte stride and load FLOAT.
+/// Returns `None` for non-subscript binary ops so callers can route
+/// them to the regular binop path.
+fn subscript_stride_and_hint(op: BinaryOp) -> Option<(usize, TypeHint)> {
+    Some(match op {
+        BinaryOp::Subscript => (8, TypeHint::Word),
+        BinaryOp::CharSubscript => (1, TypeHint::Int),
+        BinaryOp::FloatSubscript => (8, TypeHint::Float),
+        _ => return None,
     })
 }
 

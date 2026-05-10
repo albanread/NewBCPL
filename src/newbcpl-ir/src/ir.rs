@@ -157,6 +157,29 @@ pub enum Instr {
         args: Vec<Value>,
         hint: TypeHint,
     },
+    /// `!ptr` — load the value at an address. Used for both prefix
+    /// `!ptr` and the result of subscript-family lowering
+    /// (`v!i` / `v%i` / `v.%i`) after the GEP step.
+    IndirectLoad {
+        dst: ValueId,
+        addr: Value,
+        hint: TypeHint,
+    },
+    /// `!ptr := value` — store a value at an address.
+    IndirectStore {
+        addr: Value,
+        value: Value,
+    },
+    /// `base + index * element_bytes` — pointer arithmetic for
+    /// subscripts. `element_bytes` is 8 for word vectors (`v!i`),
+    /// 1 for char vectors (`v%i`), 8 for float vectors (`v.%i`,
+    /// where each element is a 64-bit double).
+    Gep {
+        dst: ValueId,
+        base: Value,
+        index: Value,
+        element_bytes: usize,
+    },
 }
 
 #[derive(Debug, Clone)]

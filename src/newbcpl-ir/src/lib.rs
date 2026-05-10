@@ -56,7 +56,7 @@ pub fn dump_ir(path: &Path) -> String {
 mod tests {
     use super::*;
     use newbcpl_parser::parse_source;
-    use newbcpl_sema::analyze;
+    use newbcpl_sema::{TypeHint, analyze};
 
     fn lower_source(source: &str) -> Module {
         let program = parse_source(source).expect("parse");
@@ -506,6 +506,111 @@ mod tests {
             b.instrs.iter().any(|i| matches!(i, Instr::FieldLoad { .. }))
         });
         assert!(has_field_load, "expected FieldLoad after LET alias");
+    }
+
+    // ─── indirection + subscripts ───────────────────────────────
+
+    #[test]
+    fn prefix_indirection_emits_iload() {
+        let m = lower_source("LET S(p) BE { LET v = !p }");
+        let s = function(&m, "S");
+        let entry = &s.blocks[0];
+        let has_iload = entry
+            .instrs
+            .iter()
+            .any(|i| matches!(i, Instr::IndirectLoad { .. }));
+        assert!(has_iload, "expected IndirectLoad");
+    }
+
+    #[test]
+    fn prefix_indirection_assignment_stores_to_address() {
+        let m = lower_source("LET S(p) BE { !p := 42 }");
+        let s = function(&m, "S");
+        let entry = &s.blocks[0];
+        let has_istore = entry
+            .instrs
+            .iter()
+            .any(|i| matches!(i, Instr::IndirectStore { .. }));
+        assert!(has_istore, "expected IndirectStore");
+    }
+
+    #[test]
+    fn address_of_local_returns_slot() {
+        let m = lower_source("LET S() BE { LET x = 5\n LET p = @x }");
+        let s = function(&m, "S");
+        // No new instruction for @x — it just passes the slot
+        // ValueId. Verify by counting Stores: x's init + p's init
+        // (which stores the slot ValueId of x).
+        let entry = &s.blocks[0];
+        let store_count = entry
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, Instr::Store { .. }))
+            .count();
+        assert_eq!(store_count, 2);
+    }
+
+    #[test]
+    fn vec_subscript_uses_word_stride() {
+        let m = lower_source("LET S() BE { LET v = VEC 10\n LET x = v!3 }");
+        let s = function(&m, "S");
+        let entry = &s.blocks[0];
+        // GEP with element_bytes=8 (BCPL word).
+        let has_gep = entry.instrs.iter().any(|i| matches!(
+            i,
+            Instr::Gep { element_bytes: 8, .. }
+        ));
+        let has_iload = entry
+            .instrs
+            .iter()
+            .any(|i| matches!(i, Instr::IndirectLoad { .. }));
+        assert!(has_gep, "expected GEP with stride 8");
+        assert!(has_iload, "expected IndirectLoad after GEP");
+    }
+
+    #[test]
+    fn float_vec_subscript_loads_float() {
+        let m = lower_source("LET S() BE { LET fv = FVEC 10\n LET x = fv.%3 }");
+        let s = function(&m, "S");
+        let entry = &s.blocks[0];
+        // The IndirectLoad for `.%` carries FLOAT hint.
+        let has_float_load = entry.instrs.iter().any(|i| matches!(
+            i,
+            Instr::IndirectLoad {
+                hint: TypeHint::Float,
+                ..
+            }
+        ));
+        assert!(has_float_load, "expected float-typed IndirectLoad");
+    }
+
+    #[test]
+    fn char_vec_subscript_uses_byte_stride() {
+        let m = lower_source("LET S(s) BE { LET c = s%5 }");
+        let s = function(&m, "S");
+        let entry = &s.blocks[0];
+        let has_byte_gep = entry.instrs.iter().any(|i| matches!(
+            i,
+            Instr::Gep { element_bytes: 1, .. }
+        ));
+        assert!(has_byte_gep, "expected GEP with stride 1");
+    }
+
+    #[test]
+    fn vec_subscript_assignment_stores_via_address() {
+        let m = lower_source("LET S() BE { LET v = VEC 10\n v!3 := 42 }");
+        let s = function(&m, "S");
+        let entry = &s.blocks[0];
+        let has_istore = entry
+            .instrs
+            .iter()
+            .any(|i| matches!(i, Instr::IndirectStore { .. }));
+        let has_gep = entry
+            .instrs
+            .iter()
+            .any(|i| matches!(i, Instr::Gep { .. }));
+        assert!(has_gep, "expected GEP for index");
+        assert!(has_istore, "expected IndirectStore for vec[i] := value");
     }
 
     #[test]
