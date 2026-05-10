@@ -2044,6 +2044,36 @@ impl Parser {
                         hint: unknown_hint(),
                     });
                 }
+                // Paren-initialiser form: `VEC(a, b, c)` —
+                // semantically equivalent to `VEC [a, b, c]`.
+                // The reference's corpus mixes both syntaxes; the
+                // bracket form is the original BCPL, the paren
+                // form a later sugar. Trailing comma tolerated
+                // (`VEC(a, b,)` and `VEC()`).
+                if self.check_sym("(") {
+                    self.eat();
+                    let mut args = Vec::new();
+                    if !self.check_sym(")") {
+                        args.push(self.parse_expr()?);
+                        while self.check_sym(",") {
+                            self.eat();
+                            if self.check_sym(")") {
+                                break;
+                            }
+                            args.push(self.parse_expr()?);
+                        }
+                    }
+                    let close = self.expect_sym(")")?;
+                    return Ok(Expr::TypedConstruct {
+                        kind,
+                        args,
+                        span: SourceSpan {
+                            start: tok.span.start,
+                            end: close.span.end,
+                        },
+                        hint: unknown_hint(),
+                    });
+                }
                 let size = self.parse_unary()?;
                 let span = SourceSpan {
                     start: tok.span.start,
