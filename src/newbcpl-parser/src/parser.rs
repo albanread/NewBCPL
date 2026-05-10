@@ -139,14 +139,180 @@ impl Parser {
 
     fn parse_decl(&mut self) -> Result<Decl, ParseError> {
         if self.check_kw("LET") {
-            self.parse_let_decl()
+            return self.parse_let_decl();
+        }
+        if self.check_kw("GET") {
+            return self.parse_get_decl();
+        }
+        if self.check_kw("MANIFEST") {
+            return self.parse_manifest_decl();
+        }
+        if self.check_kw("STATIC") {
+            return self.parse_static_decl();
+        }
+        if self.check_kw("GLOBAL") || self.check_kw("GLOBALS") {
+            return self.parse_global_decl();
+        }
+        let span = self.peek().span;
+        let lex = self.peek().lexeme.clone();
+        Err(ParseError::new(
+            format!("expected declaration, got `{lex}`"),
+            span,
+        ))
+    }
+
+    /// `GET "filename"` — include directive. The path is the raw lexeme
+    /// of the string literal *with* its surrounding quotes stripped;
+    /// `*`-escapes are not cooked here (sema or the file resolver does it).
+    fn parse_get_decl(&mut self) -> Result<Decl, ParseError> {
+        let kw = self.eat();
+        let tok = self.peek().clone();
+        if tok.kind != TokenKind::String {
+            return Err(ParseError::new(
+                format!("expected string literal after GET, got `{}`", tok.lexeme),
+                tok.span,
+            ));
+        }
+        self.pos += 1;
+        let path = strip_quotes(&tok.lexeme).to_string();
+        let span = SourceSpan {
+            start: kw.span.start,
+            end: tok.span.end,
+        };
+        Ok(Decl::Get(GetDirective { path, span }))
+    }
+
+    /// `MANIFEST $( name = expr; name = expr; ... $)`.
+    fn parse_manifest_decl(&mut self) -> Result<Decl, ParseError> {
+        let kw = self.eat();
+        let bindings = self.parse_named_bindings_block(true)?;
+        let span = SourceSpan {
+            start: kw.span.start,
+            end: bindings
+                .last()
+                .map(|b| b.span.end)
+                .unwrap_or(kw.span.end),
+        };
+        Ok(Decl::Manifest(NamedBindingsDecl { bindings, span }))
+    }
+
+    /// Two forms:
+    ///   `STATIC name`                           — single bare declaration
+    ///   `STATIC $( name = expr; ... $)`         — block of initialised statics
+    fn parse_static_decl(&mut self) -> Result<Decl, ParseError> {
+        let kw = self.eat();
+        let bindings = if self.check_sym("$(") || self.check_sym("{") {
+            self.parse_named_bindings_block(false)?
         } else {
-            let span = self.peek().span;
-            let lex = self.peek().lexeme.clone();
-            Err(ParseError::new(
-                format!("expected declaration, got `{lex}`"),
-                span,
-            ))
+            // Bare `STATIC name` — record one binding with no initializer.
+            let name_tok = self.eat_identifier()?;
+            vec![NamedBinding {
+                name: name_tok.lexeme,
+                value: None,
+                span: name_tok.span,
+            }]
+        };
+        let span = SourceSpan {
+            start: kw.span.start,
+            end: bindings
+                .last()
+                .map(|b| b.span.end)
+                .unwrap_or(kw.span.end),
+        };
+        Ok(Decl::Static(NamedBindingsDecl { bindings, span }))
+    }
+
+    /// `GLOBAL $( name : offset; ... $)` (classic) or
+    /// `GLOBALS $( LET name = expr; ... $)` (dialect). Both forms share
+    /// the same AST node; only the binding values' meaning differs.
+    fn parse_global_decl(&mut self) -> Result<Decl, ParseError> {
+        let kw = self.eat();
+        let bindings = self.parse_named_bindings_block(false)?;
+        let span = SourceSpan {
+            start: kw.span.start,
+            end: bindings
+                .last()
+                .map(|b| b.span.end)
+                .unwrap_or(kw.span.end),
+        };
+        Ok(Decl::Global(NamedBindingsDecl { bindings, span }))
+    }
+
+    /// Parse a `$( … $)` or `{ … }` block of named bindings used by
+    /// `MANIFEST`, `STATIC`, `GLOBAL`, and `GLOBALS`. Each binding is one
+    /// of:
+    ///   `name = expr`        (MANIFEST, STATIC initialised, GLOBALS-with-LET-stripped)
+    ///   `name : expr`        (GLOBAL classic offset)
+    ///   `name`               (STATIC bare, when `init_required` is false)
+    ///   `LET name = expr`    (GLOBALS modern form; the LET is consumed and ignored)
+    ///
+    /// Bindings are separated by `;` or by a newline (any `;` is consumed
+    /// silently). When `init_required` is true, an initialiser is
+    /// mandatory (MANIFEST never omits values).
+    fn parse_named_bindings_block(
+        &mut self,
+        init_required: bool,
+    ) -> Result<Vec<NamedBinding>, ParseError> {
+        let open = self.eat();
+        let close_lex = match open.lexeme.as_str() {
+            "$(" => "$)",
+            "{" => "}",
+            other => {
+                return Err(ParseError::new(
+                    format!("expected `$(` or `{{` to open block, got `{other}`"),
+                    open.span,
+                ));
+            }
+        };
+        let mut bindings = Vec::new();
+        loop {
+            // Consume any number of separators (`;`).
+            while self.check_sym(";") {
+                self.eat();
+            }
+            if self.is_at_end() {
+                return Err(ParseError::new(
+                    format!("unterminated block — expected `{close_lex}`"),
+                    open.span,
+                ));
+            }
+            if self.check_sym(close_lex) {
+                self.eat();
+                return Ok(bindings);
+            }
+            // GLOBALS lets users write `LET name = expr` — strip the LET.
+            if self.check_kw("LET") {
+                self.eat();
+            }
+            let name_tok = self.eat_identifier()?;
+            let value = if self.check_sym("=") || self.check_sym(":") {
+                self.eat();
+                Some(self.parse_expr()?)
+            } else if init_required {
+                let span = self.peek().span;
+                let lex = self.peek().lexeme.clone();
+                return Err(ParseError::new(
+                    format!(
+                        "expected `=` after `{}`, got `{lex}`",
+                        name_tok.lexeme
+                    ),
+                    span,
+                ));
+            } else {
+                None
+            };
+            let end = value
+                .as_ref()
+                .map(|e| e.span().end)
+                .unwrap_or(name_tok.span.end);
+            bindings.push(NamedBinding {
+                name: name_tok.lexeme,
+                value,
+                span: SourceSpan {
+                    start: name_tok.span.start,
+                    end,
+                },
+            });
         }
     }
 
@@ -279,8 +445,14 @@ impl Parser {
         if self.check_sym("$(") || self.check_sym("{") {
             return self.parse_block();
         }
-        if self.check_kw("LET") {
-            return Ok(Stmt::Decl(self.parse_let_decl()?));
+        if self.check_kw("LET")
+            || self.check_kw("GET")
+            || self.check_kw("MANIFEST")
+            || self.check_kw("STATIC")
+            || self.check_kw("GLOBAL")
+            || self.check_kw("GLOBALS")
+        {
+            return Ok(Stmt::Decl(self.parse_decl()?));
         }
         if self.check_kw("IF") {
             return self.parse_if();
@@ -919,6 +1091,19 @@ impl Parser {
                 tok.span,
             )),
         }
+    }
+}
+
+/// The lexer keeps string lexemes with their surrounding `"` quotes;
+/// for `GET "foo"` we want just the inner text. `*`-escapes are *not*
+/// cooked here — sema or the file resolver does that — so the path we
+/// hand back is exactly what was inside the quotes.
+fn strip_quotes(s: &str) -> &str {
+    let bytes = s.as_bytes();
+    if bytes.len() >= 2 && bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"' {
+        &s[1..s.len() - 1]
+    } else {
+        s
     }
 }
 

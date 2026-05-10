@@ -109,7 +109,7 @@ impl LexError {
 const KEYWORDS: &[&str] = &[
     // 1974 Richards core
     "LET", "AND", "BE", "VALOF", "RESULTIS",
-    "MANIFEST", "STATIC", "GLOBAL", "VEC", "TABLE", "OF",
+    "MANIFEST", "STATIC", "GLOBAL", "GLOBALS", "VEC", "TABLE", "OF",
     "IF", "UNLESS", "TEST", "THEN", "ELSE", "OR", "DO",
     "WHILE", "UNTIL", "REPEAT", "REPEATWHILE", "REPEATUNTIL",
     "FOR", "TO", "BY",

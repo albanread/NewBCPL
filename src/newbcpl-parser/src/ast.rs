@@ -21,6 +21,38 @@ pub enum Decl {
     Function(FunctionDecl),
     Routine(RoutineDecl),
     Let(LetDecl),
+    /// `GET "filename"` include directive.
+    Get(GetDirective),
+    /// `MANIFEST $( name = expr; ... $)` — compile-time constants.
+    Manifest(NamedBindingsDecl),
+    /// `STATIC name` (uninitialised) or `STATIC $( name = expr; ... $)`.
+    Static(NamedBindingsDecl),
+    /// `GLOBAL $( name : offset; ... $)` (classic offset form) and
+    /// `GLOBALS $( LET name = expr; ... $)` (modern dialect form) both
+    /// land here. The distinction (offset vs initialiser) is sema's
+    /// concern; the parser just records each binding's optional value.
+    Global(NamedBindingsDecl),
+}
+
+#[derive(Debug, Clone)]
+pub struct GetDirective {
+    pub path: String,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct NamedBindingsDecl {
+    pub bindings: Vec<NamedBinding>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct NamedBinding {
+    pub name: String,
+    /// `None` for `STATIC name` (declaration without initialiser);
+    /// `Some` for `name = expr`, `name : expr`, or `LET name = expr`.
+    pub value: Option<Expr>,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone)]
@@ -267,6 +299,10 @@ impl Decl {
             Decl::Function(f) => f.span,
             Decl::Routine(r) => r.span,
             Decl::Let(l) => l.span,
+            Decl::Get(g) => g.span,
+            Decl::Manifest(m) => m.span,
+            Decl::Static(s) => s.span,
+            Decl::Global(g) => g.span,
         }
     }
 }

@@ -10,7 +10,8 @@ use std::fmt::Write;
 use std::path::Path;
 
 pub use ast::{
-    BinaryOp, Block, Decl, Expr, FunctionDecl, LetDecl, Program, RoutineDecl, Span, Stmt, UnaryOp,
+    BinaryOp, Block, Decl, Expr, FunctionDecl, GetDirective, LetDecl, NamedBinding,
+    NamedBindingsDecl, Program, RoutineDecl, Span, Stmt, UnaryOp,
 };
 pub use parser::{ParseError, parse_source};
 
@@ -77,6 +78,40 @@ fn pretty_print_decl(decl: &Decl, level: usize, out: &mut String) {
                 writeln!(out, "{name} =").unwrap();
                 pretty_print_expr(expr, level + 2, out);
             }
+        }
+        Decl::Get(g) => {
+            writeln!(out, "get \"{}\"", g.path).unwrap();
+        }
+        Decl::Manifest(m) => {
+            writeln!(out, "manifest ({} bindings)", m.bindings.len()).unwrap();
+            for b in &m.bindings {
+                pretty_print_named_binding(b, level + 1, out);
+            }
+        }
+        Decl::Static(s) => {
+            writeln!(out, "static ({} bindings)", s.bindings.len()).unwrap();
+            for b in &s.bindings {
+                pretty_print_named_binding(b, level + 1, out);
+            }
+        }
+        Decl::Global(g) => {
+            writeln!(out, "global ({} bindings)", g.bindings.len()).unwrap();
+            for b in &g.bindings {
+                pretty_print_named_binding(b, level + 1, out);
+            }
+        }
+    }
+}
+
+fn pretty_print_named_binding(b: &NamedBinding, level: usize, out: &mut String) {
+    indent(level, out);
+    match &b.value {
+        Some(value) => {
+            writeln!(out, "{} =", b.name).unwrap();
+            pretty_print_expr(value, level + 1, out);
+        }
+        None => {
+            writeln!(out, "{} (uninitialised)", b.name).unwrap();
         }
     }
 }
@@ -860,6 +895,87 @@ mod tests {
     fn error_missing_else_in_test() {
         let err = parse_err("LET S() BE { TEST x = 0 THEN f() g() }");
         assert!(err.message.contains("ELSE"));
+    }
+
+    // ─── top-level forms ────────────────────────────────────────
+
+    #[test]
+    fn parses_get_directive() {
+        let p = parse_ok("GET \"libhdr.h\"\nLET START() BE { f() }");
+        let Decl::Get(g) = &p.items[0] else {
+            panic!("expected GET");
+        };
+        assert_eq!(g.path, "libhdr.h");
+    }
+
+    #[test]
+    fn parses_manifest_block() {
+        let p = parse_ok("MANIFEST $(\n  A = 1\n  B = 2\n  C = #X10\n$)");
+        let Decl::Manifest(m) = &p.items[0] else {
+            panic!();
+        };
+        assert_eq!(m.bindings.len(), 3);
+        assert_eq!(m.bindings[0].name, "A");
+        assert!(m.bindings[0].value.is_some());
+    }
+
+    #[test]
+    fn parses_static_bare() {
+        let p = parse_ok("LET S() BE { STATIC test\n test := 100 }");
+        let Decl::Routine(r) = &p.items[0] else {
+            panic!();
+        };
+        let Stmt::Block(b) = r.body.as_ref() else {
+            panic!();
+        };
+        let Stmt::Decl(Decl::Static(s)) = &b.stmts[0] else {
+            panic!("expected STATIC");
+        };
+        assert_eq!(s.bindings.len(), 1);
+        assert_eq!(s.bindings[0].name, "test");
+        assert!(s.bindings[0].value.is_none());
+    }
+
+    #[test]
+    fn parses_static_block() {
+        let p = parse_ok("STATIC $( str1 = \"Hello\" $)");
+        let Decl::Static(s) = &p.items[0] else {
+            panic!();
+        };
+        assert_eq!(s.bindings.len(), 1);
+        assert_eq!(s.bindings[0].name, "str1");
+        assert!(s.bindings[0].value.is_some());
+    }
+
+    #[test]
+    fn parses_globals_with_let() {
+        let p = parse_ok("GLOBALS $(\n  LET x = 1\n  LET y = 2\n$)");
+        let Decl::Global(g) = &p.items[0] else {
+            panic!();
+        };
+        assert_eq!(g.bindings.len(), 2);
+        assert_eq!(g.bindings[0].name, "x");
+        assert_eq!(g.bindings[1].name, "y");
+    }
+
+    #[test]
+    fn parses_classic_global_with_offset() {
+        let p = parse_ok("GLOBAL $( frob : 100; quux : 101 $)");
+        let Decl::Global(g) = &p.items[0] else {
+            panic!();
+        };
+        assert_eq!(g.bindings.len(), 2);
+        assert_eq!(g.bindings[0].name, "frob");
+    }
+
+    #[test]
+    fn manifest_requires_init() {
+        let err = parse_err("MANIFEST $( A $)");
+        assert!(
+            err.message.contains("expected `=`"),
+            "got: {}",
+            err.message
+        );
     }
 
     #[test]
