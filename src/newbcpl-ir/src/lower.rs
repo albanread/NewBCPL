@@ -59,6 +59,21 @@ struct Builder {
     current_block: BlockId,
     /// Lexical scope stack: name → slot ValueId.
     scopes: Vec<HashMap<String, ValueId>>,
+    /// Stack of currently-active control-flow frames so `BREAK` /
+    /// `LOOP` know which loop to target. Every loop pushes one frame
+    /// on entry and pops on exit; the innermost frame is the BREAK
+    /// / LOOP target.
+    loops: Vec<LoopFrame>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LoopFrame {
+    /// `BREAK` jumps here.
+    break_block: BlockId,
+    /// `LOOP` jumps here. For WHILE / UNTIL / FOR this is the
+    /// header block; for REPEAT-family loops it's the body block
+    /// (so `LOOP` re-enters at the start of the iteration).
+    continue_block: BlockId,
 }
 
 impl Builder {
@@ -82,7 +97,22 @@ impl Builder {
             next_block: 1,
             current_block: entry,
             scopes: vec![HashMap::new()],
+            loops: Vec::new(),
         }
+    }
+
+    fn current_block_terminator(&self) -> Option<&Terminator> {
+        self.function
+            .blocks
+            .iter()
+            .find(|b| b.id == self.current_block)
+            .map(|b| &b.terminator)
+    }
+
+    /// Whether the current block has an Unreachable placeholder
+    /// terminator — i.e. nothing has terminated it yet.
+    fn current_open(&self) -> bool {
+        matches!(self.current_block_terminator(), Some(Terminator::Unreachable))
     }
 
     fn alloc_value(&mut self) -> ValueId {
@@ -178,15 +208,7 @@ impl Lowerer {
         self.lower_stmt(&r.body);
         // If the body fell through without an explicit RETURN, emit
         // one for routines (no return value).
-        let cur = self.b().current_block;
-        let unterminated = self
-            .b()
-            .function
-            .blocks
-            .iter()
-            .find(|b| b.id == cur)
-            .is_some_and(|b| matches!(b.terminator, Terminator::Unreachable));
-        if unterminated {
+        if self.b().current_open() {
             self.b().terminate(Terminator::Return(None));
         }
         self.finish_function();
@@ -281,12 +303,234 @@ impl Lowerer {
                 let dead = self.b().alloc_block("after.finish");
                 self.b().switch_to(dead);
             }
-            // Loops / SWITCHON / FOREACH / labels / RETAIN / etc.
-            // are not yet lowered — they fall through and are simply
-            // observed but produce no IR. Subsequent IR-grow chunks
-            // pick them up.
+            Stmt::While { cond, body, .. } => self.lower_while(cond, body, /*invert=*/ false),
+            Stmt::Until { cond, body, .. } => self.lower_while(cond, body, /*invert=*/ true),
+            Stmt::Repeat { body, .. } => self.lower_repeat_forever(body),
+            Stmt::RepeatWhile { body, cond, .. } => {
+                self.lower_repeat_with_cond(body, cond, /*invert=*/ false)
+            }
+            Stmt::RepeatUntil { body, cond, .. } => {
+                self.lower_repeat_with_cond(body, cond, /*invert=*/ true)
+            }
+            Stmt::For {
+                name,
+                start,
+                end,
+                step,
+                body,
+                ..
+            } => self.lower_for(name, start, end, step.as_ref(), body),
+            Stmt::Break(_) => {
+                if let Some(frame) = self.b().loops.last().copied() {
+                    self.b().terminate(Terminator::Branch(frame.break_block));
+                    let dead = self.b().alloc_block("after.break");
+                    self.b().switch_to(dead);
+                }
+                // BREAK outside any loop is sema-flagged; emit nothing.
+            }
+            Stmt::Loop(_) => {
+                if let Some(frame) = self.b().loops.last().copied() {
+                    self.b().terminate(Terminator::Branch(frame.continue_block));
+                    let dead = self.b().alloc_block("after.loop");
+                    self.b().switch_to(dead);
+                }
+            }
+            // SWITCHON / FOREACH / labels / RETAIN etc. — subsequent
+            // IR-grow chunks lower these.
             _ => {}
         }
+    }
+
+    /// `WHILE c DO s` lowers to:
+    ///
+    ///   pred → header
+    ///   header: cond, br c ? body : exit
+    ///   body: lower(s), br header
+    ///   exit: ...
+    ///
+    /// `UNTIL c DO s` is identical with the cond-branch arms swapped
+    /// (use `invert=true`).
+    fn lower_while(&mut self, cond: &Expr, body: &Stmt, invert: bool) {
+        let header = self.b().alloc_block("while.header");
+        let body_block = self.b().alloc_block("while.body");
+        let exit = self.b().alloc_block("while.end");
+
+        // Predecessor → header.
+        self.b().terminate(Terminator::Branch(header));
+        self.b().switch_to(header);
+        let cond_value = self.lower_expr(cond);
+        let (then_block, else_block) = if invert {
+            (exit, body_block)
+        } else {
+            (body_block, exit)
+        };
+        self.b().terminate(Terminator::CondBranch {
+            cond: cond_value,
+            then_block,
+            else_block,
+        });
+
+        self.b().switch_to(body_block);
+        self.b().loops.push(LoopFrame {
+            break_block: exit,
+            continue_block: header,
+        });
+        self.lower_stmt(body);
+        self.b().loops.pop();
+        if self.b().current_open() {
+            self.b().terminate(Terminator::Branch(header));
+        }
+        self.b().switch_to(exit);
+    }
+
+    /// `body REPEAT` — infinite loop. `BREAK` is the only exit.
+    fn lower_repeat_forever(&mut self, body: &Stmt) {
+        let body_block = self.b().alloc_block("repeat.body");
+        let exit = self.b().alloc_block("repeat.end");
+
+        self.b().terminate(Terminator::Branch(body_block));
+        self.b().switch_to(body_block);
+        self.b().loops.push(LoopFrame {
+            break_block: exit,
+            continue_block: body_block,
+        });
+        self.lower_stmt(body);
+        self.b().loops.pop();
+        if self.b().current_open() {
+            self.b().terminate(Terminator::Branch(body_block));
+        }
+        self.b().switch_to(exit);
+    }
+
+    /// `body REPEATWHILE c` (do-while) and `body REPEATUNTIL c` (do-
+    /// until). The body executes once before the test.
+    fn lower_repeat_with_cond(&mut self, body: &Stmt, cond: &Expr, invert: bool) {
+        let body_block = self.b().alloc_block("repeat.body");
+        let test = self.b().alloc_block("repeat.test");
+        let exit = self.b().alloc_block("repeat.end");
+
+        self.b().terminate(Terminator::Branch(body_block));
+        self.b().switch_to(body_block);
+        // LOOP inside a do-while jumps to the test (next iteration's
+        // condition); BREAK exits.
+        self.b().loops.push(LoopFrame {
+            break_block: exit,
+            continue_block: test,
+        });
+        self.lower_stmt(body);
+        self.b().loops.pop();
+        if self.b().current_open() {
+            self.b().terminate(Terminator::Branch(test));
+        }
+        self.b().switch_to(test);
+        let cond_value = self.lower_expr(cond);
+        let (then_block, else_block) = if invert {
+            (exit, body_block)
+        } else {
+            (body_block, exit)
+        };
+        self.b().terminate(Terminator::CondBranch {
+            cond: cond_value,
+            then_block,
+            else_block,
+        });
+        self.b().switch_to(exit);
+    }
+
+    /// `FOR i = e1 TO e2 [BY e3] DO body` lowers to:
+    ///
+    ///   pred:        alloca i, store e1, br header
+    ///   header:      load i, icmp.le e2, br body : exit
+    ///   body:        lower(body), br incr
+    ///   incr:        load i, iadd e3, store, br header
+    ///   exit:        ...
+    fn lower_for(
+        &mut self,
+        name: &str,
+        start: &Expr,
+        end: &Expr,
+        step: Option<&Expr>,
+        body: &Stmt,
+    ) {
+        // Initialise the loop variable in the predecessor block so
+        // the LET-style scoping works through Load/Store like every
+        // other local.
+        let start_v = self.lower_expr(start);
+        let i_slot = self.b().alloca(name, TypeHint::Int);
+        self.b().emit(Instr::Store {
+            slot: i_slot,
+            value: start_v,
+        });
+        self.b().push_scope();
+        self.b().declare_local(name, i_slot);
+
+        let header = self.b().alloc_block("for.header");
+        let body_block = self.b().alloc_block("for.body");
+        let incr = self.b().alloc_block("for.incr");
+        let exit = self.b().alloc_block("for.end");
+
+        self.b().terminate(Terminator::Branch(header));
+        self.b().switch_to(header);
+        // i <= end
+        let i_dst = self.b().alloc_value();
+        self.b().emit(Instr::Load {
+            dst: i_dst,
+            slot: i_slot,
+            hint: TypeHint::Int,
+        });
+        let end_v = self.lower_expr(end);
+        let cmp = self.b().alloc_value();
+        self.b().emit(Instr::BinOp {
+            dst: cmp,
+            op: IrBinOp::ICmpLe,
+            lhs: Value::Local(i_dst),
+            rhs: end_v,
+            hint: TypeHint::Int,
+        });
+        self.b().terminate(Terminator::CondBranch {
+            cond: Value::Local(cmp),
+            then_block: body_block,
+            else_block: exit,
+        });
+
+        self.b().switch_to(body_block);
+        self.b().loops.push(LoopFrame {
+            break_block: exit,
+            continue_block: incr,
+        });
+        self.lower_stmt(body);
+        self.b().loops.pop();
+        if self.b().current_open() {
+            self.b().terminate(Terminator::Branch(incr));
+        }
+
+        self.b().switch_to(incr);
+        let i_load = self.b().alloc_value();
+        self.b().emit(Instr::Load {
+            dst: i_load,
+            slot: i_slot,
+            hint: TypeHint::Int,
+        });
+        let step_v = match step {
+            Some(s) => self.lower_expr(s),
+            None => Value::Const(Const::Int(1)),
+        };
+        let i_next = self.b().alloc_value();
+        self.b().emit(Instr::BinOp {
+            dst: i_next,
+            op: IrBinOp::IAdd,
+            lhs: Value::Local(i_load),
+            rhs: step_v,
+            hint: TypeHint::Int,
+        });
+        self.b().emit(Instr::Store {
+            slot: i_slot,
+            value: Value::Local(i_next),
+        });
+        self.b().terminate(Terminator::Branch(header));
+
+        self.b().switch_to(exit);
+        self.b().pop_scope();
     }
 
     fn lower_block(&mut self, block: &Block) {
@@ -334,17 +578,7 @@ impl Lowerer {
 
         self.b().switch_to(then_block);
         self.lower_stmt(then_stmt);
-        // If the then-branch fell through without terminating, jump
-        // to the merge block.
-        let cur = self.b().current_block;
-        let needs_merge = self
-            .b()
-            .function
-            .blocks
-            .iter()
-            .find(|b| b.id == cur)
-            .is_some_and(|b| matches!(b.terminator, Terminator::Unreachable));
-        if needs_merge {
+        if self.b().current_open() {
             self.b().terminate(Terminator::Branch(merge));
         }
 
@@ -352,15 +586,7 @@ impl Lowerer {
         if let Some(els) = else_stmt {
             self.lower_stmt(els);
         }
-        let cur = self.b().current_block;
-        let needs_merge = self
-            .b()
-            .function
-            .blocks
-            .iter()
-            .find(|b| b.id == cur)
-            .is_some_and(|b| matches!(b.terminator, Terminator::Unreachable));
-        if needs_merge {
+        if self.b().current_open() {
             self.b().terminate(Terminator::Branch(merge));
         }
 
@@ -386,15 +612,7 @@ impl Lowerer {
         });
         self.b().switch_to(body_block);
         self.lower_stmt(then_stmt);
-        let cur = self.b().current_block;
-        let needs_merge = self
-            .b()
-            .function
-            .blocks
-            .iter()
-            .find(|b| b.id == cur)
-            .is_some_and(|b| matches!(b.terminator, Terminator::Unreachable));
-        if needs_merge {
+        if self.b().current_open() {
             self.b().terminate(Terminator::Branch(merge));
         }
         self.b().switch_to(merge);

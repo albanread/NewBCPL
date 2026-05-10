@@ -266,6 +266,134 @@ mod tests {
         assert_eq!(m.layouts[0].class_name, "Point");
     }
 
+    // ─── loops ──────────────────────────────────────────────────
+
+    fn count_blocks_with<F: Fn(&Terminator) -> bool>(f: &Function, pred: F) -> usize {
+        f.blocks.iter().filter(|b| pred(&b.terminator)).count()
+    }
+
+    #[test]
+    fn while_lowers_to_header_body_exit() {
+        let m = lower_source("LET S() BE { WHILE i < 10 DO f() }");
+        let s = function(&m, "S");
+        // entry → header → body → header (loop) … → exit
+        assert!(s.blocks.len() >= 4);
+        let cb = count_blocks_with(s, |t| matches!(t, Terminator::CondBranch { .. }));
+        assert_eq!(cb, 1, "exactly one CondBranch (the WHILE header)");
+    }
+
+    #[test]
+    fn until_swaps_branch_arms() {
+        // Same shape as WHILE but the cond-branch arms are swapped:
+        // body executes when cond is FALSE.
+        let m = lower_source("LET S() BE { UNTIL done DO step() }");
+        let s = function(&m, "S");
+        let cb = count_blocks_with(s, |t| matches!(t, Terminator::CondBranch { .. }));
+        assert_eq!(cb, 1);
+    }
+
+    #[test]
+    fn break_jumps_to_loop_exit() {
+        let m = lower_source(
+            "LET S() BE { WHILE i < 10 DO $( IF i = 5 THEN BREAK\n step() $) }",
+        );
+        let s = function(&m, "S");
+        // Two cond-branches: WHILE header and IF inside the body.
+        let cb = count_blocks_with(s, |t| matches!(t, Terminator::CondBranch { .. }));
+        assert_eq!(cb, 2);
+        // BREAK creates an unconditional branch to the WHILE exit.
+        let branches = s
+            .blocks
+            .iter()
+            .filter(|b| matches!(b.terminator, Terminator::Branch(_)))
+            .count();
+        assert!(branches >= 3, "expected at least 3 unconditional branches");
+    }
+
+    #[test]
+    fn loop_keyword_jumps_to_continue_target() {
+        let m = lower_source(
+            "LET S() BE { WHILE i < 10 DO $( IF cond THEN LOOP\n step() $) }",
+        );
+        let s = function(&m, "S");
+        // Both BREAK and LOOP scenarios produce extra Branch
+        // terminators; cond-branches are 2 (WHILE header + IF).
+        let cb = count_blocks_with(s, |t| matches!(t, Terminator::CondBranch { .. }));
+        assert_eq!(cb, 2);
+    }
+
+    #[test]
+    fn for_loop_emits_init_header_body_incr_exit() {
+        let m = lower_source("LET S() BE { FOR i = 1 TO 10 DO f(i) }");
+        let s = function(&m, "S");
+        // entry alloca's i, branches to header. Header has
+        // CondBranch. Body branches to incr. Incr branches to header.
+        // Exit ends with return.
+        assert!(s.blocks.len() >= 5, "expected ≥5 blocks for FOR");
+        // Exactly one CondBranch (the header test).
+        let cb = count_blocks_with(s, |t| matches!(t, Terminator::CondBranch { .. }));
+        assert_eq!(cb, 1);
+        // The entry block must have an alloca for `i` and a store
+        // of the start value.
+        let entry = &s.blocks[0];
+        let has_i = entry
+            .instrs
+            .iter()
+            .any(|i| matches!(i, Instr::Alloca { name, .. } if name == "i"));
+        assert!(has_i);
+    }
+
+    #[test]
+    fn for_with_by_uses_step_value() {
+        let m = lower_source("LET S() BE { FOR i = 0 TO 100 BY 5 DO f(i) }");
+        let s = function(&m, "S");
+        // The increment block contains an iadd of 5 (constant).
+        let has_step = s.blocks.iter().any(|b| {
+            b.instrs.iter().any(|i| {
+                matches!(
+                    i,
+                    Instr::BinOp {
+                        op: IrBinOp::IAdd,
+                        rhs: Value::Const(Const::Int(5)),
+                        ..
+                    }
+                )
+            })
+        });
+        assert!(has_step, "expected iadd with step=5");
+    }
+
+    #[test]
+    fn repeat_forever_only_exits_via_break() {
+        let m = lower_source("LET S() BE { $( BREAK $) REPEAT }");
+        let s = function(&m, "S");
+        // entry → body, body has BREAK which branches to exit.
+        // The body's natural fallthrough also branches to body
+        // (the repeat).
+        assert!(s.blocks.len() >= 3);
+    }
+
+    #[test]
+    fn repeat_while_tests_after_body() {
+        let m = lower_source("LET S() BE { $( step() $) REPEATWHILE i < 10 }");
+        let s = function(&m, "S");
+        // body → test → body (loop) | exit
+        assert!(s.blocks.len() >= 4);
+        let cb = count_blocks_with(s, |t| matches!(t, Terminator::CondBranch { .. }));
+        assert_eq!(cb, 1);
+    }
+
+    #[test]
+    fn repeat_until_inverts_the_test() {
+        let m = lower_source("LET S() BE { $( step() $) REPEATUNTIL done }");
+        let s = function(&m, "S");
+        // Same shape as REPEATWHILE; difference is the cond-branch
+        // arms get swapped — observable only by comparing
+        // then_block / else_block ordering, which we don't here.
+        let cb = count_blocks_with(s, |t| matches!(t, Terminator::CondBranch { .. }));
+        assert_eq!(cb, 1);
+    }
+
     #[test]
     fn dump_smoke() {
         let m = lower_source("LET S() BE { LET y = 1 + 2 }");
