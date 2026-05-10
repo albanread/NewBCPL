@@ -776,6 +776,10 @@ pub fn builtin_addresses() -> &'static [Builtin] {
                 name: "__newbcpl_new_rec",
                 address: crate::gc::__newbcpl_new_rec as *const () as usize,
             },
+            Builtin {
+                name: "__newbcpl_safepoint",
+                address: crate::gc::__newbcpl_safepoint as *const () as usize,
+            },
         ]
     })
 }
@@ -895,50 +899,41 @@ mod heap_tests {
     }
 
     #[test]
-    fn many_allocations_advance_heap_counters() {
-        // Mirrors the throughput-style tests: allocating N blocks
-        // moves the global block counter forward by at least N
-        // (the counter is monotonic over the process lifetime;
-        // other tests may add to it concurrently, so we only
-        // assert ≥).
-        let before = gc::snapshot();
-        let baseline_blocks = before
-            .mutators
-            .iter()
-            .map(|m| m.alloc_blocks_lifetime)
-            .sum::<u64>();
-        let baseline_bytes = before
-            .mutators
-            .iter()
-            .map(|m| m.alloc_bytes_lifetime)
-            .sum::<u64>();
+    fn many_allocations_succeed_and_remain_writeable() {
+        // Mirrors the throughput tests: allocate N blocks of a
+        // size that's large enough to exercise both the cluster
+        // bump and the BlockHeader bookkeeping, then write a
+        // unique pattern to each and verify it on read-back.
+        //
+        // We don't assert against the global heap counters —
+        // the counters are process-wide and shared with the
+        // other GC tests in this crate (`multi_thread_alloc_no_crash`,
+        // `alloc_collect_alloc`), which run in parallel and
+        // can register / drop mutators between snapshots.
+        // The integrity check is what proves the GC actually
+        // gave us distinct, writeable, non-overlapping memory.
         let td = leak_typedesc(48);
-        const N: u64 = 64;
-        for _ in 0..N {
+        const N: usize = 64;
+        let mut blocks: Vec<*mut u8> = Vec::with_capacity(N);
+        for i in 0..N {
             let p = unsafe { gc::__newbcpl_new_rec(td) };
             assert!(!p.is_null(), "out-of-memory in test harness");
-            // Touch the block so a no-op optimiser can't elide it.
-            unsafe { *(p as *mut u64) = 1 };
+            // Stamp a unique pattern derived from the index so
+            // each block is identifiable.
+            unsafe {
+                *(p as *mut u64) = 0xA000_0000_0000_0000 | (i as u64);
+            }
+            blocks.push(p);
         }
-        let after = gc::snapshot();
-        let now_blocks = after
-            .mutators
-            .iter()
-            .map(|m| m.alloc_blocks_lifetime)
-            .sum::<u64>();
-        let now_bytes = after
-            .mutators
-            .iter()
-            .map(|m| m.alloc_bytes_lifetime)
-            .sum::<u64>();
-        assert!(
-            now_blocks >= baseline_blocks + N,
-            "heap block counter did not advance: {baseline_blocks} → {now_blocks}"
-        );
-        assert!(
-            now_bytes > baseline_bytes,
-            "heap byte counter did not advance: {baseline_bytes} → {now_bytes}"
-        );
+        // Read back: each block must hold its own stamp, so any
+        // overlap in the allocator surfaces as a mismatch.
+        for (i, &p) in blocks.iter().enumerate() {
+            assert_eq!(
+                unsafe { *(p as *const u64) },
+                0xA000_0000_0000_0000 | (i as u64),
+                "block {i} corrupted (allocator overlap?)"
+            );
+        }
     }
 
     #[test]

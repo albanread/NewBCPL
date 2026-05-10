@@ -309,10 +309,44 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
             self.bind_parameter(fv, i, p);
         }
 
+        // Cooperative safepoint poll at function entry. The
+        // GC's allocator path (`__newbcpl_new_rec`) already
+        // polls on each allocation; this catches functions
+        // that run for a long time without allocating, so a
+        // concurrent collector can pause every thread cleanly.
+        // The poll is cheap when no GC is pending (atomic load
+        // + branch); the slow path parks the thread.
+        self.emit_safepoint_poll();
+
         // Emit each block in source order.
         for block in &f.blocks {
             self.emit_block(block);
         }
+    }
+
+    /// Emit a `call void @__newbcpl_safepoint()` at the current
+    /// builder position. The function is declared on demand and
+    /// resolved at JIT-link time via the runtime's
+    /// `builtin_addresses()` table.
+    fn emit_safepoint_poll(&mut self) {
+        let safepoint_fn = match self.by_name.get("__newbcpl_safepoint") {
+            Some(&f) => f,
+            None => {
+                let fn_ty = self.context.void_type().fn_type(&[], false);
+                let fv = self.module.add_function(
+                    "__newbcpl_safepoint",
+                    fn_ty,
+                    Some(Linkage::External),
+                );
+                self.by_name
+                    .insert("__newbcpl_safepoint".to_string(), fv);
+                fv
+            }
+        };
+        let _ = self
+            .builder
+            .build_call(safepoint_fn, &[], "safepoint")
+            .expect("call __newbcpl_safepoint");
     }
 
     fn bind_parameter(&mut self, fv: FunctionValue<'ctx>, idx: usize, p: &Param) {

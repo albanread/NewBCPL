@@ -476,4 +476,68 @@ mod tests {
         assert!(dump.contains("define i64 @S()"));
         let _ = std::fs::remove_file(&tmp);
     }
+
+    #[test]
+    fn every_function_polls_safepoint() {
+        // Cooperative-GC plumbing: the IR-emit pass inserts a
+        // `__newbcpl_safepoint()` call at the top of every JIT'd
+        // function so the collector can pause threads that
+        // never allocate. Confirm the call shows up in both the
+        // top-level routine and a class method body — START and
+        // Foo_CREATE both need to be parkable.
+        let text = emit_text(
+            "CLASS Foo $(\n  DECL x\n  ROUTINE CREATE(ix) BE $( SELF.x := ix $)\n$)\nLET S() BE { LET f = NEW Foo(42) }",
+        );
+        let safepoint_calls = text.matches("call void @__newbcpl_safepoint()").count();
+        assert!(
+            safepoint_calls >= 2,
+            "expected at least one safepoint call per function (START and Foo_CREATE), got {safepoint_calls}\n{text}"
+        );
+        assert!(text.contains("declare void @__newbcpl_safepoint()"));
+    }
+
+    #[test]
+    fn jit_run_advances_heap_block_counter() {
+        // End-to-end proof that JIT-emitted `NEW Class` flows
+        // through the GC: compile a program that creates three
+        // class instances, run it, and check the global block
+        // counter advanced by at least three.
+        //
+        // We deliberately do **not** call `collect()` here.
+        // The TypeDesc constants for these classes live in the
+        // JIT module's data section, which the `ExecutionEngine`
+        // owns. When `run()` returns the engine drops and the
+        // memory backing the TypeDescs goes with it — calling
+        // `collect()` afterwards would dereference dangling
+        // `BlockHeader.tag` pointers. Lifting that constraint
+        // requires either keeping JIT modules alive for the
+        // life of the heap, or copying TypeDescs out of the
+        // JIT into stable storage. Tracked as a follow-up.
+        let tmp = std::env::temp_dir().join("newbcpl_jit_alloc.bcl");
+        std::fs::write(
+            &tmp,
+            "CLASS Point $(\n  DECL x, y\n  ROUTINE CREATE(ix, iy) BE $( SELF.x := ix\n SELF.y := iy $)\n$)\nLET START() BE $(\n LET a = NEW Point(1, 2)\n LET b = NEW Point(3, 4)\n LET c = NEW Point(5, 6)\n$)",
+        )
+        .unwrap();
+        let before = newbcpl_runtime::gc::snapshot();
+        let blocks_before = before
+            .mutators
+            .iter()
+            .map(|m| m.alloc_blocks_lifetime)
+            .sum::<u64>();
+        run(&tmp).expect("JIT run should succeed");
+        let after = newbcpl_runtime::gc::snapshot();
+        let blocks_after = after
+            .mutators
+            .iter()
+            .map(|m| m.alloc_blocks_lifetime)
+            .sum::<u64>();
+        assert!(
+            blocks_after >= blocks_before + 3,
+            "JIT'd START allocated three Point instances but the heap counter \
+             only moved {} → {} (expected ≥ +3)",
+            blocks_before, blocks_after
+        );
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
