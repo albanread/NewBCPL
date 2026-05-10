@@ -44,8 +44,32 @@ use newbcpl_parser::{
 
 pub use newbcpl_parser::TypeHint;
 
+pub mod layout;
+pub use layout::{ClassLayout, FieldLayout, VtableEntry};
+
+/// Stable, comparable identifier for a binding. Codegen uses these
+/// rather than name-based string lookup so multiple references to the
+/// same variable land on a single storage slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SymbolId(pub u32);
+
+impl SymbolId {
+    pub fn raw(self) -> u32 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for SymbolId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "s{}", self.0)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct BindingInfo {
+    /// Stable, name-independent identifier. Allocated by sema in
+    /// declaration order. Codegen looks bindings up by this ID.
+    pub id: SymbolId,
     pub name: String,
     pub hint: TypeHint,
     /// For `Object` bindings, the class name they were created from
@@ -112,6 +136,11 @@ pub struct SemaOutput {
     pub classes: Vec<ClassInfo>,
     /// Every function / routine sema saw, with its inferred signature.
     pub functions: Vec<FunctionInfo>,
+    /// Concrete object layouts — field offsets, vtable slots,
+    /// pointer-offset arrays. One per declared class. Computed
+    /// after the main walk so all `ClassInfo` records (including
+    /// inferred method results) are available.
+    pub layouts: Vec<ClassLayout>,
     /// Non-fatal diagnostics. Sema never fails on type grounds, so
     /// every interesting observation lands here.
     pub warnings: Vec<SemaWarning>,
@@ -141,10 +170,12 @@ pub enum FunctionKind {
 pub fn analyze(program: &Program) -> SemaOutput {
     let mut sema = Sema::new();
     sema.analyze_program(program);
+    let layouts = layout::compute_layouts(&sema.classes);
     SemaOutput {
         bindings: sema.binding_log,
         classes: sema.class_log,
         functions: sema.function_log,
+        layouts,
         warnings: sema.warnings,
     }
 }
@@ -181,15 +212,57 @@ pub fn dump_sema(path: &Path) -> String {
                         Some(c) => format!(" [{c}]"),
                         None => String::new(),
                     };
+                    let managed = if b.is_managed { " M" } else { "" };
                     writeln!(
                         out,
-                        "  {:>4}:{:<3}  {:<12} {}{class}",
+                        "  {:>4}:{:<3}  {:>5}  {:<12} {}{class}{managed}",
                         b.span.start.line,
                         b.span.start.column,
+                        format!("{}", b.id),
                         b.hint.as_str(),
                         b.name,
                     )
                     .unwrap();
+                }
+                if !result.layouts.is_empty() {
+                    writeln!(out, "layouts ({}):", result.layouts.len()).unwrap();
+                    for l in &result.layouts {
+                        let managed = if l.managed { " MANAGED" } else { "" };
+                        let release = if l.has_release { " has-RELEASE" } else { "" };
+                        writeln!(
+                            out,
+                            "  {}{managed}{release}  size={} bytes  ptroffs={:?}",
+                            l.class_name, l.instance_size, l.ptr_offsets,
+                        )
+                        .unwrap();
+                        for f in &l.fields {
+                            let from = if f.defining_class != l.class_name {
+                                format!(" (from {})", f.defining_class)
+                            } else {
+                                String::new()
+                            };
+                            writeln!(
+                                out,
+                                "    +{:<3}  {:<8} {}{from}",
+                                f.offset,
+                                f.hint.as_str(),
+                                f.name
+                            )
+                            .unwrap();
+                        }
+                        for v in &l.vtable {
+                            let provider = match &v.defining_class {
+                                Some(c) => c.as_str(),
+                                None => "(default)",
+                            };
+                            writeln!(
+                                out,
+                                "    slot {}  {:<14}  {}",
+                                v.slot, v.method_name, provider,
+                            )
+                            .unwrap();
+                        }
+                    }
                 }
                 writeln!(out, "classes ({}):", result.classes.len()).unwrap();
                 for c in &result.classes {
@@ -262,6 +335,9 @@ pub fn dump_sema(path: &Path) -> String {
 // ─────────────────────────────────────────────────────────────────────────────
 
 struct Sema {
+    /// Monotonic counter for `SymbolId`. Allocated once per binding
+    /// in `declare`, never reused.
+    next_symbol_id: u32,
     /// Stack of scope frames. Each frame maps name → hint. Newer
     /// frames shadow older ones.
     scopes: Vec<HashMap<String, BindingInfo>>,
@@ -293,6 +369,7 @@ struct Sema {
 impl Sema {
     fn new() -> Self {
         Self {
+            next_symbol_id: 0,
             scopes: vec![HashMap::new()],
             classes: HashMap::new(),
             functions: HashMap::new(),
@@ -304,6 +381,12 @@ impl Sema {
             switchon_depth: 0,
             warnings: Vec::new(),
         }
+    }
+
+    fn alloc_symbol_id(&mut self) -> SymbolId {
+        let id = SymbolId(self.next_symbol_id);
+        self.next_symbol_id += 1;
+        id
     }
 
     fn push_scope(&mut self) {
@@ -324,6 +407,7 @@ impl Sema {
             .map(|c| self.class_is_managed(c))
             .unwrap_or(false);
         let info = BindingInfo {
+            id: self.alloc_symbol_id(),
             name: name.to_string(),
             hint,
             class_name: class_name.clone(),
