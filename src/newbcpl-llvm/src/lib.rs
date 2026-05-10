@@ -208,32 +208,45 @@ pub fn run(path: &Path) -> Result<i64, String> {
             continue;
         }
         let vt_ptr = vt_addr as *mut usize;
+        // Address of the no-op stub used for unbound slots. Cast
+        // once per layout so each entry's fallback is O(1).
+        let default_method_addr =
+            newbcpl_runtime::builtins::__newbcpl_default_method
+                as *const ()
+                as usize;
         for entry in &layout.vtable {
-            let owner = match &entry.defining_class {
-                Some(c) => c,
-                // Default CREATE / RELEASE for classes that don't
-                // declare them: leave the slot at zero — virtual
-                // calls into these are harmless because nobody
-                // generates one (sema only emits MethodCall for
-                // declared methods).
-                None => continue,
+            // Resolve the method address. Three outcomes:
+            //   1. Bound: write the JIT'd function's compiled
+            //      address into the slot.
+            //   2. Not declared by this class (inherited default
+            //      CREATE / RELEASE) OR declared but body lives
+            //      in a different JIT module: fall back to the
+            //      `__newbcpl_default_method` stub, which returns
+            //      0 and is safe to call. Without this, an
+            //      explicit `obj.RELEASE()` in user code would
+            //      jump to address 0 and segfault.
+            let fn_addr: usize = match &entry.defining_class {
+                Some(owner) => {
+                    let method_symbol = format!("{owner}_{}", entry.method_name);
+                    match module.get_function(&method_symbol) {
+                        Some(fv) => {
+                            let a = unsafe {
+                                LLVMGetPointerToGlobal(
+                                    exec_engine.as_mut_ptr(),
+                                    fv.as_value_ref(),
+                                )
+                            } as usize;
+                            if a == 0 {
+                                default_method_addr
+                            } else {
+                                a
+                            }
+                        }
+                        None => default_method_addr,
+                    }
+                }
+                None => default_method_addr,
             };
-            let method_symbol = format!("{owner}_{}", entry.method_name);
-            let fv = match module.get_function(&method_symbol) {
-                Some(f) => f,
-                // The method's body lives in a different module
-                // (cross-module dispatch isn't wired yet) — skip.
-                None => continue,
-            };
-            let fn_addr = unsafe {
-                LLVMGetPointerToGlobal(
-                    exec_engine.as_mut_ptr(),
-                    fv.as_value_ref(),
-                )
-            } as usize;
-            if fn_addr == 0 {
-                continue;
-            }
             unsafe {
                 vt_ptr.add(entry.slot).write(fn_addr);
             }

@@ -95,6 +95,19 @@ pub unsafe extern "C" fn FINISH() -> i64 {
     std::process::exit(0);
 }
 
+/// Stub that fills any vtable slot whose class doesn't supply a
+/// method body — most commonly the default `CREATE` / `RELEASE`
+/// that classes inherit without overriding. Returns 0 (BCPL routine
+/// convention). Without this, a virtual call into such a slot
+/// jumps to address 0 and segfaults; with it the call is a clean
+/// no-op. The JIT-side vtable patcher in `newbcpl-llvm/lib.rs`
+/// writes this address into every entry whose `defining_class`
+/// is `None`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __newbcpl_default_method() -> i64 {
+    0
+}
+
 /// `GC()` — request a full collection right now. Useful for
 /// tests and benchmarks; in normal use the allocator triggers
 /// collection on a heap-pressure threshold so most programs
@@ -943,6 +956,7 @@ pub fn builtin_addresses() -> &'static [Builtin] {
             },
             builtin!(GC),
             builtin!(HEAP_INFO),
+            builtin!(__newbcpl_default_method),
         ]
     })
 }

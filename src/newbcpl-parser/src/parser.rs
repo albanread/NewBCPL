@@ -521,19 +521,76 @@ impl Parser {
             return self.parse_class_field(visibility);
         }
         if self.check_kw("LET") {
+            // Inside a class body, `LET` has three shapes:
+            //   `LET x, y, z`                 — field declarations
+            //                                   (equivalent to `DECL x, y, z`)
+            //   `LET name = expr`             — initialised member
+            //   `LET name(params) = expr`     — function-form method
+            //   `LET name(params) BE stmt`    — routine-form method
+            // We peek past the leading `LET name (, name)*` to see
+            // whether `=`, `(`, or `AS` follows. If none of those, it's
+            // a field-style declaration.
+            if self.lookahead_is_field_let() {
+                return self.parse_class_let_fields(visibility);
+            }
             let start = self.peek().span.start;
-            let Decl::Let(let_decl) = self.parse_let_decl()? else {
-                unreachable!("LET parses to Decl::Let");
+            // `parse_let_decl` returns `Decl::Let` for value
+            // bindings, `Decl::Function` for `LET name(...) = expr`,
+            // and `Decl::Routine` for `LET name(...) BE stmt`.
+            // Inside a class body the function / routine shapes are
+            // methods; the value shape is an initialised member.
+            // (The pre-existing class lowering called
+            // `unreachable!("LET parses to Decl::Let")` here — that
+            // was wrong for class methods written with the LET
+            // function/routine grammar, blocking
+            // `LET getX() = x` and `LET init(...) BE ...` style.)
+            return match self.parse_let_decl()? {
+                Decl::Let(let_decl) => {
+                    let span = SourceSpan {
+                        start,
+                        end: let_decl.span.end,
+                    };
+                    Ok(ClassMember {
+                        visibility,
+                        kind: ClassMemberKind::Let(let_decl),
+                        span,
+                    })
+                }
+                Decl::Function(f) => {
+                    let span = SourceSpan { start, end: f.span.end };
+                    Ok(ClassMember {
+                        visibility,
+                        kind: ClassMemberKind::Method(ClassMethod {
+                            name: f.name,
+                            params: f.params,
+                            is_virtual,
+                            is_final,
+                            body: ClassMethodBody::Function(f.body),
+                            span,
+                        }),
+                        span,
+                    })
+                }
+                Decl::Routine(r) => {
+                    let span = SourceSpan { start, end: r.span.end };
+                    Ok(ClassMember {
+                        visibility,
+                        kind: ClassMemberKind::Method(ClassMethod {
+                            name: r.name,
+                            params: r.params,
+                            is_virtual,
+                            is_final,
+                            body: ClassMethodBody::Routine(r.body),
+                            span,
+                        }),
+                        span,
+                    })
+                }
+                other => unreachable!(
+                    "parse_let_decl returned unexpected variant: {:?}",
+                    other
+                ),
             };
-            let span = SourceSpan {
-                start,
-                end: let_decl.span.end,
-            };
-            return Ok(ClassMember {
-                visibility,
-                kind: ClassMemberKind::Let(let_decl),
-                span,
-            });
         }
         if self.check_kw("FLET") {
             return self.parse_class_flet_member(visibility);
@@ -545,6 +602,61 @@ impl Parser {
             format!("expected class member (DECL / LET / FLET / ROUTINE / FUNCTION), got `{lex}`"),
             span,
         ))
+    }
+
+    /// Peek-only: is the current `LET`-led token sequence a class
+    /// field declaration (no initialiser, no params)? Walks past
+    /// the names without consuming, returns true iff the token
+    /// after the last name is NOT `=`, `(`, or `AS` — i.e. the
+    /// declaration ends with the name list. Restores nothing
+    /// (this is a pure read of `self.tokens[self.pos..]`).
+    fn lookahead_is_field_let(&self) -> bool {
+        // Tokens: LET name (, name)* TERMINATOR ?
+        let mut i = self.pos + 1; // skip LET
+        loop {
+            let t = self.tokens.get(i);
+            let Some(t) = t else { return true };
+            if t.kind != TokenKind::Identifier {
+                return false;
+            }
+            i += 1;
+            let next = self.tokens.get(i);
+            match next {
+                Some(t) if t.kind == TokenKind::Symbol && t.lexeme == "," => {
+                    i += 1;
+                    continue;
+                }
+                Some(t) if t.kind == TokenKind::Symbol && t.lexeme == "=" => return false,
+                Some(t) if t.kind == TokenKind::Symbol && t.lexeme == "(" => return false,
+                Some(t) if t.kind == TokenKind::Keyword && t.lexeme == "AS" => return false,
+                _ => return true,
+            }
+        }
+    }
+
+    /// `LET x, y` inside a class body — field declarations equivalent
+    /// to `DECL x, y`. Sema lays them out alongside DECL-introduced
+    /// fields. The leading `LET` is consumed, then a comma-separated
+    /// list of identifiers.
+    fn parse_class_let_fields(
+        &mut self,
+        visibility: Visibility,
+    ) -> Result<ClassMember, ParseError> {
+        let kw = self.eat(); // LET
+        let mut names = vec![self.eat_identifier()?.lexeme];
+        while self.check_sym(",") {
+            self.eat();
+            names.push(self.eat_identifier()?.lexeme);
+        }
+        let span = SourceSpan {
+            start: kw.span.start,
+            end: self.tokens[self.pos.saturating_sub(1)].span.end,
+        };
+        Ok(ClassMember {
+            visibility,
+            kind: ClassMemberKind::Fields(names),
+            span,
+        })
     }
 
     fn parse_class_field(&mut self, visibility: Visibility) -> Result<ClassMember, ParseError> {
