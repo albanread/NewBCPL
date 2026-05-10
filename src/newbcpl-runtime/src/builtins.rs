@@ -105,6 +105,65 @@ pub unsafe extern "C" fn GC() -> i64 {
     0
 }
 
+/// `HEAP_INFO()` — print a one-screen summary of the GC's state
+/// to stdout. Intended for interactive debugging and quick
+/// instrumentation in tests; use `gc::snapshot()` from Rust for
+/// programmatic access.
+///
+/// The shape mirrors the reference's `print_runtime_metrics` —
+/// allocation counts, live working set, collection cycles, and
+/// the current threshold the allocator will trigger at. Nothing
+/// here changes program state.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn HEAP_INFO() -> i64 {
+    use std::sync::atomic::Ordering;
+    let c = &crate::gc::HEAP_COUNTERS;
+    let alloc_blocks = c.alloc_blocks_lifetime.load(Ordering::Acquire);
+    let alloc_bytes = c.alloc_bytes_lifetime.load(Ordering::Acquire);
+    let free_blocks = c.free_blocks_lifetime.load(Ordering::Acquire);
+    let free_bytes = c.free_bytes_lifetime.load(Ordering::Acquire);
+    let live_blocks = c.live_blocks.load(Ordering::Acquire);
+    let live_bytes = c.live_bytes.load(Ordering::Acquire);
+    let peak_live = c.peak_live_bytes.load(Ordering::Acquire);
+    let cycles = c.collect_cycles.load(Ordering::Acquire);
+    let last_reclaimed = c.collect_last_reclaimed_bytes.load(Ordering::Acquire);
+    let bytes_since = c.alloc_bytes_since_collect.load(Ordering::Acquire);
+    let threshold = c.collect_threshold.load(Ordering::Acquire);
+    let clusters = c.cluster_count.load(Ordering::Acquire);
+    let modules = c.module_root_count.load(Ordering::Acquire);
+    let threads = c.registered_threads.load(Ordering::Acquire);
+
+    let stdout = std::io::stdout();
+    let mut h = stdout.lock();
+    let _ = writeln!(h, "=== newbcpl GC heap info ===");
+    let _ = writeln!(
+        h,
+        "  allocations:  {alloc_blocks:>10} blocks  {alloc_bytes:>14} bytes (lifetime)"
+    );
+    let _ = writeln!(
+        h,
+        "  freed:        {free_blocks:>10} blocks  {free_bytes:>14} bytes (lifetime)"
+    );
+    let _ = writeln!(
+        h,
+        "  live:         {live_blocks:>10} blocks  {live_bytes:>14} bytes  (peak {peak_live} bytes)"
+    );
+    let _ = writeln!(
+        h,
+        "  collects:     {cycles:>10} cycles  last reclaimed {last_reclaimed} bytes"
+    );
+    let _ = writeln!(
+        h,
+        "  trigger:      {bytes_since}/{threshold} bytes since last collect"
+    );
+    let _ = writeln!(
+        h,
+        "  clusters: {clusters}  module roots: {modules}  registered threads: {threads}"
+    );
+    let _ = h.flush();
+    0
+}
+
 // ─── WRITEF / WRITEF1..WRITEF7 ────────────────────────────────────
 
 /// `WRITEF` and its arity-suffixed siblings are the BCPL printf.
@@ -883,6 +942,7 @@ pub fn builtin_addresses() -> &'static [Builtin] {
                 address: crate::gc::__newbcpl_collect as *const () as usize,
             },
             builtin!(GC),
+            builtin!(HEAP_INFO),
         ]
     })
 }
