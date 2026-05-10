@@ -333,6 +333,158 @@ pub unsafe extern "C" fn RND(max_val: i64) -> f64 {
     FRND() * (max_val as f64)
 }
 
+// ─── list runtime (real linked-list shape) ──────────────────────
+//
+// Mirrors `reference/runtime/ListDataTypes.h` so the layout the JIT
+// emits and the layout the runtime expects agree byte-for-byte.
+// Allocations currently come from `Box::leak` (same shape as our
+// vector / pair stubs); routing list nodes through the GC heap
+// alongside class instances is a clearly-labelled follow-up.
+
+/// One node of a BCPL list. The `type` tag describes which member of
+/// the value union is live (`ATOM_INT`, `ATOM_FLOAT`, `ATOM_PAIR`,
+/// `ATOM_OBJECT`, ...). The reference reserves slot 0 for the
+/// header (`ATOM_SENTINEL`) so a stray walk through `next` past the
+/// last data node lands on the header rather than wild memory.
+#[repr(C)]
+pub struct ListAtom {
+    pub type_tag: i32,
+    pub pad: i32,
+    /// Untagged 64-bit value slot. Holds an `i64` for `ATOM_INT`,
+    /// the bit pattern of an `f64` for `ATOM_FLOAT`, or a raw
+    /// pointer for `ATOM_STRING` / `ATOM_OBJECT` / `ATOM_LIST_POINTER`.
+    /// PAIR/QUAD/OCT (all 64-bit packed) round-trip through here too.
+    pub value: i64,
+    pub next: *mut ListAtom,
+}
+
+/// The header that every list points to. `head` / `tail` are atoms,
+/// `length` is maintained on each append for O(1) `LEN`. The `type`
+/// field is always `ATOM_SENTINEL` so code walking through a chain
+/// can detect the header bookend.
+#[repr(C)]
+pub struct ListHeader {
+    pub type_tag: i32,
+    pub contains_literals: i32,
+    pub length: i64,
+    pub head: *mut ListAtom,
+    pub tail: *mut ListAtom,
+}
+
+/// Atom type tags — must match `reference/runtime/ListDataTypes.h`.
+#[allow(dead_code)]
+pub const ATOM_SENTINEL: i32 = 0;
+pub const ATOM_INT: i32 = 1;
+pub const ATOM_FLOAT: i32 = 2;
+pub const ATOM_STRING: i32 = 3;
+#[allow(dead_code)]
+pub const ATOM_LIST_POINTER: i32 = 4;
+pub const ATOM_OBJECT: i32 = 5;
+pub const ATOM_PAIR: i32 = 6;
+
+fn leak_list_header() -> *mut ListHeader {
+    let hdr = Box::new(ListHeader {
+        type_tag: ATOM_SENTINEL,
+        contains_literals: 0,
+        length: 0,
+        head: std::ptr::null_mut(),
+        tail: std::ptr::null_mut(),
+    });
+    Box::leak(hdr) as *mut ListHeader
+}
+
+fn leak_atom(type_tag: i32, value: i64) -> *mut ListAtom {
+    let atom = Box::new(ListAtom {
+        type_tag,
+        pad: 0,
+        value,
+        next: std::ptr::null_mut(),
+    });
+    Box::leak(atom) as *mut ListAtom
+}
+
+/// Create a fresh empty list. JIT-emitted `LIST(...)` construction
+/// calls this once, then issues an `APND_*` per initialiser.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __newbcpl_list_new_empty() -> *mut ListHeader {
+    leak_list_header()
+}
+
+fn append_atom(hdr: *mut ListHeader, atom: *mut ListAtom) {
+    if hdr.is_null() || atom.is_null() {
+        return;
+    }
+    unsafe {
+        let h = &mut *hdr;
+        if h.head.is_null() {
+            h.head = atom;
+            h.tail = atom;
+        } else {
+            (*h.tail).next = atom;
+            h.tail = atom;
+        }
+        h.length += 1;
+    }
+}
+
+/// `APND(list, n)` — append an integer atom to `list`. The same
+/// entry point handles boolean / character / packed-word values
+/// since BCPL treats every word identically at the ABI.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn APND(hdr: *mut ListHeader, value: i64) -> i64 {
+    append_atom(hdr, leak_atom(ATOM_INT, value));
+    0
+}
+
+/// Float-typed append (BCPL `FPND` in the reference; aliased to
+/// `APND_FLOAT` for our emit's per-arg type dispatch). The value
+/// comes in as `f64`; we reinterpret-store its bits in the atom's
+/// `i64` value slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn APND_FLOAT(hdr: *mut ListHeader, value: f64) -> i64 {
+    append_atom(hdr, leak_atom(ATOM_FLOAT, value.to_bits() as i64));
+    0
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn APND_STRING(hdr: *mut ListHeader, ptr: *const u8) -> i64 {
+    append_atom(hdr, leak_atom(ATOM_STRING, ptr as i64));
+    0
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn APND_OBJECT(hdr: *mut ListHeader, ptr: *const u8) -> i64 {
+    append_atom(hdr, leak_atom(ATOM_OBJECT, ptr as i64));
+    0
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn APND_PAIR(hdr: *mut ListHeader, packed: i64) -> i64 {
+    append_atom(hdr, leak_atom(ATOM_PAIR, packed));
+    0
+}
+
+/// `CONCAT(a, b)` — return a fresh list whose atoms are a copy of
+/// `a` followed by a copy of `b`. The reference's
+/// `BCPL_CONCAT_LISTS` is destructive (rewires `a.tail.next`);
+/// we copy for safety since neither header is GC-tracked yet.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn CONCAT(a: *mut ListHeader, b: *mut ListHeader) -> *mut ListHeader {
+    let result = leak_list_header();
+    for src in [a, b] {
+        if src.is_null() {
+            continue;
+        }
+        let mut cur = unsafe { (*src).head };
+        while !cur.is_null() {
+            let (tt, v) = unsafe { ((*cur).type_tag, (*cur).value) };
+            append_atom(result, leak_atom(tt, v));
+            cur = unsafe { (*cur).next };
+        }
+    }
+    result
+}
+
 // ─── vector / list runtime helpers ───────────────────────────────
 //
 // BCPL convention: a vector of N words is allocated as N+1 words.
@@ -388,15 +540,28 @@ pub unsafe extern "C" fn FREEVEC(_p: *mut i64) -> i64 {
     0
 }
 
-/// `__newbcpl_len(p)` — read the BCPL length header that lives one
-/// word *before* the data pointer. Mirrors the NewCP / reference
-/// runtime layout. Returns 0 for null.
+/// `__newbcpl_len(p)` — vector length, read from the word *before*
+/// the data pointer (BCPL convention). Used for VEC / FVEC /
+/// PAIRS. Lists go through `__newbcpl_list_len` because their
+/// length lives at a different offset inside a `ListHeader`.
+/// Returns 0 for null.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __newbcpl_len(p: *const i64) -> i64 {
     if p.is_null() {
         return 0;
     }
     unsafe { *p.offset(-1) }
+}
+
+/// `__newbcpl_list_len(header)` — length of a real `ListHeader`,
+/// O(1) (the length is maintained on every append). Returns 0 for
+/// null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __newbcpl_list_len(hdr: *const ListHeader) -> i64 {
+    if hdr.is_null() {
+        return 0;
+    }
+    unsafe { (*hdr).length }
 }
 
 #[unsafe(no_mangle)]
@@ -409,32 +574,80 @@ pub unsafe extern "C" fn __newbcpl_freelist(_p: *mut i64) -> i64 {
     0
 }
 
-/// List ABI placeholder: the reference uses a header struct;
-/// without GC integration we treat a list as a contiguous run
-/// of words and `hd` reads slot 0. `tl` returns a pointer one
-/// word past the head. `rest(p, n)` skips n words.
+/// `HD(list)` — read the value of the first atom. Returns 0 if
+/// the list is null or empty. The atom's `type_tag` is ignored
+/// here; BCPL treats every value as a 64-bit word at the call
+/// site, with the caller responsible for interpretation (`HD` of
+/// a list-of-pairs is an i64-packed PAIR, etc.).
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn __newbcpl_list_hd(p: *const i64) -> i64 {
-    if p.is_null() {
+pub unsafe extern "C" fn __newbcpl_list_hd(hdr: *const ListHeader) -> i64 {
+    if hdr.is_null() {
         return 0;
     }
-    unsafe { *p }
+    let head = unsafe { (*hdr).head };
+    if head.is_null() {
+        return 0;
+    }
+    unsafe { (*head).value }
 }
 
+/// `TL(list)` — return a fresh header whose contents are every
+/// atom after the head, sharing the same nodes. The original
+/// list is unmodified. Returns null for empty / null input.
+///
+/// Sharing nodes is a deliberate choice: BCPL `tl` is the
+/// constant-time list spine — copying every node would change
+/// O(1) into O(n). When the GC migration of list nodes lands,
+/// the sharing is still safe because we mark via the head
+/// pointer's reachability.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn __newbcpl_list_tl(p: *mut i64) -> *mut i64 {
-    if p.is_null() {
+pub unsafe extern "C" fn __newbcpl_list_tl(hdr: *mut ListHeader) -> *mut ListHeader {
+    if hdr.is_null() {
         return std::ptr::null_mut();
     }
-    unsafe { p.add(1) }
+    let head = unsafe { (*hdr).head };
+    if head.is_null() {
+        return std::ptr::null_mut();
+    }
+    let next = unsafe { (*head).next };
+    if next.is_null() {
+        // Empty tail — return an empty list header so callers
+        // can chain `TL(TL(...))` without null checks.
+        return leak_list_header();
+    }
+    let new_hdr = leak_list_header();
+    unsafe {
+        (*new_hdr).head = next;
+        (*new_hdr).tail = (*hdr).tail;
+        (*new_hdr).length = (*hdr).length - 1;
+    }
+    new_hdr
 }
 
+/// `REST(list, n)` — skip the first `n` atoms. Same sharing
+/// strategy as `TL`. `n <= 0` returns the original; null in →
+/// null out.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn __newbcpl_list_rest(p: *mut i64, n: i64) -> *mut i64 {
-    if p.is_null() {
+pub unsafe extern "C" fn __newbcpl_list_rest(hdr: *mut ListHeader, n: i64) -> *mut ListHeader {
+    if hdr.is_null() {
         return std::ptr::null_mut();
     }
-    unsafe { p.add(n.max(0) as usize) }
+    if n <= 0 {
+        return hdr;
+    }
+    let mut cur = unsafe { (*hdr).head };
+    let mut skipped = 0i64;
+    while !cur.is_null() && skipped < n {
+        cur = unsafe { (*cur).next };
+        skipped += 1;
+    }
+    let new_hdr = leak_list_header();
+    unsafe {
+        (*new_hdr).head = cur;
+        (*new_hdr).tail = (*hdr).tail;
+        (*new_hdr).length = (*hdr).length - skipped;
+    }
+    new_hdr
 }
 
 // Function-call-form aliases of the list helpers. BCPL programs
@@ -444,18 +657,18 @@ pub unsafe extern "C" fn __newbcpl_list_rest(p: *mut i64, n: i64) -> *mut i64 {
 // expose the same addresses under those names.
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn HD(p: *const i64) -> i64 {
-    unsafe { __newbcpl_list_hd(p) }
+pub unsafe extern "C" fn HD(hdr: *const ListHeader) -> i64 {
+    unsafe { __newbcpl_list_hd(hdr) }
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn TL(p: *mut i64) -> *mut i64 {
-    unsafe { __newbcpl_list_tl(p) }
+pub unsafe extern "C" fn TL(hdr: *mut ListHeader) -> *mut ListHeader {
+    unsafe { __newbcpl_list_tl(hdr) }
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn TAIL(p: *mut i64) -> *mut i64 {
-    unsafe { __newbcpl_list_tl(p) }
+pub unsafe extern "C" fn TAIL(hdr: *mut ListHeader) -> *mut ListHeader {
+    unsafe { __newbcpl_list_tl(hdr) }
 }
 
 /// `SPLIT(s, delim)` — placeholder. Real implementation needs the
@@ -546,11 +759,19 @@ pub fn builtin_addresses() -> &'static [Builtin] {
             builtin!(FREEVEC),
             builtin!(SPLIT),
             builtin!(__newbcpl_len),
+            builtin!(__newbcpl_list_len),
             builtin!(__newbcpl_freevec),
             builtin!(__newbcpl_freelist),
             builtin!(__newbcpl_list_hd),
             builtin!(__newbcpl_list_tl),
             builtin!(__newbcpl_list_rest),
+            builtin!(__newbcpl_list_new_empty),
+            builtin!(APND),
+            builtin!(APND_FLOAT),
+            builtin!(APND_STRING),
+            builtin!(APND_OBJECT),
+            builtin!(APND_PAIR),
+            builtin!(CONCAT),
             Builtin {
                 name: "__newbcpl_new_rec",
                 address: crate::gc::__newbcpl_new_rec as *const () as usize,

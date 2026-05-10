@@ -841,18 +841,16 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
             TypedKind::FQuad => self.build_simd_vector(args, /* float = */ true),
             // FOCT = <8 x f32>, 256-bit. Real LLVM vector across two Q-regs.
             TypedKind::FOct => self.build_simd_vector(args, /* float = */ true),
-            // LIST / MANIFESTLIST currently share the VEC layout
-            // (length header at offset -8, data starts at the
-            // returned pointer). The reference uses a linked
-            // ListHeader/ListAtom shape; until that arrives,
-            // allocating LIST as a contiguous length-prefixed
-            // array keeps `LEN(list)` and FOREACH iteration
-            // working on simple cases. Heterogeneous element
-            // types (pointers vs ints) round-trip through the
-            // i64 word as in the reference.
-            TypedKind::List | TypedKind::ManifestList => {
-                self.emit_vec_construct(args, false)
-            }
+            // LIST / MANIFESTLIST construct a real linked
+            // `ListHeader` + chain of `ListAtom`s — matches
+            // `reference/runtime/ListDataTypes.h` byte-for-byte
+            // so HD/TL/APND/CONCAT all walk the same shape.
+            // We emit a call to `__newbcpl_list_new_empty()`
+            // and then issue one `APND_*` per initialiser,
+            // type-dispatched by each arg's LLVM type so that
+            // floats land in float atoms and packed PAIR
+            // values land in pair atoms.
+            TypedKind::List | TypedKind::ManifestList => self.emit_list_construct(args),
         }
     }
 
@@ -1033,6 +1031,115 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
             acc = self.builder.build_or(acc, placed, "pack.acc").expect("or");
         }
         acc
+    }
+
+    /// `LIST(a, b, c)` lowers to:
+    ///   1. `header = __newbcpl_list_new_empty()`
+    ///   2. for each arg: `APND_*(header, arg)` — the suffix
+    ///      depends on the arg's LLVM type so floats end up in
+    ///      `ATOM_FLOAT` atoms, pointers in `ATOM_STRING` (or
+    ///      `ATOM_OBJECT` — we collapse both onto the string
+    ///      append for now since the reference's runtime treats
+    ///      raw pointers the same way at the ABI level), and
+    ///      integers / packed SIMD words in `ATOM_INT`.
+    ///   3. Return `header`.
+    /// MANIFESTLIST shares this lowering; in the reference it
+    /// allocates in read-only memory, but our runtime tracks
+    /// every list via `Box::leak` for now (GC integration of
+    /// list nodes is a follow-up slice).
+    fn emit_list_construct(&mut self, args: &[Value]) -> BasicValueEnum<'ctx> {
+        let ptr_t = self.context.ptr_type(AddressSpace::default());
+        let i64_t = self.context.i64_type();
+        let f64_t = self.context.f64_type();
+
+        // Make sure the helper functions are declared with the
+        // exact signatures the runtime exposes — we go around
+        // `declare_extern`'s defaults because the list ABI uses
+        // pointer + typed-value pairs.
+        let new_empty = self.declare_list_helper(
+            "__newbcpl_list_new_empty",
+            ptr_t.fn_type(&[], false),
+        );
+        let apnd_int = self.declare_list_helper(
+            "APND",
+            i64_t.fn_type(&[ptr_t.into(), i64_t.into()], false),
+        );
+        let apnd_float = self.declare_list_helper(
+            "APND_FLOAT",
+            i64_t.fn_type(&[ptr_t.into(), f64_t.into()], false),
+        );
+        let apnd_string = self.declare_list_helper(
+            "APND_STRING",
+            i64_t.fn_type(&[ptr_t.into(), ptr_t.into()], false),
+        );
+        let apnd_pair = self.declare_list_helper(
+            "APND_PAIR",
+            i64_t.fn_type(&[ptr_t.into(), i64_t.into()], false),
+        );
+
+        let header = self
+            .builder
+            .build_call(new_empty, &[], "list.hdr")
+            .expect("call __newbcpl_list_new_empty")
+            .try_as_basic_value();
+        use inkwell::values::ValueKind;
+        let header_ptr = match header {
+            ValueKind::Basic(v) => self.as_pointer(v),
+            ValueKind::Instruction(_) => panic!(
+                "__newbcpl_list_new_empty must return a pointer"
+            ),
+        };
+
+        for (i, a) in args.iter().enumerate() {
+            let v = self.lower_value(a);
+            let (callee, arg_val): (FunctionValue<'ctx>, BasicMetadataValueEnum<'ctx>) = match v {
+                BasicValueEnum::FloatValue(_) => (apnd_float, v.into()),
+                BasicValueEnum::PointerValue(_) => (apnd_string, v.into()),
+                // VectorValue (FQUAD / FOCT) doesn't fit a list
+                // atom's i64 slot — collapse via `as_int_word`
+                // for now (loses lanes; same band-aid we use
+                // for other vector-to-word boundaries).
+                BasicValueEnum::IntValue(_) | BasicValueEnum::VectorValue(_) => {
+                    let packed = self.as_int_word(v);
+                    // We don't track the source's SIMD kind here;
+                    // route packed PAIR / QUAD / OCT values
+                    // through `APND_PAIR` so the atom carries an
+                    // `ATOM_PAIR` tag. Bare integers also go
+                    // through this path — the atom holds the
+                    // same i64 either way and the type tag is
+                    // a hint, not a correctness gate.
+                    let needs_pair_tag =
+                        matches!(a, Value::Local(_)) && matches!(v, BasicValueEnum::VectorValue(_));
+                    let callee = if needs_pair_tag { apnd_pair } else { apnd_int };
+                    (callee, packed.into())
+                }
+                _ => (apnd_int, self.as_int_word(v).into()),
+            };
+            let _ = self
+                .builder
+                .build_call(callee, &[header_ptr.into(), arg_val], &format!("list.apnd.{i}"))
+                .expect("call APND_*");
+        }
+        header_ptr.into()
+    }
+
+    /// Declare a list-runtime helper with a precise signature.
+    /// Bypasses `declare_extern`'s default `i64 fn(i64, ...)`
+    /// shape so pointer / float parameters are typed correctly
+    /// and the LLVM verifier accepts the call.
+    fn declare_list_helper(
+        &mut self,
+        name: &str,
+        fn_type: inkwell::types::FunctionType<'ctx>,
+    ) -> FunctionValue<'ctx> {
+        if let Some(&existing) = self.by_name.get(name) {
+            return existing;
+        }
+        let fv = self
+            .module
+            .add_function(name, fn_type, Some(Linkage::External));
+        self.by_name.insert(name.to_string(), fv);
+        fv
     }
 
     /// Lane access (`pair.|n|`). Dispatches on the source's SIMD

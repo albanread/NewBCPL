@@ -736,11 +736,16 @@ impl<'a> Lowerer<'a> {
     /// `FOREACH name IN iter DO body`
     /// — or its destructuring form `FOREACH (n0, n1[, ...]) IN iter DO body`.
     ///
-    /// Iteration shape: index from 0 to `__newbcpl_len(iter) - 1`,
-    /// per-iteration `element = iter ! i`. This works for both VEC
-    /// and the simplified array-shaped LIST emit puts in place
-    /// today. Linked-list semantics (HD/TL traversal) arrive when
-    /// the real list runtime lands.
+    /// Two iteration shapes, picked from the iterable's type
+    /// hint:
+    ///   - **VEC / FVEC**: `i = 0..__newbcpl_len(iter)`, each
+    ///     `element = iter ! i`. Length lives at `*(iter - 8)`.
+    ///   - **LIST / MANIFESTLIST**: walk the linked
+    ///     `ListHeader → head → next → next → ...` chain.
+    ///     Each iteration loads `cursor.value` (offset 8 of a
+    ///     `ListAtom`) and steps via `cursor.next` (offset 16).
+    ///     The header's `head` lives at offset 16 of a
+    ///     `ListHeader`.
     ///
     /// Destructuring: when `names.len() > 1` the element is a
     /// SIMD-lane-packed value (PAIR ⇒ 2 lanes, QUAD ⇒ 4, OCT ⇒ 8).
@@ -757,6 +762,9 @@ impl<'a> Lowerer<'a> {
     ) {
         if names.is_empty() {
             return;
+        }
+        if matches!(iter.hint(), TypeHint::List) {
+            return self.lower_foreach_list(names, iter, body);
         }
         // Lower the iterable once, store in a stable slot so the
         // length call and the per-iteration subscripts share it.
@@ -890,6 +898,169 @@ impl<'a> Lowerer<'a> {
             value: Value::Local(i_next),
         });
         self.b().terminate(Terminator::Branch(header));
+
+        self.b().switch_to(exit);
+    }
+
+    /// FOREACH over a real linked list (a `ListHeader` chain).
+    /// Walks `header.head → atom → atom.next → ...` until the
+    /// cursor goes null. Per iteration loads `atom.value` (a
+    /// 64-bit word) and binds it to the name(s).
+    ///
+    /// Atom / header field offsets are fixed to match the C
+    /// layout in `reference/runtime/ListDataTypes.h` mirrored
+    /// in `newbcpl-runtime/builtins.rs`:
+    ///   ListAtom   { i32 type @0, i32 pad @4, i64 value @8,
+    ///                ptr  next  @16 } — total 24 bytes
+    ///   ListHeader { i32 type @0, i32 contains_literals @4,
+    ///                i64 length @8, ptr head @16, ptr tail @24 }
+    ///                — total 32 bytes
+    fn lower_foreach_list(&mut self, names: &[String], iter: &Expr, body: &Stmt) {
+        const ATOM_VALUE_OFFSET: i64 = 8;
+        const ATOM_NEXT_OFFSET: i64 = 16;
+        const HEADER_HEAD_OFFSET: i64 = 16;
+
+        // header pointer in a stable slot.
+        let header_v = self.lower_expr(iter);
+        let header_slot = self.b().alloca("foreach.list.hdr", TypeHint::List);
+        self.b().emit(Instr::Store {
+            slot: header_slot,
+            value: header_v,
+        });
+
+        // cursor = header.head — a load via `Gep(base=header,
+        // index=16, stride=1)`. The IR's Gep takes
+        // `base + index * element_bytes`, so passing
+        // `index=HEADER_HEAD_OFFSET, element_bytes=1` lands on
+        // the head field exactly.
+        let header_load = self.b().alloc_value();
+        self.b().emit(Instr::Load {
+            dst: header_load,
+            slot: header_slot,
+            hint: TypeHint::List,
+        });
+        let head_field = self.b().alloc_value();
+        self.b().emit(Instr::Gep {
+            dst: head_field,
+            base: Value::Local(header_load),
+            index: Value::Const(Const::Int(HEADER_HEAD_OFFSET)),
+            element_bytes: 1,
+        });
+        let initial_head = self.b().alloc_value();
+        self.b().emit(Instr::IndirectLoad {
+            dst: initial_head,
+            addr: Value::Local(head_field),
+            hint: TypeHint::List,
+        });
+
+        // cursor slot — holds the current atom pointer.
+        let cursor_slot = self.b().alloca("foreach.list.cur", TypeHint::List);
+        self.b().emit(Instr::Store {
+            slot: cursor_slot,
+            value: Value::Local(initial_head),
+        });
+
+        let header_block = self.b().alloc_block("foreach.list.header");
+        let body_block = self.b().alloc_block("foreach.list.body");
+        let incr = self.b().alloc_block("foreach.list.next");
+        let exit = self.b().alloc_block("foreach.list.end");
+
+        self.b().terminate(Terminator::Branch(header_block));
+        self.b().switch_to(header_block);
+        let cursor_load = self.b().alloc_value();
+        self.b().emit(Instr::Load {
+            dst: cursor_load,
+            slot: cursor_slot,
+            hint: TypeHint::List,
+        });
+        // `cursor != 0` — coerce-friendly. The IR's icmp.ne
+        // emit goes through `as_int_word`, which handles
+        // pointer operands by ptrtoint-ing them.
+        let cmp = self.b().alloc_value();
+        self.b().emit(Instr::BinOp {
+            dst: cmp,
+            op: IrBinOp::ICmpNe,
+            lhs: Value::Local(cursor_load),
+            rhs: Value::Const(Const::Int(0)),
+            hint: TypeHint::Int,
+        });
+        self.b().terminate(Terminator::CondBranch {
+            cond: Value::Local(cmp),
+            then_block: body_block,
+            else_block: exit,
+        });
+
+        // Body: load atom.value, bind to name(s), run body.
+        self.b().switch_to(body_block);
+        self.b().push_scope();
+        let cur_for_value = self.b().alloc_value();
+        self.b().emit(Instr::Load {
+            dst: cur_for_value,
+            slot: cursor_slot,
+            hint: TypeHint::List,
+        });
+        let value_field = self.b().alloc_value();
+        self.b().emit(Instr::Gep {
+            dst: value_field,
+            base: Value::Local(cur_for_value),
+            index: Value::Const(Const::Int(ATOM_VALUE_OFFSET)),
+            element_bytes: 1,
+        });
+        let elem = self.b().alloc_value();
+        self.b().emit(Instr::IndirectLoad {
+            dst: elem,
+            addr: Value::Local(value_field),
+            hint: TypeHint::Word,
+        });
+
+        if names.len() == 1 {
+            let slot = self.b().alloca(&names[0], TypeHint::Word);
+            self.b().emit(Instr::Store {
+                slot,
+                value: Value::Local(elem),
+            });
+            self.b().declare_local(&names[0], slot, None);
+        } else {
+            self.unpack_lanes(names, Value::Local(elem));
+        }
+
+        self.b().frames.push(Frame {
+            break_block: exit,
+            continue_block: Some(incr),
+        });
+        self.lower_stmt(body);
+        self.b().frames.pop();
+        if self.b().current_open() {
+            self.b().terminate(Terminator::Branch(incr));
+        }
+        self.b().pop_scope();
+
+        // Step: cursor = cursor.next.
+        self.b().switch_to(incr);
+        let cur_for_next = self.b().alloc_value();
+        self.b().emit(Instr::Load {
+            dst: cur_for_next,
+            slot: cursor_slot,
+            hint: TypeHint::List,
+        });
+        let next_field = self.b().alloc_value();
+        self.b().emit(Instr::Gep {
+            dst: next_field,
+            base: Value::Local(cur_for_next),
+            index: Value::Const(Const::Int(ATOM_NEXT_OFFSET)),
+            element_bytes: 1,
+        });
+        let next = self.b().alloc_value();
+        self.b().emit(Instr::IndirectLoad {
+            dst: next,
+            addr: Value::Local(next_field),
+            hint: TypeHint::List,
+        });
+        self.b().emit(Instr::Store {
+            slot: cursor_slot,
+            value: Value::Local(next),
+        });
+        self.b().terminate(Terminator::Branch(header_block));
 
         self.b().switch_to(exit);
     }
@@ -1455,7 +1626,22 @@ impl<'a> Lowerer<'a> {
         // BCPL list / vector keyword operators lower to runtime
         // calls. The runtime helper names line up with NewCP's
         // convention so the GC and ABI shapes match.
-        if let Some(runtime_name) = unary_runtime_helper(op) {
+        if let Some(default_name) = unary_runtime_helper(op) {
+            // `LEN` is the one operator where the runtime helper
+            // differs by operand shape — vectors carry their
+            // length one word *before* the data pointer, while
+            // lists hold it in a `ListHeader` field. Dispatch
+            // here so the call site lands on the right address;
+            // see `__newbcpl_len` and `__newbcpl_list_len` in
+            // newbcpl-runtime/builtins.rs. `HD`/`TL`/`REST` are
+            // already list-shaped and have no vector form.
+            let runtime_name = if matches!(op, UnaryOp::Len)
+                && matches!(operand.hint(), TypeHint::List)
+            {
+                "__newbcpl_list_len"
+            } else {
+                default_name
+            };
             let arg = self.lower_expr(operand);
             // FREEVEC / FREELIST don't produce a useful value — emit
             // the call with no result slot.
