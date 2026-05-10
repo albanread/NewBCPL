@@ -889,22 +889,35 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
         }
     }
 
-    /// VEC k with `k` a constant size produces `alloca [k+1 x i64]`
-    /// (BCPL's "size k declares a vector of k+1 cells"). VEC [e1,
-    /// e2, …] with explicit initialisers allocates `[N x i64]`
-    /// where N is the arg count and stores each element.
+    /// `VEC k` / `FVEC k` / their init-list cousins all allocate a
+    /// `(k+1) * 8`-byte buffer on the **GC heap** via
+    /// `__newbcpl_alloc_rec`. Slot 0 holds the length; the
+    /// returned pointer is one word past slot 0 so `V!i` lands on
+    /// slot `1+i` and `__newbcpl_len(V)` reads the length at
+    /// `*(V-8)`.
+    ///
+    /// The buffer is heap, not stack, because BCPL's value
+    /// semantics make a VEC variable a *pointer* — it's freely
+    /// copied between locals, returned from functions, stored
+    /// into other vectors, and put into lists. A stack-alloca'd
+    /// buffer would dangle the moment the constructing frame
+    /// exits. Heap-allocating uniformly turns the question of
+    /// "does this VEC escape?" from a precondition into a
+    /// safety property.
+    ///
+    /// `float` selects the slot type for the init-list path
+    /// (f64 vs i64). The const-size path is element-type-agnostic
+    /// because it allocates raw bytes — the slot-load type is
+    /// determined at the use site.
     fn emit_vec_construct(&mut self, args: &[Value], float: bool) -> BasicValueEnum<'ctx> {
-        let elem_t: BasicTypeEnum<'ctx> = if float {
-            self.context.f64_type().into()
-        } else {
-            self.context.i64_type().into()
-        };
-        // Heuristic: a single Int constant arg means "size k", so
-        // allocate k+1 cells. Anything else is treated as an init
-        // list (one cell per arg).
+        let i64_t = self.context.i64_type();
+        let f64_t = self.context.f64_type();
+        // Heuristic: a single Int constant arg means "size k",
+        // so allocate `k+1` cells. Anything else is treated as
+        // an init list (one cell per arg).
         let single_const_size = if args.len() == 1 {
             if let Value::Const(Const::Int(k)) = &args[0] {
-                Some(*k)
+                Some(*k as u64)
             } else {
                 None
             }
@@ -912,103 +925,116 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
             None
         };
 
-        if let Some(k) = single_const_size {
-            // BCPL convention: a vector of length k is allocated
-            // as k+1 cells. The first cell stores the length;
-            // the returned pointer points at cell 1 (the first
-            // data element). `V!i` therefore lands on cell 1+i,
-            // and `__newbcpl_len(V)` reads `*(V-8)` to recover k.
-            let total = (k as u64).saturating_add(1) as u32;
-            let arr_t = match elem_t {
-                BasicTypeEnum::IntType(t) => t.array_type(total),
-                BasicTypeEnum::FloatType(t) => t.array_type(total),
-                _ => unreachable!(),
-            };
-            let alloca = self.builder.build_alloca(arr_t, "vec").expect("vec");
-            let i64_t = self.context.i64_type();
-            // Store length at slot 0.
-            let zero = i64_t.const_zero();
-            let header_ptr = unsafe {
-                self.builder
-                    .build_gep(arr_t, alloca, &[zero, zero], "vec.len_hdr")
-                    .expect("gep header")
-            };
-            self.builder
-                .build_store(header_ptr, i64_t.const_int(k as u64, true))
-                .expect("store vec length");
-            // Return pointer to slot 1 — that is the data pointer
-            // the rest of the program sees.
-            let one = i64_t.const_int(1, false);
-            let data_ptr = unsafe {
-                self.builder
-                    .build_gep(arr_t, alloca, &[zero, one], "vec.data")
-                    .expect("gep data")
-            };
-            return data_ptr.into();
+        let count: u64 = single_const_size.unwrap_or_else(|| args.len() as u64);
+        let total_bytes = count.saturating_add(1).saturating_mul(8);
+
+        // Heap-allocate via the GC's size-keyed allocator.
+        let buf = self.alloc_rec_bytes(total_bytes);
+        // Length header at byte offset 0.
+        self.store_word_at_offset(buf, 0, i64_t.const_int(count, true).into());
+
+        // Init-list form: write each scalar at byte offsets
+        // 8, 16, 24, … (one word stride). The const-size path
+        // skips this loop — the GC zero-initialises the block,
+        // so unwritten slots already read 0.
+        if single_const_size.is_none() {
+            for (i, v) in args.iter().enumerate() {
+                let elem_v = self.lower_value(v);
+                // Coerce to the slot type.
+                let stored: BasicValueEnum<'ctx> = if float {
+                    match elem_v {
+                        BasicValueEnum::FloatValue(_) => elem_v,
+                        BasicValueEnum::IntValue(iv) => self
+                            .builder
+                            .build_signed_int_to_float(iv, f64_t, "i2f")
+                            .expect("sitofp")
+                            .into(),
+                        _ => elem_v,
+                    }
+                } else {
+                    match elem_v {
+                        BasicValueEnum::IntValue(_) => self.as_int_word(elem_v).into(),
+                        BasicValueEnum::VectorValue(_) => {
+                            self.pack_vector_to_word(elem_v).into()
+                        }
+                        _ => elem_v,
+                    }
+                };
+                let offset = (i as u64 + 1) * 8;
+                self.store_word_at_offset(buf, offset, stored);
+            }
         }
 
-        // Init-list form: alloca `[N+1 x T]`, store length at slot
-        // 0, each init value at slots 1..=N, return slot 1's
-        // address. Same convention as the const-size form so
-        // LEN/FOREACH read the length header at -8 reliably.
-        let count = args.len() as u32;
-        let total = count + 1;
-        let arr_t = match elem_t {
-            BasicTypeEnum::IntType(t) => t.array_type(total),
-            BasicTypeEnum::FloatType(t) => t.array_type(total),
-            _ => unreachable!(),
-        };
-        let alloca = self.builder.build_alloca(arr_t, "vec").expect("vec");
+        // Return the data pointer — one word past the length header.
+        self.byte_offset_ptr(buf, 8, "vec.data").into()
+    }
+
+    /// Call `__newbcpl_alloc_rec(size)` and return the resulting
+    /// pointer. Declares the function on demand with its precise
+    /// `ptr fn(i64)` signature.
+    fn alloc_rec_bytes(&mut self, size: u64) -> PointerValue<'ctx> {
         let i64_t = self.context.i64_type();
-        // Length header at slot 0.
-        let zero = i64_t.const_zero();
-        let header_ptr = unsafe {
-            self.builder
-                .build_gep(arr_t, alloca, &[zero, zero], "vec.len_hdr")
-                .expect("gep header")
+        let ptr_t = self.context.ptr_type(AddressSpace::default());
+        let alloc_fn = match self.by_name.get("__newbcpl_alloc_rec") {
+            Some(&f) => f,
+            None => {
+                let fn_ty = ptr_t.fn_type(&[i64_t.into()], false);
+                let fv = self.module.add_function(
+                    "__newbcpl_alloc_rec",
+                    fn_ty,
+                    Some(Linkage::External),
+                );
+                self.by_name
+                    .insert("__newbcpl_alloc_rec".to_string(), fv);
+                fv
+            }
         };
-        self.builder
-            .build_store(header_ptr, i64_t.const_int(count as u64, true))
-            .expect("store init length");
-        for (i, v) in args.iter().enumerate() {
-            let elem_v = self.lower_value(v);
-            // Coerce the value to fit the slot. The interesting
-            // case is SIMD PAIR / QUAD / OCT values: in the IR
-            // they're produced as wide LLVM vectors (the IR
-            // models lanes explicitly), but a LIST / VEC slot
-            // is one i64 word. Pack the lanes into i64 using the
-            // BCPL convention — low-order lanes occupy the low
-            // bits, sign-truncated to the lane width — so that
-            // `FOREACH (a, b) IN list-of-pairs` reads them back
-            // by shifting / sign-extending. Plain int-vs-int
-            // mismatches go through `as_int_word` as before.
-            let elem_v = match (elem_v, elem_t) {
-                (BasicValueEnum::IntValue(_), BasicTypeEnum::IntType(_)) => {
-                    self.as_int_word(elem_v).into()
-                }
-                (BasicValueEnum::VectorValue(_), BasicTypeEnum::IntType(_)) => {
-                    self.pack_vector_to_word(elem_v).into()
-                }
-                _ => elem_v,
-            };
-            let idx = i64_t.const_int((i + 1) as u64, false);
-            let elem_ptr = unsafe {
-                self.builder
-                    .build_gep(arr_t, alloca, &[zero, idx], &format!("vec.elem.{i}"))
-                    .expect("gep init")
-            };
-            self.builder
-                .build_store(elem_ptr, elem_v)
-                .expect("store init");
+        let size_arg = i64_t.const_int(size, false);
+        let call_site = self
+            .builder
+            .build_call(alloc_fn, &[size_arg.into()], "alloc_rec")
+            .expect("call __newbcpl_alloc_rec");
+        use inkwell::values::ValueKind;
+        match call_site.try_as_basic_value() {
+            ValueKind::Basic(rv) => self.as_pointer(rv),
+            ValueKind::Instruction(_) => {
+                panic!("__newbcpl_alloc_rec must return a pointer")
+            }
         }
-        // Return pointer to slot 1.
-        let one = i64_t.const_int(1, false);
-        let data_ptr = unsafe {
+    }
+
+    /// `gep i8, base, [offset]` — produce an `i8*`-style pointer
+    /// at `base + offset` bytes. The opaque-pointer model means
+    /// the LLVM-level pointer is untyped; the load/store at the
+    /// use site picks the value type.
+    fn byte_offset_ptr(
+        &self,
+        base: PointerValue<'ctx>,
+        offset: u64,
+        name: &str,
+    ) -> PointerValue<'ctx> {
+        let i64_t = self.context.i64_type();
+        let i8_t = self.context.i8_type();
+        let off = i64_t.const_int(offset, false);
+        unsafe {
             self.builder
-                .build_gep(arr_t, alloca, &[zero, one], "vec.data")
-                .expect("gep data")
-        };
-        data_ptr.into()
+                .build_gep(i8_t, base, &[off], name)
+                .expect("gep byte offset")
+        }
+    }
+
+    /// Convenience: store an i64-shaped value at `base + offset`
+    /// bytes. Used for the length header and each init-list slot.
+    fn store_word_at_offset(
+        &self,
+        base: PointerValue<'ctx>,
+        offset: u64,
+        value: BasicValueEnum<'ctx>,
+    ) {
+        let slot = self.byte_offset_ptr(base, offset, "slot");
+        self.builder
+            .build_store(slot, value)
+            .expect("store at byte offset");
     }
 
     /// Pack a SIMD lane vector into a single i64 word using the

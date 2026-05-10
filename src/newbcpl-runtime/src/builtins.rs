@@ -501,16 +501,25 @@ pub unsafe extern "C" fn CONCAT(a: *mut ListHeader, b: *mut ListHeader) -> *mut 
 // These implementations leak today — they're unblocking stubs
 // until the GC integration lands.
 
-/// Allocate a fresh, zeroed slab of `(n_words + 1) * 8` bytes,
-/// store `n_words` into the first slot, and return a pointer one
-/// word past the start so subscripts `p!0..p!(n-1)` and
-/// `__newbcpl_len(p)` (which reads `p[-1]`) both work.
+/// Allocate a fresh, zeroed slab of `(n_words + 1) * 8` bytes on
+/// the **GC heap** via the size-keyed allocator, store `n_words`
+/// into the first slot, and return a pointer one word past the
+/// start so subscripts `p!0..p!(n-1)` and `__newbcpl_len(p)`
+/// (which reads `p[-1]`) both work.
+///
+/// Heap allocation is correct even when the caller is a JIT'd
+/// routine — see `__newbcpl_alloc_rec` for the runtime-side
+/// TypeDesc-interning that keeps `BlockHeader.tag` pointers
+/// stable across JIT engine drops.
 fn alloc_vec_words(n_words: i64) -> *mut i64 {
     let n = n_words.max(0) as usize;
-    let mut buf = vec![0i64; n + 1].into_boxed_slice();
-    buf[0] = n_words;
-    let raw = Box::leak(buf).as_mut_ptr();
-    unsafe { raw.add(1) }
+    let total_bytes = (n + 1) * std::mem::size_of::<i64>();
+    let raw = unsafe { __newbcpl_alloc_rec(total_bytes as i64) } as *mut i64;
+    // The GC zero-initialises the block; we just stamp the length.
+    unsafe {
+        *raw = n_words;
+        raw.add(1)
+    }
 }
 
 #[unsafe(no_mangle)]
