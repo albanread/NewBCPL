@@ -253,6 +253,17 @@ pub enum Terminator {
         then_block: BlockId,
         else_block: BlockId,
     },
+    /// `SWITCHON value INTO ...` — multi-target dispatch. Each entry
+    /// in `cases` is a `(constant, target)` pair: when `value`
+    /// matches the constant, control flows to `target`. If nothing
+    /// matches, control flows to `default`. Codegen emits LLVM's
+    /// `switch` instruction directly when all case constants are
+    /// `Const::Int`; otherwise falls back to a chain of CondBranches.
+    Switch {
+        value: Value,
+        cases: Vec<(Value, BlockId)>,
+        default: BlockId,
+    },
     /// Marker for blocks reached only via fallthrough that we never
     /// expect to execute (e.g. dead block after `RETURN`). Codegen
     /// emits an `unreachable` instruction.

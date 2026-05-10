@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 
 use newbcpl_parser::{
-    BinaryOp, Block, Decl, Expr, FunctionDecl, LetDecl, Program, RoutineDecl, Stmt,
+    BinaryOp, Block, Decl, Expr, FunctionDecl, LetDecl, Program, RoutineDecl, Stmt, SwitchCase,
     TypeConstructorKind, UnaryOp,
 };
 use newbcpl_sema::{ClassLayout, SemaOutput, TypeHint};
@@ -63,10 +63,13 @@ struct Builder {
     /// through the layout / vtable tables.
     scopes: Vec<HashMap<String, LocalInfo>>,
     /// Stack of currently-active control-flow frames so `BREAK` /
-    /// `LOOP` know which loop to target. Every loop pushes one frame
-    /// on entry and pops on exit; the innermost frame is the BREAK
-    /// / LOOP target.
-    loops: Vec<LoopFrame>,
+    /// `LOOP` / `ENDCASE` know which scope to target. WHILE / UNTIL /
+    /// FOR / REPEAT push a frame with `continue_block` set; SWITCHON
+    /// pushes one with `continue_block` = None (since `LOOP` skips
+    /// past it to the enclosing loop). The innermost frame is the
+    /// BREAK / ENDCASE target; the innermost *loop* frame is the
+    /// LOOP target.
+    frames: Vec<Frame>,
 }
 
 #[derive(Debug, Clone)]
@@ -80,13 +83,15 @@ struct LocalInfo {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct LoopFrame {
-    /// `BREAK` jumps here.
+struct Frame {
+    /// `BREAK` (and `ENDCASE` inside a SWITCHON) jumps here.
     break_block: BlockId,
     /// `LOOP` jumps here. For WHILE / UNTIL / FOR this is the
     /// header block; for REPEAT-family loops it's the body block
-    /// (so `LOOP` re-enters at the start of the iteration).
-    continue_block: BlockId,
+    /// (so `LOOP` re-enters at the start of the iteration). `None`
+    /// for SWITCHON frames — `LOOP` walks past to the enclosing
+    /// loop (or sema has already warned).
+    continue_block: Option<BlockId>,
 }
 
 impl Builder {
@@ -110,8 +115,19 @@ impl Builder {
             next_block: 1,
             current_block: entry,
             scopes: vec![HashMap::new()],
-            loops: Vec::new(),
+            frames: Vec::new(),
         }
+    }
+
+    fn innermost_break(&self) -> Option<BlockId> {
+        self.frames.last().map(|f| f.break_block)
+    }
+
+    fn innermost_continue(&self) -> Option<BlockId> {
+        self.frames
+            .iter()
+            .rev()
+            .find_map(|f| f.continue_block)
     }
 
     fn current_block_terminator(&self) -> Option<&Terminator> {
@@ -346,20 +362,36 @@ impl<'a> Lowerer<'a> {
                 ..
             } => self.lower_for(name, start, end, step.as_ref(), body),
             Stmt::Break(_) => {
-                if let Some(frame) = self.b().loops.last().copied() {
-                    self.b().terminate(Terminator::Branch(frame.break_block));
+                if let Some(target) = self.b().innermost_break() {
+                    self.b().terminate(Terminator::Branch(target));
                     let dead = self.b().alloc_block("after.break");
                     self.b().switch_to(dead);
                 }
-                // BREAK outside any loop is sema-flagged; emit nothing.
+                // BREAK outside any frame is sema-flagged; emit nothing.
             }
             Stmt::Loop(_) => {
-                if let Some(frame) = self.b().loops.last().copied() {
-                    self.b().terminate(Terminator::Branch(frame.continue_block));
+                if let Some(target) = self.b().innermost_continue() {
+                    self.b().terminate(Terminator::Branch(target));
                     let dead = self.b().alloc_block("after.loop");
                     self.b().switch_to(dead);
                 }
             }
+            Stmt::Endcase(_) => {
+                // ENDCASE jumps out of the enclosing SWITCHON. We
+                // reuse the same `break_block` slot — sema has
+                // already verified this only fires inside SWITCHON.
+                if let Some(target) = self.b().innermost_break() {
+                    self.b().terminate(Terminator::Branch(target));
+                    let dead = self.b().alloc_block("after.endcase");
+                    self.b().switch_to(dead);
+                }
+            }
+            Stmt::Switchon {
+                scrutinee,
+                cases,
+                default,
+                ..
+            } => self.lower_switchon(scrutinee, cases, default.as_deref()),
             // SWITCHON / FOREACH / labels / RETAIN etc. — subsequent
             // IR-grow chunks lower these.
             _ => {}
@@ -396,12 +428,12 @@ impl<'a> Lowerer<'a> {
         });
 
         self.b().switch_to(body_block);
-        self.b().loops.push(LoopFrame {
+        self.b().frames.push(Frame {
             break_block: exit,
-            continue_block: header,
+            continue_block: Some(header),
         });
         self.lower_stmt(body);
-        self.b().loops.pop();
+        self.b().frames.pop();
         if self.b().current_open() {
             self.b().terminate(Terminator::Branch(header));
         }
@@ -415,12 +447,12 @@ impl<'a> Lowerer<'a> {
 
         self.b().terminate(Terminator::Branch(body_block));
         self.b().switch_to(body_block);
-        self.b().loops.push(LoopFrame {
+        self.b().frames.push(Frame {
             break_block: exit,
-            continue_block: body_block,
+            continue_block: Some(body_block),
         });
         self.lower_stmt(body);
-        self.b().loops.pop();
+        self.b().frames.pop();
         if self.b().current_open() {
             self.b().terminate(Terminator::Branch(body_block));
         }
@@ -438,12 +470,12 @@ impl<'a> Lowerer<'a> {
         self.b().switch_to(body_block);
         // LOOP inside a do-while jumps to the test (next iteration's
         // condition); BREAK exits.
-        self.b().loops.push(LoopFrame {
+        self.b().frames.push(Frame {
             break_block: exit,
-            continue_block: test,
+            continue_block: Some(test),
         });
         self.lower_stmt(body);
-        self.b().loops.pop();
+        self.b().frames.pop();
         if self.b().current_open() {
             self.b().terminate(Terminator::Branch(test));
         }
@@ -519,12 +551,12 @@ impl<'a> Lowerer<'a> {
         });
 
         self.b().switch_to(body_block);
-        self.b().loops.push(LoopFrame {
+        self.b().frames.push(Frame {
             break_block: exit,
-            continue_block: incr,
+            continue_block: Some(incr),
         });
         self.lower_stmt(body);
-        self.b().loops.pop();
+        self.b().frames.pop();
         if self.b().current_open() {
             self.b().terminate(Terminator::Branch(incr));
         }
@@ -556,6 +588,88 @@ impl<'a> Lowerer<'a> {
 
         self.b().switch_to(exit);
         self.b().pop_scope();
+    }
+
+    /// `SWITCHON value INTO $( CASE k1: ... CASE k2: ... DEFAULT: ... $)`.
+    ///
+    /// Each parsed `SwitchCase` may carry multiple labels that share
+    /// one body block (`CASE 1: CASE 2: stmt` produces values=[1,2],
+    /// body=[stmt]). Adjacent fall-through cases (the parser records
+    /// `CASE 1:` with no body, then `CASE 2:` with the actual stmt)
+    /// land here as separate `SwitchCase` records — we lower them
+    /// in source order, with each case's block branching to the
+    /// next case's block on fallthrough. ENDCASE jumps to a shared
+    /// exit block.
+    fn lower_switchon(
+        &mut self,
+        scrutinee: &Expr,
+        cases: &[SwitchCase],
+        default: Option<&[Stmt]>,
+    ) {
+        let scrutinee_v = self.lower_expr(scrutinee);
+        // One block per case, in source order. The default block
+        // exists even when the user didn't write DEFAULT — codegen
+        // either lowers it as a no-op or as the explicit body.
+        let case_blocks: Vec<BlockId> = cases
+            .iter()
+            .enumerate()
+            .map(|(i, _)| self.b().alloc_block(&format!("switch.case{i}")))
+            .collect();
+        let default_block = self.b().alloc_block("switch.default");
+        let exit = self.b().alloc_block("switch.end");
+
+        // Build the switch table. Each label expression in each case
+        // points at the same case block.
+        let mut table: Vec<(Value, BlockId)> = Vec::new();
+        for (case, &block) in cases.iter().zip(case_blocks.iter()) {
+            for v in &case.values {
+                let label_v = self.lower_expr(v);
+                table.push((label_v, block));
+            }
+        }
+        self.b().terminate(Terminator::Switch {
+            value: scrutinee_v,
+            cases: table,
+            default: default_block,
+        });
+
+        // Push a SWITCHON frame so ENDCASE / BREAK target `exit`.
+        self.b().frames.push(Frame {
+            break_block: exit,
+            continue_block: None,
+        });
+
+        // Lower each case body. If a case falls through (no terminator
+        // when we finish), branch to the next case's block — or to
+        // the default block if this was the last case.
+        for (i, case) in cases.iter().enumerate() {
+            self.b().switch_to(case_blocks[i]);
+            for stmt in &case.body {
+                self.lower_stmt(stmt);
+            }
+            if self.b().current_open() {
+                let next = case_blocks
+                    .get(i + 1)
+                    .copied()
+                    .unwrap_or(default_block);
+                self.b().terminate(Terminator::Branch(next));
+            }
+        }
+
+        // The default block — body if present, otherwise just falls
+        // through to exit.
+        self.b().switch_to(default_block);
+        if let Some(body) = default {
+            for stmt in body {
+                self.lower_stmt(stmt);
+            }
+        }
+        if self.b().current_open() {
+            self.b().terminate(Terminator::Branch(exit));
+        }
+
+        self.b().frames.pop();
+        self.b().switch_to(exit);
     }
 
     fn lower_block(&mut self, block: &Block) {

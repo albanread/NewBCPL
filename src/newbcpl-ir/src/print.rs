@@ -263,6 +263,22 @@ fn render_terminator(t: &Terminator) -> String {
                 else_block.0
             )
         }
+        Terminator::Switch {
+            value,
+            cases,
+            default,
+        } => {
+            let case_strs: Vec<String> = cases
+                .iter()
+                .map(|(v, b)| format!("{} => bb{}", render_value(v), b.0))
+                .collect();
+            format!(
+                "switch {} {{ {}, default => bb{} }}",
+                render_value(value),
+                case_strs.join(", "),
+                default.0
+            )
+        }
         Terminator::Unreachable => "unreachable".to_string(),
     }
 }

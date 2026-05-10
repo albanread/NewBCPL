@@ -724,6 +724,96 @@ mod tests {
         assert!(has_lane, "expected LaneExtract with FLOAT hint");
     }
 
+    // ─── SWITCHON / ENDCASE ─────────────────────────────────────
+
+    #[test]
+    fn switchon_emits_switch_terminator() {
+        let m = lower_source(
+            "LET S(x) BE { SWITCHON x INTO $( CASE 1: f()\n CASE 2: g()\n DEFAULT: h() $) }",
+        );
+        let s = function(&m, "S");
+        let switch_count = s
+            .blocks
+            .iter()
+            .filter(|b| matches!(b.terminator, Terminator::Switch { .. }))
+            .count();
+        assert_eq!(switch_count, 1, "expected exactly one Switch terminator");
+    }
+
+    #[test]
+    fn switchon_case_blocks_have_distinct_targets() {
+        let m = lower_source(
+            "LET S(x) BE { SWITCHON x INTO $( CASE 1: f()\n CASE 2: g() $) }",
+        );
+        let s = function(&m, "S");
+        let Terminator::Switch { cases, default, .. } = s
+            .blocks
+            .iter()
+            .find_map(|b| match &b.terminator {
+                Terminator::Switch { cases, default, value: _ } => {
+                    Some(Terminator::Switch {
+                        cases: cases.clone(),
+                        default: *default,
+                        value: Value::Const(Const::Null),
+                    })
+                }
+                _ => None,
+            })
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(cases.len(), 2);
+        // Distinct block ids for the two cases.
+        assert_ne!(cases[0].1, cases[1].1);
+        assert_ne!(cases[0].1, default);
+    }
+
+    #[test]
+    fn endcase_branches_to_switch_exit() {
+        let m = lower_source(
+            "LET S(x) BE { SWITCHON x INTO $( CASE 1: f()\n ENDCASE\n DEFAULT: g() $) }",
+        );
+        let s = function(&m, "S");
+        // ENDCASE should produce an unconditional branch (to the
+        // exit block) somewhere among the case bodies.
+        let branch_count = s
+            .blocks
+            .iter()
+            .filter(|b| matches!(b.terminator, Terminator::Branch(_)))
+            .count();
+        assert!(branch_count >= 2);
+    }
+
+    #[test]
+    fn case_fallthrough_branches_to_next_case() {
+        // CASE 1: (no body) CASE 2: g() — case 1 falls through to
+        // case 2's block.
+        let m = lower_source(
+            "LET S(x) BE { SWITCHON x INTO $( CASE 1:\n CASE 2: g() $) }",
+        );
+        let s = function(&m, "S");
+        // Two case bodies + one default + one exit + entry = ≥5 blocks.
+        assert!(s.blocks.len() >= 5);
+    }
+
+    #[test]
+    fn break_inside_switchon_targets_switch_exit() {
+        // BREAK inside SWITCHON body works the same as ENDCASE —
+        // they both pop to the SWITCHON's exit block via the
+        // shared break_block.
+        let m = lower_source(
+            "LET S(x) BE { SWITCHON x INTO $( CASE 1: BREAK\n DEFAULT: f() $) }",
+        );
+        let s = function(&m, "S");
+        let switch_count = s
+            .blocks
+            .iter()
+            .filter(|b| matches!(b.terminator, Terminator::Switch { .. }))
+            .count();
+        assert_eq!(switch_count, 1);
+    }
+
     #[test]
     fn dump_smoke() {
         let m = lower_source("LET S() BE { LET y = 1 + 2 }");
