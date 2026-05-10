@@ -39,7 +39,7 @@ use std::path::Path;
 
 use newbcpl_parser::{
     BinaryOp, Block, ClassDecl, ClassMember, ClassMemberKind, ClassMethodBody, Decl, Expr,
-    LetDecl, LetKind, Program, Span, Stmt, TypeConstructorKind, UnaryOp,
+    LetDecl, LetKind, Program, Span, Stmt, TypeConstructorKind, UnaryOp, Visibility,
 };
 
 /// Register-class hint for a value. The lattice from
@@ -150,6 +150,28 @@ pub struct ClassInfo {
     pub name: String,
     pub extends: Option<String>,
     pub managed: bool,
+    pub fields: Vec<ClassFieldInfo>,
+    pub methods: Vec<ClassMethodInfo>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClassFieldInfo {
+    pub name: String,
+    pub hint: TypeHint,
+    pub visibility: Visibility,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClassMethodInfo {
+    pub name: String,
+    pub kind: FunctionKind,
+    pub params: Vec<String>,
+    pub result: TypeHint,
+    pub is_virtual: bool,
+    pub is_final: bool,
+    pub visibility: Visibility,
     pub span: Span,
 }
 
@@ -262,7 +284,44 @@ pub fn dump_sema(path: &Path) -> String {
                         None => String::new(),
                     };
                     let managed = if c.managed { " MANAGED" } else { "" };
-                    writeln!(out, "  {}{extends}{managed}", c.name).unwrap();
+                    writeln!(
+                        out,
+                        "  {}{extends}{managed}  ({} fields, {} methods)",
+                        c.name,
+                        c.fields.len(),
+                        c.methods.len()
+                    )
+                    .unwrap();
+                    for f in &c.fields {
+                        let vis = match f.visibility {
+                            Visibility::Public => "pub ",
+                            Visibility::Private => "priv ",
+                            Visibility::Protected => "prot ",
+                        };
+                        writeln!(out, "    {vis}field {} : {}", f.name, f.hint.as_str())
+                            .unwrap();
+                    }
+                    for m in &c.methods {
+                        let vis = match m.visibility {
+                            Visibility::Public => "pub ",
+                            Visibility::Private => "priv ",
+                            Visibility::Protected => "prot ",
+                        };
+                        let kind = match m.kind {
+                            FunctionKind::Function => "FUNCTION",
+                            FunctionKind::Routine => "ROUTINE",
+                        };
+                        let virt = if m.is_virtual { "virtual " } else { "" };
+                        let final_ = if m.is_final { "final " } else { "" };
+                        writeln!(
+                            out,
+                            "    {vis}{virt}{final_}{kind} {}({}) -> {}",
+                            m.name,
+                            m.params.join(", "),
+                            m.result.as_str()
+                        )
+                        .unwrap();
+                    }
                 }
                 writeln!(out, "warnings ({}):", result.warnings.len()).unwrap();
                 for w in &result.warnings {
@@ -416,10 +475,76 @@ impl Sema {
     }
 
     fn register_class(&mut self, c: &ClassDecl) {
+        // Walk members once to collect field hints. Methods are
+        // recorded with their declared shape; their result hints are
+        // refined later when the body is actually analysed.
+        let mut fields: Vec<ClassFieldInfo> = Vec::new();
+        let mut methods: Vec<ClassMethodInfo> = Vec::new();
+        for m in &c.members {
+            match &m.kind {
+                ClassMemberKind::Fields(names) => {
+                    for n in names {
+                        fields.push(ClassFieldInfo {
+                            name: n.clone(),
+                            // DECL has no initialiser — bag-of-bits Word.
+                            hint: TypeHint::Word,
+                            visibility: m.visibility,
+                            span: m.span,
+                        });
+                    }
+                }
+                ClassMemberKind::Let(let_decl) => {
+                    for (name, expr) in &let_decl.bindings {
+                        fields.push(ClassFieldInfo {
+                            name: name.clone(),
+                            hint: literal_hint(expr),
+                            visibility: m.visibility,
+                            span: m.span,
+                        });
+                    }
+                }
+                ClassMemberKind::FLet(b) => {
+                    let hint = b
+                        .value
+                        .as_ref()
+                        .map(literal_hint)
+                        .unwrap_or(TypeHint::Float);
+                    fields.push(ClassFieldInfo {
+                        name: b.name.clone(),
+                        hint: if hint == TypeHint::Word || hint == TypeHint::Int {
+                            TypeHint::Float
+                        } else {
+                            hint
+                        },
+                        visibility: m.visibility,
+                        span: m.span,
+                    });
+                }
+                ClassMemberKind::Method(method) => {
+                    methods.push(ClassMethodInfo {
+                        name: method.name.clone(),
+                        kind: if matches!(method.body, ClassMethodBody::Function(_)) {
+                            FunctionKind::Function
+                        } else {
+                            FunctionKind::Routine
+                        },
+                        params: method.params.clone(),
+                        // Refined later in analyze_class_member.
+                        result: TypeHint::Unknown,
+                        is_virtual: method.is_virtual,
+                        is_final: method.is_final,
+                        visibility: m.visibility,
+                        span: method.span,
+                    });
+                }
+            }
+        }
         let info = ClassInfo {
             name: c.name.clone(),
             extends: c.extends.clone(),
             managed: c.managed,
+            fields,
+            methods,
             span: c.span,
         };
         self.class_log.push(info.clone());
@@ -534,29 +659,101 @@ impl Sema {
         }
     }
 
-    fn analyze_class_member(&mut self, _c: &ClassDecl, m: &ClassMember) {
+    fn analyze_class_member(&mut self, c: &ClassDecl, m: &ClassMember) {
         match &m.kind {
             ClassMemberKind::Fields(_) | ClassMemberKind::Let(_) | ClassMemberKind::FLet(_) => {
-                // Member-storage type tracking is deferred until sema
-                // grows class-aware member-access typing. For now we
-                // observe the names but don't bind them in any scope.
+                // Field hints were collected during `register_class`.
+                // Nothing to bind in the surrounding scope here.
             }
             ClassMemberKind::Method(method) => {
                 self.push_scope();
-                // SELF is implicitly available inside any method body.
-                self.declare("SELF", TypeHint::Object, None, method.span);
-                self.declare("SUPER", TypeHint::Object, None, method.span);
+                // SELF is the receiver — we know its class name. SUPER
+                // is the parent's "view" of the same object, so it
+                // gets the parent's class name when there is one.
+                self.declare("SELF", TypeHint::Object, Some(c.name.clone()), method.span);
+                self.declare(
+                    "SUPER",
+                    TypeHint::Object,
+                    c.extends.clone(),
+                    method.span,
+                );
                 for p in &method.params {
                     self.declare(p, TypeHint::Word, None, method.span);
                 }
-                match &method.body {
-                    ClassMethodBody::Routine(s) => self.analyze_stmt(s),
-                    ClassMethodBody::Function(e) => {
-                        let _ = self.type_of(e);
+                let result_hint = match &method.body {
+                    ClassMethodBody::Routine(s) => {
+                        self.analyze_stmt(s);
+                        TypeHint::Word
+                    }
+                    ClassMethodBody::Function(e) => self.type_of(e),
+                };
+                self.pop_scope();
+                // Refine the previously-recorded method's result hint.
+                if let Some(class_info) = self.classes.get_mut(&c.name) {
+                    for mi in class_info.methods.iter_mut() {
+                        if mi.name == method.name && mi.span == method.span {
+                            mi.result = result_hint;
+                            break;
+                        }
                     }
                 }
-                self.pop_scope();
+                // Mirror the refinement into `class_log` so dump-sema
+                // surfaces the inferred result.
+                if let Some(class_log_entry) =
+                    self.class_log.iter_mut().find(|ci| ci.name == c.name)
+                {
+                    for mi in class_log_entry.methods.iter_mut() {
+                        if mi.name == method.name && mi.span == method.span {
+                            mi.result = result_hint;
+                            break;
+                        }
+                    }
+                }
             }
+        }
+    }
+
+    /// Look up a field by walking the class's inheritance chain. Returns
+    /// the field's hint if found, `None` otherwise.
+    fn lookup_field(&self, class_name: &str, field: &str) -> Option<TypeHint> {
+        let mut current = Some(class_name.to_string());
+        while let Some(name) = current {
+            if let Some(class) = self.classes.get(&name) {
+                if let Some(f) = class.fields.iter().find(|f| f.name == field) {
+                    return Some(f.hint);
+                }
+                current = class.extends.clone();
+            } else {
+                return None;
+            }
+        }
+        None
+    }
+
+    /// Look up a method by walking the inheritance chain. Returns the
+    /// method's full info (so the caller can use both kind and result).
+    fn lookup_method(&self, class_name: &str, method: &str) -> Option<ClassMethodInfo> {
+        let mut current = Some(class_name.to_string());
+        while let Some(name) = current {
+            if let Some(class) = self.classes.get(&name) {
+                if let Some(m) = class.methods.iter().find(|m| m.name == method) {
+                    return Some(m.clone());
+                }
+                current = class.extends.clone();
+            } else {
+                return None;
+            }
+        }
+        None
+    }
+
+    /// Best-effort: return the class name an expression evaluates to,
+    /// when sema knows. Used for `obj.field` resolution.
+    fn class_of_expr(&self, e: &Expr) -> Option<String> {
+        match e {
+            Expr::Ident { name, .. } => self.lookup(name).and_then(|info| info.class_name.clone()),
+            Expr::New { class_name, .. } => Some(class_name.clone()),
+            _ => None,
         }
     }
 
@@ -773,30 +970,43 @@ impl Sema {
                 None => TypeHint::Unknown,
             },
             Expr::Call { callee, args, .. } => {
-                // Walk callee + args first so side-effecting warnings
-                // fire even when we don't know the function's type.
                 for a in args {
                     let _ = self.type_of(a);
                 }
                 let _ = self.type_of(callee);
                 if let Expr::Ident { name, .. } = callee.as_ref() {
-                    // 1. Conversion intrinsics — known result classes.
                     match name.as_str() {
                         "FLOAT" | "FSQRT" => return TypeHint::Float,
                         "TRUNC" | "FIX" | "ENTIER" | "LEN" => return TypeHint::Int,
                         "TYPE" | "TYPEOF" => return TypeHint::String,
                         _ => {}
                     }
-                    // 2. User-defined function whose body we've already
-                    //    analysed (or pre-registered as a placeholder).
                     if let Some(info) = self.functions.get(name) {
-                        // Routines logically don't return a value;
-                        // surface that as Word so callers can still
-                        // ignore the result without warnings.
                         return match info.kind {
                             FunctionKind::Routine => TypeHint::Word,
                             FunctionKind::Function => info.result,
                         };
+                    }
+                }
+                // Method call: callee is `obj.methodName`. Resolve via
+                // the class table and take the method's inferred
+                // result hint.
+                if let Expr::Binary {
+                    op: BinaryOp::Dot,
+                    lhs,
+                    rhs,
+                    ..
+                } = callee.as_ref()
+                {
+                    if let (Some(class_name), Expr::Ident { name: method, .. }) =
+                        (self.class_of_expr(lhs), rhs.as_ref())
+                    {
+                        if let Some(method_info) = self.lookup_method(&class_name, method) {
+                            return match method_info.kind {
+                                FunctionKind::Routine => TypeHint::Word,
+                                FunctionKind::Function => method_info.result,
+                            };
+                        }
                     }
                 }
                 TypeHint::Word
@@ -820,6 +1030,27 @@ impl Sema {
                 }
             }
             Expr::Binary { op, lhs, rhs, .. } => {
+                // Member access: resolve `obj.field` through the class
+                // table when sema knows obj's class. The RHS is
+                // syntactically an identifier (the parser enforces it),
+                // so type_of(rhs) would just look it up as a top-level
+                // name — skip that and route through `lookup_field`.
+                if matches!(op, BinaryOp::Dot | BinaryOp::Of) {
+                    let _ = self.type_of(lhs);
+                    if let (Some(class_name), Expr::Ident { name: field, .. }) =
+                        (self.class_of_expr(lhs), rhs.as_ref())
+                    {
+                        if let Some(hint) = self.lookup_field(&class_name, field) {
+                            return hint;
+                        }
+                        // Fall back to method lookup so `obj.method`
+                        // (without a call) still has a sensible hint.
+                        if let Some(_) = self.lookup_method(&class_name, field) {
+                            return TypeHint::Function;
+                        }
+                    }
+                    return TypeHint::Word;
+                }
                 let lhs_hint = self.type_of(lhs);
                 let rhs_hint = self.type_of(rhs);
                 self.binary_result(*op, lhs_hint, rhs_hint, lhs, rhs)
@@ -945,6 +1176,38 @@ impl Sema {
                 _ => TypeHint::Int,
             },
         }
+    }
+}
+
+/// Cheap, scope-free hint inference for a literal-shaped expression —
+/// used by `register_class` to populate field hints during the
+/// pre-pass, before bindings are known. Only literals and bare type-
+/// constructors get a precise hint; anything else falls back to
+/// `Word` and is refined later if class members ever participate in
+/// flow inference.
+fn literal_hint(e: &Expr) -> TypeHint {
+    match e {
+        Expr::IntLit { .. } => TypeHint::Int,
+        Expr::FloatLit { .. } => TypeHint::Float,
+        Expr::StringLit { .. } => TypeHint::String,
+        Expr::CharLit { .. } => TypeHint::Int,
+        Expr::BoolLit { .. } => TypeHint::Int,
+        Expr::Null { .. } => TypeHint::Null,
+        Expr::TypedConstruct { kind, .. } => match kind {
+            TypeConstructorKind::Vec => TypeHint::Vec,
+            TypeConstructorKind::FVec => TypeHint::FVec,
+            TypeConstructorKind::Table => TypeHint::Vec,
+            TypeConstructorKind::FTable => TypeHint::FVec,
+            TypeConstructorKind::Pair => TypeHint::Pair,
+            TypeConstructorKind::FPair => TypeHint::FPair,
+            TypeConstructorKind::Quad => TypeHint::Quad,
+            TypeConstructorKind::FQuad => TypeHint::FQuad,
+            TypeConstructorKind::Oct => TypeHint::Oct,
+            TypeConstructorKind::FOct => TypeHint::FOct,
+            TypeConstructorKind::List | TypeConstructorKind::ManifestList => TypeHint::List,
+        },
+        Expr::New { .. } => TypeHint::Object,
+        _ => TypeHint::Word,
     }
 }
 
@@ -1268,6 +1531,105 @@ mod tests {
         let f = function_info(&out, "outer");
         assert_eq!(f.result, TypeHint::Int);
         assert_eq!(binding_hint(&out, "inner"), TypeHint::Int);
+    }
+
+    // ─── class-aware member access ──────────────────────────────
+
+    #[test]
+    fn class_records_decl_fields_as_word() {
+        let out = analyze_str("CLASS Point $( DECL x, y $)");
+        let c = out
+            .classes
+            .iter()
+            .find(|c| c.name == "Point")
+            .expect("Point class");
+        assert_eq!(c.fields.len(), 2);
+        assert!(c.fields.iter().all(|f| f.hint == TypeHint::Word));
+    }
+
+    #[test]
+    fn class_records_let_field_with_inferred_hint() {
+        let out = analyze_str("CLASS Counter $(\n  LET count = 0\n  LET label = \"hi\"\n$)");
+        let c = out
+            .classes
+            .iter()
+            .find(|c| c.name == "Counter")
+            .unwrap();
+        let count = c.fields.iter().find(|f| f.name == "count").unwrap();
+        let label = c.fields.iter().find(|f| f.name == "label").unwrap();
+        assert_eq!(count.hint, TypeHint::Int);
+        assert_eq!(label.hint, TypeHint::String);
+    }
+
+    #[test]
+    fn class_flet_field_default_is_float() {
+        let out = analyze_str("CLASS Point $(\n  FLET x\n  FLET y = 0.0\n$)");
+        let c = out.classes.iter().find(|c| c.name == "Point").unwrap();
+        assert_eq!(c.fields.len(), 2);
+        for f in &c.fields {
+            assert_eq!(f.hint, TypeHint::Float);
+        }
+    }
+
+    #[test]
+    fn member_access_resolves_through_class_table() {
+        let out = analyze_str(
+            "CLASS Point $(\n  DECL x, y\n  LET color = 0\n$)\nLET p = NEW Point\nLET cx = p.color",
+        );
+        // p inferred as OBJECT[Point]; p.color is the Int field.
+        assert_eq!(binding_hint(&out, "p"), TypeHint::Object);
+        assert_eq!(binding_hint(&out, "cx"), TypeHint::Int);
+    }
+
+    #[test]
+    fn member_access_walks_inheritance_chain() {
+        let out = analyze_str(
+            "CLASS Animal $( LET legs = 4 $)\nCLASS Dog EXTENDS Animal $( DECL breed $)\nLET d = NEW Dog\nLET n = d.legs",
+        );
+        // legs is inherited from Animal — Dog → Animal → field found.
+        assert_eq!(binding_hint(&out, "n"), TypeHint::Int);
+    }
+
+    #[test]
+    fn method_call_uses_class_method_result() {
+        let out = analyze_str(
+            "CLASS Point $(\n  FUNCTION getX() = 3.14\n$)\nLET p = NEW Point\nLET x = p.getX()",
+        );
+        assert_eq!(binding_hint(&out, "x"), TypeHint::Float);
+    }
+
+    #[test]
+    fn unknown_field_falls_back_to_word() {
+        let out = analyze_str("CLASS Point $( DECL x $)\nLET p = NEW Point\nLET q = p.absent");
+        assert_eq!(binding_hint(&out, "q"), TypeHint::Word);
+    }
+
+    #[test]
+    fn class_method_table_records_signatures() {
+        let out = analyze_str(
+            "CLASS Point $(\n  FUNCTION getX() = 1.0\n  ROUTINE move(dx, dy) BE $( $)\n  VIRTUAL ROUTINE bark() BE $( $)\n$)",
+        );
+        let c = out.classes.iter().find(|c| c.name == "Point").unwrap();
+        assert_eq!(c.methods.len(), 3);
+        let getx = c.methods.iter().find(|m| m.name == "getX").unwrap();
+        assert_eq!(getx.kind, FunctionKind::Function);
+        assert_eq!(getx.result, TypeHint::Float);
+        let mv = c.methods.iter().find(|m| m.name == "move").unwrap();
+        assert_eq!(mv.kind, FunctionKind::Routine);
+        let bark = c.methods.iter().find(|m| m.name == "bark").unwrap();
+        assert!(bark.is_virtual);
+    }
+
+    #[test]
+    fn self_inside_method_resolves_to_own_class() {
+        let out = analyze_str(
+            "CLASS Point $(\n  LET x = 0\n  FUNCTION getX() = SELF.x\n$)",
+        );
+        let c = out.classes.iter().find(|c| c.name == "Point").unwrap();
+        let getx = c.methods.iter().find(|m| m.name == "getX").unwrap();
+        // SELF is OBJECT[Point], SELF.x looks up the Int field — so
+        // the method's body type (and result) is Int.
+        assert_eq!(getx.result, TypeHint::Int);
     }
 
     #[test]
