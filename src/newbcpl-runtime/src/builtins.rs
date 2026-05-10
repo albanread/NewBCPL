@@ -95,6 +95,16 @@ pub unsafe extern "C" fn FINISH() -> i64 {
     std::process::exit(0);
 }
 
+/// `GC()` — request a full collection right now. Useful for
+/// tests and benchmarks; in normal use the allocator triggers
+/// collection on a heap-pressure threshold so most programs
+/// never need to call this. Returns 0 by BCPL convention.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn GC() -> i64 {
+    crate::gc::collect();
+    0
+}
+
 // ─── WRITEF / WRITEF1..WRITEF7 ────────────────────────────────────
 
 /// `WRITEF` and its arity-suffixed siblings are the BCPL printf.
@@ -868,6 +878,11 @@ pub fn builtin_addresses() -> &'static [Builtin] {
                 address: crate::gc::__newbcpl_safepoint as *const () as usize,
             },
             builtin!(__newbcpl_alloc_rec),
+            Builtin {
+                name: "__newbcpl_collect",
+                address: crate::gc::__newbcpl_collect as *const () as usize,
+            },
+            builtin!(GC),
         ]
     })
 }
@@ -984,6 +999,46 @@ mod heap_tests {
             42,
             "second-slot write must persist"
         );
+    }
+
+    #[test]
+    fn alloc_pressure_auto_triggers_collect() {
+        // Lower the auto-trigger threshold so the test doesn't
+        // need to allocate the production threshold's worth of
+        // memory (4 MB) to fire one cycle. We restore the
+        // production value at the end so other tests in the
+        // shared process see the normal threshold.
+        let old_threshold = gc::HEAP_COUNTERS
+            .collect_threshold
+            .swap(64 * 1024, std::sync::atomic::Ordering::AcqRel);
+        let cycles_before = gc::HEAP_COUNTERS
+            .collect_cycles
+            .load(std::sync::atomic::Ordering::Acquire);
+
+        // Allocate well past the lowered threshold. Each block
+        // is a few hundred bytes, so a few hundred allocations
+        // crosses 64 KiB comfortably and the allocator path
+        // should trigger at least one cycle.
+        let td = leak_typedesc(256);
+        for _ in 0..512 {
+            let p = unsafe { gc::__newbcpl_new_rec(td) };
+            assert!(!p.is_null(), "allocator must keep returning blocks");
+            // Touch the block to keep it from being optimised away.
+            unsafe { *(p as *mut u64) = 0xABCD };
+        }
+        let cycles_after = gc::HEAP_COUNTERS
+            .collect_cycles
+            .load(std::sync::atomic::Ordering::Acquire);
+        assert!(
+            cycles_after > cycles_before,
+            "allocator did not trigger any collect cycles: \
+             {cycles_before} → {cycles_after}"
+        );
+
+        // Restore the production threshold.
+        gc::HEAP_COUNTERS
+            .collect_threshold
+            .store(old_threshold, std::sync::atomic::Ordering::Release);
     }
 
     #[test]

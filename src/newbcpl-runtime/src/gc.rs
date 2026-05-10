@@ -160,7 +160,34 @@ pub(crate) struct HeapCounters {
     pub(crate) peak_live_bytes: AtomicU64,
     pub(crate) registered_threads: AtomicU64,
     pub(crate) safepoint_waits_total_nanos: AtomicU64,
+    /// Bytes allocated since the last collect cycle. The
+    /// allocator drops this to zero each time it triggers a
+    /// collect; allocations between collects accumulate here.
+    pub(crate) alloc_bytes_since_collect: AtomicU64,
+    /// When `alloc_bytes_since_collect` would exceed this value
+    /// on the next allocation, the allocator triggers a collect.
+    /// Initialised to `INITIAL_COLLECT_THRESHOLD`; after each
+    /// cycle it adapts to `max(INITIAL, live_bytes * GROWTH)` so
+    /// cycle cost amortises to a fixed fraction of allocation
+    /// cost. Threshold = 0 disables the auto-trigger entirely
+    /// (used by `disable_auto_collect_for_test`).
+    pub(crate) collect_threshold: AtomicU64,
 }
+
+/// Initial allocator-trigger threshold. Picked so that small
+/// programs (Hello World, the corpus tests) never run a single
+/// cycle, but a long-running mutator that allocates in a loop
+/// will collect after a few MB. Tunable; production GCs typically
+/// pick something in the 1–8 MB range as the floor.
+const INITIAL_COLLECT_THRESHOLD: u64 = 4 * 1024 * 1024;
+
+/// Threshold growth factor applied after each collect:
+///   new_threshold = max(INITIAL, live_bytes * GROWTH_FACTOR).
+/// Standard amortisation argument: every byte allocated pays for
+/// at most `1/(GROWTH_FACTOR - 1)` bytes of marking, so collection
+/// cost is a constant fraction of allocation cost. 2.0 is the
+/// classical choice (HotSpot, Go, Boehm all sit around here).
+const COLLECT_GROWTH_FACTOR: u64 = 2;
 
 impl HeapCounters {
     const fn zeroed() -> Self {
@@ -183,6 +210,8 @@ impl HeapCounters {
             peak_live_bytes: AtomicU64::new(0),
             registered_threads: AtomicU64::new(0),
             safepoint_waits_total_nanos: AtomicU64::new(0),
+            alloc_bytes_since_collect: AtomicU64::new(0),
+            collect_threshold: AtomicU64::new(INITIAL_COLLECT_THRESHOLD),
         }
     }
 
@@ -206,9 +235,16 @@ impl HeapCounters {
             &self.peak_live_bytes,
             &self.registered_threads,
             &self.safepoint_waits_total_nanos,
+            &self.alloc_bytes_since_collect,
         ] {
             slot.store(0, Ordering::Relaxed);
         }
+        // Reset the threshold to its initial value too — without
+        // this, tests that reset counters and then run small
+        // workloads would sit forever at whatever the previous
+        // run grew the threshold to.
+        self.collect_threshold
+            .store(INITIAL_COLLECT_THRESHOLD, Ordering::Relaxed);
     }
 }
 
@@ -781,6 +817,32 @@ pub unsafe extern "C" fn __newbcpl_new_rec(tag: *const TypeDesc) -> *mut u8 {
     let total_size = total_block_size(payload_size);
     let header_size = std::mem::size_of::<BlockHeader>();
 
+    // Threshold-based auto-collect. We collect *before* the
+    // allocation so the new block can't be reclaimed by the
+    // sweep that fires (no root references it yet — the JIT'd
+    // caller hasn't received the pointer). After the cycle we
+    // re-baseline the threshold to `live_bytes * GROWTH` so
+    // collection cost amortises.
+    let threshold = HEAP_COUNTERS.collect_threshold.load(Ordering::Acquire);
+    if threshold != 0 {
+        let bytes_since_load =
+            HEAP_COUNTERS.alloc_bytes_since_collect.load(Ordering::Acquire);
+        if bytes_since_load.saturating_add(total_size as u64) >= threshold {
+            collect_stw(&mutator, sp, &spill_buf);
+            HEAP_COUNTERS
+                .alloc_bytes_since_collect
+                .store(0, Ordering::Release);
+            let live = HEAP_COUNTERS.live_bytes.load(Ordering::Acquire);
+            let new_threshold = std::cmp::max(
+                INITIAL_COLLECT_THRESHOLD,
+                live.saturating_mul(COLLECT_GROWTH_FACTOR),
+            );
+            HEAP_COUNTERS
+                .collect_threshold
+                .store(new_threshold, Ordering::Release);
+        }
+    }
+
     let block = alloc_under_lock(total_size, &mutator, sp, &spill_buf);
 
     unsafe {
@@ -795,12 +857,26 @@ pub unsafe extern "C" fn __newbcpl_new_rec(tag: *const TypeDesc) -> *mut u8 {
     HEAP_COUNTERS
         .alloc_bytes_lifetime
         .fetch_add(total_size as u64, Ordering::Relaxed);
+    HEAP_COUNTERS
+        .alloc_bytes_since_collect
+        .fetch_add(total_size as u64, Ordering::Relaxed);
     mutator.alloc_blocks_lifetime.fetch_add(1, Ordering::Relaxed);
     mutator
         .alloc_bytes_lifetime
         .fetch_add(total_size as u64, Ordering::Relaxed);
 
     unsafe { block.add(header_size) }
+}
+
+/// `__newbcpl_collect()` — extern wrapper around `collect()` so
+/// JIT'd code (and the `GC()` builtin) can request a sweep
+/// directly. Useful as an escape hatch when the threshold
+/// heuristic doesn't fit the workload (benchmarks, tests, "I
+/// just freed a huge thing").
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __newbcpl_collect() -> i64 {
+    collect();
+    0
 }
 
 /// Allocate untracked, untraced bytes (`SYSTEM.NEW`).  These live
