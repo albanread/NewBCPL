@@ -11,7 +11,7 @@ use std::path::Path;
 
 pub use ast::{
     BinaryOp, Block, Decl, Expr, FunctionDecl, GetDirective, LetDecl, NamedBinding,
-    NamedBindingsDecl, Program, RoutineDecl, Span, Stmt, TypeConstructorKind, UnaryOp,
+    NamedBindingsDecl, Program, RoutineDecl, Span, Stmt, SwitchCase, TypeConstructorKind, UnaryOp,
 };
 pub use parser::{ParseError, parse_source};
 
@@ -223,6 +223,85 @@ fn pretty_print_stmt(stmt: &Stmt, level: usize, out: &mut String) {
             indent(level + 1, out);
             writeln!(out, "cond:").unwrap();
             pretty_print_expr(cond, level + 2, out);
+        }
+        Stmt::For {
+            name,
+            start,
+            end,
+            step,
+            body,
+            ..
+        } => {
+            writeln!(out, "for {name}").unwrap();
+            indent(level + 1, out);
+            writeln!(out, "from:").unwrap();
+            pretty_print_expr(start, level + 2, out);
+            indent(level + 1, out);
+            writeln!(out, "to:").unwrap();
+            pretty_print_expr(end, level + 2, out);
+            if let Some(step) = step {
+                indent(level + 1, out);
+                writeln!(out, "by:").unwrap();
+                pretty_print_expr(step, level + 2, out);
+            }
+            indent(level + 1, out);
+            writeln!(out, "body:").unwrap();
+            pretty_print_stmt(body, level + 2, out);
+        }
+        Stmt::ForEach {
+            names,
+            annotation,
+            iter,
+            body,
+            ..
+        } => {
+            write!(out, "foreach {}", names.join(", ")).unwrap();
+            if let Some(ann) = annotation {
+                write!(out, " : {ann}").unwrap();
+            }
+            writeln!(out).unwrap();
+            indent(level + 1, out);
+            writeln!(out, "in:").unwrap();
+            pretty_print_expr(iter, level + 2, out);
+            indent(level + 1, out);
+            writeln!(out, "body:").unwrap();
+            pretty_print_stmt(body, level + 2, out);
+        }
+        Stmt::Switchon {
+            scrutinee,
+            cases,
+            default,
+            ..
+        } => {
+            writeln!(
+                out,
+                "switchon ({} cases{})",
+                cases.len(),
+                if default.is_some() { ", default" } else { "" }
+            )
+            .unwrap();
+            indent(level + 1, out);
+            writeln!(out, "scrutinee:").unwrap();
+            pretty_print_expr(scrutinee, level + 2, out);
+            for case in cases {
+                indent(level + 1, out);
+                writeln!(out, "case ({} labels):", case.values.len()).unwrap();
+                for v in &case.values {
+                    pretty_print_expr(v, level + 2, out);
+                }
+                indent(level + 2, out);
+                writeln!(out, "body ({} stmts):", case.body.len()).unwrap();
+                for s in &case.body {
+                    pretty_print_stmt(s, level + 3, out);
+                }
+            }
+            if let Some(body) = default {
+                indent(level + 1, out);
+                writeln!(out, "default ({} stmts):", body.len()).unwrap();
+                for s in body {
+                    pretty_print_stmt(s, level + 2, out);
+                }
+            }
         }
         Stmt::Resultis(e, _) => {
             writeln!(out, "resultis").unwrap();
@@ -1254,6 +1333,142 @@ mod tests {
             lhs.as_ref(),
             Expr::Unary { op: UnaryOp::Hd, .. }
         ));
+    }
+
+    // ─── FOR / FOREACH / SWITCHON ───────────────────────────────
+
+    #[test]
+    fn parses_for_to() {
+        let p = parse_ok("LET S() BE { FOR i = 1 TO 10 DO f(i) }");
+        let Decl::Routine(r) = &p.items[0] else {
+            panic!();
+        };
+        let Stmt::Block(b) = r.body.as_ref() else {
+            panic!();
+        };
+        let Stmt::For {
+            name,
+            step,
+            ..
+        } = &b.stmts[0]
+        else {
+            panic!();
+        };
+        assert_eq!(name, "i");
+        assert!(step.is_none());
+    }
+
+    #[test]
+    fn parses_for_to_by() {
+        let p = parse_ok("LET S() BE { FOR i = 0 TO 100 BY 5 DO f(i) }");
+        let Decl::Routine(r) = &p.items[0] else {
+            panic!();
+        };
+        let Stmt::Block(b) = r.body.as_ref() else {
+            panic!();
+        };
+        let Stmt::For { step, .. } = &b.stmts[0] else {
+            panic!();
+        };
+        assert!(step.is_some());
+    }
+
+    #[test]
+    fn parses_foreach_simple() {
+        let p = parse_ok("LET S() BE { FOREACH e IN xs DO f(e) }");
+        let Decl::Routine(r) = &p.items[0] else {
+            panic!();
+        };
+        let Stmt::Block(b) = r.body.as_ref() else {
+            panic!();
+        };
+        let Stmt::ForEach {
+            names,
+            annotation,
+            ..
+        } = &b.stmts[0]
+        else {
+            panic!();
+        };
+        assert_eq!(names, &vec!["e".to_string()]);
+        assert!(annotation.is_none());
+    }
+
+    #[test]
+    fn parses_foreach_with_annotation() {
+        let p = parse_ok("LET S() BE { FOREACH C AS INTEGER IN S DO f(C) }");
+        let Decl::Routine(r) = &p.items[0] else {
+            panic!();
+        };
+        let Stmt::Block(b) = r.body.as_ref() else {
+            panic!();
+        };
+        let Stmt::ForEach { annotation, .. } = &b.stmts[0] else {
+            panic!();
+        };
+        assert_eq!(annotation, &Some("INTEGER".to_string()));
+    }
+
+    #[test]
+    fn parses_foreach_pair_destructuring() {
+        let p = parse_ok("LET S() BE { FOREACH k, v IN m DO f(k, v) }");
+        let Decl::Routine(r) = &p.items[0] else {
+            panic!();
+        };
+        let Stmt::Block(b) = r.body.as_ref() else {
+            panic!();
+        };
+        let Stmt::ForEach { names, .. } = &b.stmts[0] else {
+            panic!();
+        };
+        assert_eq!(names.len(), 2);
+        assert_eq!(names[0], "k");
+        assert_eq!(names[1], "v");
+    }
+
+    #[test]
+    fn parses_switchon() {
+        let p = parse_ok(
+            "LET S() BE $(\n  SWITCHON x INTO $(\n    CASE 1: f()\n    CASE 2:\n    CASE 3: g()\n    DEFAULT: h()\n  $)\n$)",
+        );
+        let Decl::Routine(r) = &p.items[0] else {
+            panic!();
+        };
+        let Stmt::Block(b) = r.body.as_ref() else {
+            panic!();
+        };
+        let Stmt::Switchon {
+            cases,
+            default,
+            ..
+        } = &b.stmts[0]
+        else {
+            panic!();
+        };
+        assert_eq!(cases.len(), 3);
+        // CASE 2: had no body, so its `body` is empty.
+        assert!(cases[1].body.is_empty());
+        // CASE 3 has the body f() (well, g()).
+        assert_eq!(cases[2].body.len(), 1);
+        assert!(default.is_some());
+    }
+
+    #[test]
+    fn for_loop_with_compound_body() {
+        let src = "LET S() BE $(
+            FOR i = 1 TO 10 DO $(
+                WRITES(\"hi*N\")
+                IF i > 5 THEN BREAK
+            $)
+        $)";
+        let p = parse_ok(src);
+        let Decl::Routine(r) = &p.items[0] else {
+            panic!();
+        };
+        let Stmt::Block(b) = r.body.as_ref() else {
+            panic!();
+        };
+        assert!(matches!(b.stmts[0], Stmt::For { .. }));
     }
 
     #[test]

@@ -475,6 +475,15 @@ impl Parser {
         if self.check_kw("UNTIL") {
             return self.parse_until();
         }
+        if self.check_kw("FOR") {
+            return self.parse_for();
+        }
+        if self.check_kw("FOREACH") {
+            return self.parse_foreach();
+        }
+        if self.check_kw("SWITCHON") {
+            return self.parse_switchon();
+        }
         if self.check_kw("RESULTIS") {
             let kw = self.eat();
             let value = self.parse_expr()?;
@@ -724,6 +733,201 @@ impl Parser {
             cond,
             body: Box::new(body),
             span,
+        })
+    }
+
+    /// `FOR name = start TO end [BY step] DO body`.
+    fn parse_for(&mut self) -> Result<Stmt, ParseError> {
+        let kw = self.eat();
+        let name = self.eat_identifier()?.lexeme;
+        self.expect_sym("=")?;
+        let start_expr = self.parse_expr()?;
+        if !self.check_kw("TO") {
+            let span = self.peek().span;
+            let lex = self.peek().lexeme.clone();
+            return Err(ParseError::new(
+                format!("expected `TO` in FOR loop, got `{lex}`"),
+                span,
+            ));
+        }
+        self.eat();
+        let end_expr = self.parse_expr()?;
+        let step_expr = if self.check_kw("BY") {
+            self.eat();
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        if self.check_kw("DO") {
+            self.eat();
+        }
+        let body = self.parse_stmt()?;
+        let span = SourceSpan {
+            start: kw.span.start,
+            end: body.span().end,
+        };
+        Ok(Stmt::For {
+            name,
+            start: start_expr,
+            end: end_expr,
+            step: step_expr,
+            body: Box::new(body),
+            span,
+        })
+    }
+
+    /// `FOREACH name [, name2] [AS Type] IN iterable DO body`.
+    fn parse_foreach(&mut self) -> Result<Stmt, ParseError> {
+        let kw = self.eat();
+        let mut names = vec![self.eat_identifier()?.lexeme];
+        if self.check_sym(",") {
+            self.eat();
+            names.push(self.eat_identifier()?.lexeme);
+        }
+        let annotation = if self.check_kw("AS") {
+            self.eat();
+            // The full type-expression grammar is more involved
+            // (POINTER TO X, OF X, etc.); for now accept a single
+            // identifier which covers `INTEGER`, `FLOAT`, `WORD`, etc.
+            Some(self.eat_identifier()?.lexeme)
+        } else {
+            None
+        };
+        if !self.check_kw("IN") {
+            let span = self.peek().span;
+            let lex = self.peek().lexeme.clone();
+            return Err(ParseError::new(
+                format!("expected `IN` in FOREACH, got `{lex}`"),
+                span,
+            ));
+        }
+        self.eat();
+        let iter = self.parse_expr()?;
+        if self.check_kw("DO") {
+            self.eat();
+        }
+        let body = self.parse_stmt()?;
+        let span = SourceSpan {
+            start: kw.span.start,
+            end: body.span().end,
+        };
+        Ok(Stmt::ForEach {
+            names,
+            annotation,
+            iter,
+            body: Box::new(body),
+            span,
+        })
+    }
+
+    /// `SWITCHON expr INTO $( CASE … : … ; DEFAULT : … $)`. Statements
+    /// are accumulated until the next `CASE` / `DEFAULT` / closing
+    /// bracket. Adjacent `CASE label:` headers preceding any statement
+    /// are recorded as separate cases with empty bodies — the parser
+    /// preserves source shape, sema/codegen interpret fall-through.
+    fn parse_switchon(&mut self) -> Result<Stmt, ParseError> {
+        let kw = self.eat();
+        let scrutinee = self.parse_expr()?;
+        if self.check_kw("INTO") {
+            self.eat();
+        }
+        if !self.check_sym("$(") && !self.check_sym("{") {
+            let span = self.peek().span;
+            let lex = self.peek().lexeme.clone();
+            return Err(ParseError::new(
+                format!("expected `$(` or `{{` after SWITCHON, got `{lex}`"),
+                span,
+            ));
+        }
+        let open = self.eat();
+        let close_lex = if open.lexeme == "$(" { "$)" } else { "}" };
+
+        let mut cases: Vec<SwitchCase> = Vec::new();
+        let mut default: Option<Vec<Stmt>> = None;
+        let mut end_span = open.span.end;
+
+        loop {
+            // Skip stray separators inside the SWITCHON body.
+            while self.check_sym(";") {
+                self.eat();
+            }
+            if self.is_at_end() {
+                return Err(ParseError::new(
+                    format!("unterminated SWITCHON — expected `{close_lex}`"),
+                    open.span,
+                ));
+            }
+            if self.check_sym(close_lex) {
+                end_span = self.eat().span.end;
+                break;
+            }
+
+            if self.check_kw("CASE") {
+                let case_kw = self.eat();
+                let value = self.parse_expr()?;
+                self.expect_sym(":")?;
+                let mut body = Vec::new();
+                while !self.is_at_end()
+                    && !self.check_kw("CASE")
+                    && !self.check_kw("DEFAULT")
+                    && !self.check_sym(close_lex)
+                {
+                    if self.check_sym(";") {
+                        self.eat();
+                        continue;
+                    }
+                    body.push(self.parse_stmt()?);
+                }
+                let case_end = body
+                    .last()
+                    .map(|s| s.span().end)
+                    .unwrap_or(case_kw.span.end);
+                cases.push(SwitchCase {
+                    values: vec![value],
+                    body,
+                    span: SourceSpan {
+                        start: case_kw.span.start,
+                        end: case_end,
+                    },
+                });
+                continue;
+            }
+
+            if self.check_kw("DEFAULT") {
+                self.eat();
+                self.expect_sym(":")?;
+                let mut body = Vec::new();
+                while !self.is_at_end()
+                    && !self.check_kw("CASE")
+                    && !self.check_kw("DEFAULT")
+                    && !self.check_sym(close_lex)
+                {
+                    if self.check_sym(";") {
+                        self.eat();
+                        continue;
+                    }
+                    body.push(self.parse_stmt()?);
+                }
+                default = Some(body);
+                continue;
+            }
+
+            let span = self.peek().span;
+            let lex = self.peek().lexeme.clone();
+            return Err(ParseError::new(
+                format!("expected CASE, DEFAULT or `{close_lex}` in SWITCHON, got `{lex}`"),
+                span,
+            ));
+        }
+
+        Ok(Stmt::Switchon {
+            scrutinee,
+            cases,
+            default,
+            span: SourceSpan {
+                start: kw.span.start,
+                end: end_span,
+            },
         })
     }
 

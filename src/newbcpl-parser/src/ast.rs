@@ -128,6 +128,35 @@ pub enum Stmt {
         cond: Expr,
         span: Span,
     },
+    /// `FOR name = start TO end [BY step] DO body`.
+    For {
+        name: String,
+        start: Expr,
+        end: Expr,
+        step: Option<Expr>,
+        body: Box<Stmt>,
+        span: Span,
+    },
+    /// `FOREACH name [, name] [AS Type] IN iterable DO body`. The
+    /// optional second name supports map-style destructuring (key,
+    /// value); the optional `AS` annotation hints the element type.
+    ForEach {
+        names: Vec<String>,
+        annotation: Option<String>,
+        iter: Expr,
+        body: Box<Stmt>,
+        span: Span,
+    },
+    /// `SWITCHON expr INTO $( CASE … : ; CASE … : … ; DEFAULT : … $)`.
+    /// `cases` preserves source order; each entry groups any number of
+    /// adjacent `CASE label:` lines that share a single body. `default`
+    /// is the optional `DEFAULT:` body.
+    Switchon {
+        scrutinee: Expr,
+        cases: Vec<SwitchCase>,
+        default: Option<Vec<Stmt>>,
+        span: Span,
+    },
     Resultis(Expr, Span),
     Return(Span),
     Finish(Span),
@@ -139,6 +168,17 @@ pub enum Stmt {
 #[derive(Debug, Clone)]
 pub struct Block {
     pub stmts: Vec<Stmt>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct SwitchCase {
+    /// All `CASE label:` lines that fall through to this body, in source
+    /// order. A bare fall-through case (`CASE 1:` followed immediately by
+    /// `CASE 2:`) is recorded as a separate `SwitchCase` with an empty
+    /// `body`; the parser does not collapse them.
+    pub values: Vec<Expr>,
+    pub body: Vec<Stmt>,
     pub span: Span,
 }
 
@@ -353,7 +393,10 @@ impl Stmt {
             | Stmt::Until { span, .. }
             | Stmt::Repeat { span, .. }
             | Stmt::RepeatWhile { span, .. }
-            | Stmt::RepeatUntil { span, .. } => *span,
+            | Stmt::RepeatUntil { span, .. }
+            | Stmt::For { span, .. }
+            | Stmt::ForEach { span, .. }
+            | Stmt::Switchon { span, .. } => *span,
             Stmt::Resultis(_, s)
             | Stmt::Return(s)
             | Stmt::Finish(s)
