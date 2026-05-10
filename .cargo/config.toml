@@ -1,0 +1,9 @@
+# Tells `llvm-sys` where to find the LLVM 22 install. Inkwell 0.9.0
+# pinned with the `llvm22-1` feature requires LLVM 22.x with the
+# `LLVMConfig.cmake` files reachable under `<prefix>/lib/cmake/llvm`.
+#
+# Adjust the path below for your machine if it isn't this one. The
+# value is checked into the repo to mirror NewCP's setup, but the
+# path itself is local to the developer's machine.
+[env]
+LLVM_SYS_221_PREFIX = "C:\\projects\\LLVM\\install"

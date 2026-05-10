@@ -82,10 +82,31 @@ fn main() -> ExitCode {
                 ExitCode::from(2)
             }
         },
-        "dump-cfg" | "dump-llvm" | "dump-asm" => {
-            // Honour the same calling convention as dump-tokens so a script
-            // that already invokes `newbcpl-driver dump-X foo.bcl` keeps
-            // working as the phases come online.
+        "dump-llvm" => match args.next() {
+            Some(path_arg) => {
+                let path = PathBuf::from(path_arg);
+                println!("{}", newbcpl_llvm::dump_llvm(&path));
+                ExitCode::SUCCESS
+            }
+            None => {
+                eprintln!("dump-llvm: missing source path");
+                print_usage();
+                ExitCode::from(2)
+            }
+        },
+        "dump-asm" => match args.next() {
+            Some(path_arg) => {
+                let path = PathBuf::from(path_arg);
+                println!("{}", newbcpl_llvm::dump_asm(&path));
+                ExitCode::SUCCESS
+            }
+            None => {
+                eprintln!("dump-asm: missing source path");
+                print_usage();
+                ExitCode::from(2)
+            }
+        },
+        "dump-cfg" => {
             let _path = args.next().map(PathBuf::from);
             eprintln!(
                 "{command}: phase not implemented yet — see docs/manifesto.md for sequencing"
