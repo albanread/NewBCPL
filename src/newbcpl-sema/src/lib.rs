@@ -365,9 +365,14 @@ struct Sema {
     /// Stack of currently-open `VALOF` blocks. Each frame collects the
     /// `RESULTIS` expression hints inside that block; on exit the
     /// frame is popped and merged into a single `TypeHint`. Empty when
-    /// not inside any VALOF — `RESULTIS` outside is a no-op for type
-    /// inference (and may eventually be a warning).
+    /// we're not inside any VALOF — `RESULTIS` in that case warns.
     valof_results: Vec<Vec<TypeHint>>,
+    /// How many loop bodies (WHILE / UNTIL / FOR / FOREACH / REPEAT
+    /// family) are currently open. `BREAK` / `LOOP` warn when 0.
+    loop_depth: u32,
+    /// How many SWITCHON bodies are currently open. `ENDCASE` warns
+    /// when 0.
+    switchon_depth: u32,
     warnings: Vec<SemaWarning>,
 }
 
@@ -381,6 +386,8 @@ impl Sema {
             class_log: Vec::new(),
             function_log: Vec::new(),
             valof_results: Vec::new(),
+            loop_depth: 0,
+            switchon_depth: 0,
             warnings: Vec::new(),
         }
     }
@@ -785,11 +792,19 @@ impl Sema {
             }
             Stmt::While { cond, body, .. } | Stmt::Until { cond, body, .. } => {
                 let _ = self.type_of(cond);
+                self.loop_depth += 1;
                 self.analyze_stmt(body);
+                self.loop_depth -= 1;
             }
-            Stmt::Repeat { body, .. } => self.analyze_stmt(body),
-            Stmt::RepeatWhile { body, cond, .. } | Stmt::RepeatUntil { body, cond, .. } => {
+            Stmt::Repeat { body, .. } => {
+                self.loop_depth += 1;
                 self.analyze_stmt(body);
+                self.loop_depth -= 1;
+            }
+            Stmt::RepeatWhile { body, cond, .. } | Stmt::RepeatUntil { body, cond, .. } => {
+                self.loop_depth += 1;
+                self.analyze_stmt(body);
+                self.loop_depth -= 1;
                 let _ = self.type_of(cond);
             }
             Stmt::For {
@@ -814,7 +829,9 @@ impl Sema {
                     TypeHint::Int
                 };
                 self.declare(name, lv_hint, None, *span);
+                self.loop_depth += 1;
                 self.analyze_stmt(body);
+                self.loop_depth -= 1;
                 self.pop_scope();
             }
             Stmt::ForEach {
@@ -839,7 +856,9 @@ impl Sema {
                 for n in names {
                     self.declare(n, element_hint, None, *span);
                 }
+                self.loop_depth += 1;
                 self.analyze_stmt(body);
+                self.loop_depth -= 1;
                 self.pop_scope();
             }
             Stmt::Switchon {
@@ -849,6 +868,7 @@ impl Sema {
                 ..
             } => {
                 let _ = self.type_of(scrutinee);
+                self.switchon_depth += 1;
                 for case in cases {
                     for v in &case.values {
                         let _ = self.type_of(v);
@@ -862,11 +882,17 @@ impl Sema {
                         self.analyze_stmt(s);
                     }
                 }
+                self.switchon_depth -= 1;
             }
-            Stmt::Resultis(e, _) => {
+            Stmt::Resultis(e, span) => {
                 let hint = self.type_of(e);
                 if let Some(frame) = self.valof_results.last_mut() {
                     frame.push(hint);
+                } else {
+                    self.warn(
+                        "RESULTIS outside any VALOF block — has no effect",
+                        *span,
+                    );
                 }
             }
             Stmt::Retain { value: Some(v), name, span, .. } => {
@@ -874,11 +900,29 @@ impl Sema {
                 let class_name = self.class_name_of(v);
                 self.declare(name, hint, class_name, *span);
             }
+            Stmt::Break(span) => {
+                if self.loop_depth == 0 {
+                    self.warn("BREAK outside any loop body — has no effect", *span);
+                }
+            }
+            Stmt::Loop(span) => {
+                if self.loop_depth == 0 {
+                    self.warn(
+                        "LOOP outside any loop body — has no effect",
+                        *span,
+                    );
+                }
+            }
+            Stmt::Endcase(span) => {
+                if self.switchon_depth == 0 {
+                    self.warn(
+                        "ENDCASE outside any SWITCHON — has no effect",
+                        *span,
+                    );
+                }
+            }
             Stmt::Return(_)
             | Stmt::Finish(_)
-            | Stmt::Break(_)
-            | Stmt::Loop(_)
-            | Stmt::Endcase(_)
             | Stmt::Brk(_)
             | Stmt::Goto { .. }
             | Stmt::Label { .. }
@@ -915,6 +959,13 @@ impl Sema {
         }
         // Free coercions:
         if matches!(target, TypeHint::Word) || matches!(value, TypeHint::Word) {
+            return;
+        }
+        // A NULL-typed binding (initialised with `?`) is a typeless
+        // pointer slot until something is assigned. Assigning any
+        // pointer-shaped value to it is a feature, not a coercion
+        // we should warn about — sema absorbs the new shape silently.
+        if matches!(target, TypeHint::Null) {
             return;
         }
         if matches!(value, TypeHint::Null)
@@ -1402,6 +1453,21 @@ mod tests {
     }
 
     #[test]
+    fn null_target_accepts_any_pointer_shape_silently() {
+        // The reverse: a binding starts as `?` (NULL) and is later
+        // assigned a real pointer. NULL is the empty pointer slot —
+        // assigning into it is a feature, not a coercion.
+        let out = analyze_str(
+            "CLASS T $( DECL x $)\nLET S() BE { LET ptr = ?\n ptr := NEW T }",
+        );
+        assert!(
+            out.warnings.is_empty(),
+            "NULL := OBJECT should be silent: {:?}",
+            out.warnings
+        );
+    }
+
+    #[test]
     fn classes_recorded() {
         let out = analyze_str(
             "CLASS Animal $( DECL name $)\nCLASS Dog EXTENDS Animal $( DECL breed $)\nCLASS Window MANAGED $( DECL handle $)",
@@ -1630,6 +1696,81 @@ mod tests {
         // SELF is OBJECT[Point], SELF.x looks up the Int field — so
         // the method's body type (and result) is Int.
         assert_eq!(getx.result, TypeHint::Int);
+    }
+
+    // ─── control-flow validity warnings ─────────────────────────
+
+    fn warning_count_matching(out: &SemaOutput, needle: &str) -> usize {
+        out.warnings
+            .iter()
+            .filter(|w| w.message.contains(needle))
+            .count()
+    }
+
+    #[test]
+    fn break_outside_loop_warns() {
+        let out = analyze_str("LET S() BE { BREAK }");
+        assert_eq!(warning_count_matching(&out, "BREAK outside"), 1);
+    }
+
+    #[test]
+    fn break_inside_while_does_not_warn() {
+        let out = analyze_str("LET S() BE { WHILE i < 10 DO $( BREAK $) }");
+        assert_eq!(warning_count_matching(&out, "BREAK outside"), 0);
+    }
+
+    #[test]
+    fn loop_outside_loop_warns() {
+        let out = analyze_str("LET S() BE { LOOP }");
+        assert_eq!(warning_count_matching(&out, "LOOP outside"), 1);
+    }
+
+    #[test]
+    fn loop_inside_for_does_not_warn() {
+        let out = analyze_str("LET S() BE { FOR i = 1 TO 10 DO LOOP }");
+        assert_eq!(warning_count_matching(&out, "LOOP outside"), 0);
+    }
+
+    #[test]
+    fn break_inside_foreach_does_not_warn() {
+        let out = analyze_str("LET S() BE { FOREACH e IN xs DO BREAK }");
+        assert_eq!(warning_count_matching(&out, "BREAK outside"), 0);
+    }
+
+    #[test]
+    fn endcase_outside_switchon_warns() {
+        let out = analyze_str("LET S() BE { ENDCASE }");
+        assert_eq!(warning_count_matching(&out, "ENDCASE outside"), 1);
+    }
+
+    #[test]
+    fn endcase_inside_switchon_does_not_warn() {
+        let out = analyze_str(
+            "LET S() BE { SWITCHON x INTO $( CASE 1: ENDCASE\n DEFAULT: f() $) }",
+        );
+        assert_eq!(warning_count_matching(&out, "ENDCASE outside"), 0);
+    }
+
+    #[test]
+    fn resultis_outside_valof_warns() {
+        // RESULTIS in a routine body is meaningless.
+        let out = analyze_str("LET S() BE { RESULTIS 0 }");
+        assert_eq!(warning_count_matching(&out, "RESULTIS outside"), 1);
+    }
+
+    #[test]
+    fn resultis_inside_valof_silent() {
+        let out = analyze_str("LET F() = VALOF $( RESULTIS 1 $)");
+        assert_eq!(warning_count_matching(&out, "RESULTIS outside"), 0);
+    }
+
+    #[test]
+    fn nested_loop_break_targets_inner() {
+        // Both BREAKs are inside a loop, neither warns.
+        let out = analyze_str(
+            "LET S() BE { WHILE x DO $( WHILE y DO BREAK\n BREAK $) }",
+        );
+        assert_eq!(warning_count_matching(&out, "BREAK outside"), 0);
     }
 
     #[test]
