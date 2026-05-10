@@ -15,8 +15,8 @@
 use std::collections::HashMap;
 
 use newbcpl_parser::{
-    BinaryOp, Block, Decl, Expr, FunctionDecl, LetDecl, Program, RoutineDecl, Stmt, SwitchCase,
-    TypeConstructorKind, UnaryOp,
+    BinaryOp, Block, ClassDecl, ClassMemberKind, ClassMethod, ClassMethodBody, Decl, Expr,
+    FunctionDecl, LetDecl, Program, RoutineDecl, Stmt, SwitchCase, TypeConstructorKind, UnaryOp,
 };
 use newbcpl_sema::{ClassLayout, SemaOutput, TypeHint};
 
@@ -26,14 +26,14 @@ use crate::ir::*;
 /// caller must have run `newbcpl_sema::analyze(&program)` first so
 /// expressions carry their hints.
 pub fn lower(program: &Program, sema: &SemaOutput, module_name: &str) -> Module {
-    let mut lowerer = Lowerer::new(&sema.layouts);
+    let mut lowerer = Lowerer::new(&sema.layouts, &sema.manifests);
     for decl in &program.items {
         match decl {
             Decl::Routine(r) => lowerer.lower_routine(r),
             Decl::Function(f) => lowerer.lower_function(f),
-            // Top-level decls that don't produce IR functions yet
-            // (GET / MANIFEST / STATIC / GLOBAL / CLASS) are simply
-            // skipped here; class layouts come from sema.
+            Decl::Class(c) => lowerer.lower_class(c),
+            // Top-level decls that don't produce IR functions
+            // (GET / MANIFEST / STATIC / GLOBAL) are skipped.
             _ => {}
         }
     }
@@ -48,6 +48,15 @@ struct Lowerer<'a> {
     functions: Vec<Function>,
     current: Option<Builder>,
     layouts: &'a [ClassLayout],
+    /// `MANIFEST` constants from sema. Lookup in `lower_ident` for
+    /// inline substitution — the BCPL convention treats a MANIFEST
+    /// as a compile-time integer, not a runtime binding.
+    manifests: &'a std::collections::HashMap<String, i64>,
+    /// Set while lowering a class method body. Allows bare-field
+    /// identifiers (`x` inside `Point.set`) to resolve as
+    /// SELF-relative field accesses, and lets `class_name_of_expr`
+    /// recognise SELF and SUPER as having the surrounding class.
+    current_class: Option<String>,
 }
 
 /// Per-function state during lowering.
@@ -264,11 +273,16 @@ impl Builder {
 }
 
 impl<'a> Lowerer<'a> {
-    fn new(layouts: &'a [ClassLayout]) -> Self {
+    fn new(
+        layouts: &'a [ClassLayout],
+        manifests: &'a std::collections::HashMap<String, i64>,
+    ) -> Self {
         Self {
             functions: Vec::new(),
             current: None,
             layouts,
+            manifests,
+            current_class: None,
         }
     }
 
@@ -292,6 +306,64 @@ impl<'a> Lowerer<'a> {
         self.start_function(&f.name, &f.params, return_hint);
         let value = self.lower_expr(&f.body);
         self.b().terminate(Terminator::Return(Some(value)));
+        self.finish_function();
+    }
+
+    /// Walk a `CLASS` declaration and emit each method as a regular
+    /// IR function with name `{class}_{method}`. The implicit
+    /// receiver `SELF` becomes the first parameter (typed OBJECT).
+    /// Field initialisers inside the class body are not yet
+    /// lowered as IR — the layout pass already records them; CREATE
+    /// is responsible for explicit initialisation.
+    fn lower_class(&mut self, c: &ClassDecl) {
+        for member in &c.members {
+            if let ClassMemberKind::Method(m) = &member.kind {
+                self.lower_method(&c.name, m);
+            }
+        }
+    }
+
+    fn lower_method(&mut self, class_name: &str, m: &ClassMethod) {
+        let mangled = mangle_method(class_name, &m.name);
+        // Build the method's parameter list with SELF as the first
+        // implicit param. Real BCPL params follow.
+        let mut params: Vec<String> = Vec::with_capacity(m.params.len() + 1);
+        params.push("SELF".to_string());
+        params.extend(m.params.iter().cloned());
+
+        let return_hint = match &m.body {
+            ClassMethodBody::Routine(_) => TypeHint::Word,
+            ClassMethodBody::Function(e) => e.hint(),
+        };
+        self.start_function(&mangled, &params, return_hint);
+
+        // Tag the SELF binding with the current class so member
+        // access through SELF resolves to the right field offsets.
+        if let Some(b) = self.current.as_mut() {
+            if let Some(info) = b
+                .scopes
+                .last_mut()
+                .and_then(|s| s.get_mut("SELF"))
+            {
+                info.class_name = Some(class_name.to_string());
+            }
+        }
+        self.current_class = Some(class_name.to_string());
+
+        match &m.body {
+            ClassMethodBody::Routine(stmt) => {
+                self.lower_stmt(stmt);
+                if self.b().current_open() {
+                    self.b().terminate(Terminator::Return(None));
+                }
+            }
+            ClassMethodBody::Function(expr) => {
+                let v = self.lower_expr(expr);
+                self.b().terminate(Terminator::Return(Some(v)));
+            }
+        }
+
+        self.current_class = None;
         self.finish_function();
     }
 
@@ -409,6 +481,13 @@ impl<'a> Lowerer<'a> {
                 body,
                 ..
             } => self.lower_for(name, start, end, step.as_ref(), body),
+            Stmt::ForEach {
+                names,
+                annotation,
+                iter,
+                body,
+                ..
+            } => self.lower_foreach(names, annotation.as_deref(), iter, body),
             Stmt::Break(_) => {
                 if let Some(target) = self.b().innermost_break() {
                     self.b().terminate(Terminator::Branch(target));
@@ -654,6 +733,222 @@ impl<'a> Lowerer<'a> {
         self.b().pop_scope();
     }
 
+    /// `FOREACH name IN iter DO body`
+    /// — or its destructuring form `FOREACH (n0, n1[, ...]) IN iter DO body`.
+    ///
+    /// Iteration shape: index from 0 to `__newbcpl_len(iter) - 1`,
+    /// per-iteration `element = iter ! i`. This works for both VEC
+    /// and the simplified array-shaped LIST emit puts in place
+    /// today. Linked-list semantics (HD/TL traversal) arrive when
+    /// the real list runtime lands.
+    ///
+    /// Destructuring: when `names.len() > 1` the element is a
+    /// SIMD-lane-packed value (PAIR ⇒ 2 lanes, QUAD ⇒ 4, OCT ⇒ 8).
+    /// We emit a sign-aware lane unpack into N i64 locals — see
+    /// `unpack_lanes`. Reference: `test_foreach_destructuring.bcl`
+    /// — `FOREACH (x, y) IN list-of-pairs` binds `x = element.|0|,
+    /// y = element.|1|` per step, and similar for wider lanes.
+    fn lower_foreach(
+        &mut self,
+        names: &[String],
+        _annotation: Option<&str>,
+        iter: &Expr,
+        body: &Stmt,
+    ) {
+        if names.is_empty() {
+            return;
+        }
+        // Lower the iterable once, store in a stable slot so the
+        // length call and the per-iteration subscripts share it.
+        let iter_v = self.lower_expr(iter);
+        let iter_slot = self.b().alloca("foreach.iter", TypeHint::Vec);
+        self.b().emit(Instr::Store {
+            slot: iter_slot,
+            value: iter_v,
+        });
+
+        // Length: `__newbcpl_len(iter)` is the BCPL convention.
+        let iter_load = self.b().alloc_value();
+        self.b().emit(Instr::Load {
+            dst: iter_load,
+            slot: iter_slot,
+            hint: TypeHint::Vec,
+        });
+        let len_dst = self.b().alloc_value();
+        self.b().emit(Instr::Call {
+            dst: Some(len_dst),
+            callee: Value::Function("__newbcpl_len".to_string()),
+            args: vec![Value::Local(iter_load)],
+            hint: TypeHint::Int,
+        });
+
+        // Loop header: i = 0; while i < len { body; i++ }.
+        let i_slot = self.b().alloca("foreach.idx", TypeHint::Int);
+        self.b().emit(Instr::Store {
+            slot: i_slot,
+            value: Value::Const(Const::Int(0)),
+        });
+        let header = self.b().alloc_block("foreach.header");
+        let body_block = self.b().alloc_block("foreach.body");
+        let incr = self.b().alloc_block("foreach.incr");
+        let exit = self.b().alloc_block("foreach.end");
+
+        self.b().terminate(Terminator::Branch(header));
+        self.b().switch_to(header);
+        let i_dst = self.b().alloc_value();
+        self.b().emit(Instr::Load {
+            dst: i_dst,
+            slot: i_slot,
+            hint: TypeHint::Int,
+        });
+        let cmp = self.b().alloc_value();
+        self.b().emit(Instr::BinOp {
+            dst: cmp,
+            op: IrBinOp::ICmpLt,
+            lhs: Value::Local(i_dst),
+            rhs: Value::Local(len_dst),
+            hint: TypeHint::Int,
+        });
+        self.b().terminate(Terminator::CondBranch {
+            cond: Value::Local(cmp),
+            then_block: body_block,
+            else_block: exit,
+        });
+
+        self.b().switch_to(body_block);
+        self.b().push_scope();
+        // Compute element address: GEP iter + i * 8 (word stride).
+        let iter_load2 = self.b().alloc_value();
+        self.b().emit(Instr::Load {
+            dst: iter_load2,
+            slot: iter_slot,
+            hint: TypeHint::Vec,
+        });
+        let i_load = self.b().alloc_value();
+        self.b().emit(Instr::Load {
+            dst: i_load,
+            slot: i_slot,
+            hint: TypeHint::Int,
+        });
+        let elem_addr = self.b().alloc_value();
+        self.b().emit(Instr::Gep {
+            dst: elem_addr,
+            base: Value::Local(iter_load2),
+            index: Value::Local(i_load),
+            element_bytes: 8,
+        });
+        let elem = self.b().alloc_value();
+        self.b().emit(Instr::IndirectLoad {
+            dst: elem,
+            addr: Value::Local(elem_addr),
+            hint: TypeHint::Word,
+        });
+
+        // Bind names. With one name, the element is the binding.
+        // With more, lane-unpack the element into each name's slot
+        // (PAIR=2 lanes×i32, QUAD=4 lanes×i16, OCT=8 lanes×i8).
+        if names.len() == 1 {
+            let slot = self.b().alloca(&names[0], TypeHint::Word);
+            self.b().emit(Instr::Store {
+                slot,
+                value: Value::Local(elem),
+            });
+            self.b().declare_local(&names[0], slot, None);
+        } else {
+            self.unpack_lanes(names, Value::Local(elem));
+        }
+
+        self.b().frames.push(Frame {
+            break_block: exit,
+            continue_block: Some(incr),
+        });
+        self.lower_stmt(body);
+        self.b().frames.pop();
+        if self.b().current_open() {
+            self.b().terminate(Terminator::Branch(incr));
+        }
+        self.b().pop_scope();
+
+        // Increment block.
+        self.b().switch_to(incr);
+        let i_now = self.b().alloc_value();
+        self.b().emit(Instr::Load {
+            dst: i_now,
+            slot: i_slot,
+            hint: TypeHint::Int,
+        });
+        let i_next = self.b().alloc_value();
+        self.b().emit(Instr::BinOp {
+            dst: i_next,
+            op: IrBinOp::IAdd,
+            lhs: Value::Local(i_now),
+            rhs: Value::Const(Const::Int(1)),
+            hint: TypeHint::Int,
+        });
+        self.b().emit(Instr::Store {
+            slot: i_slot,
+            value: Value::Local(i_next),
+        });
+        self.b().terminate(Terminator::Branch(header));
+
+        self.b().switch_to(exit);
+    }
+
+    /// Unpack the lanes of a SIMD-packed value `elem` into N named
+    /// locals. The packed shapes the destructuring grammar
+    /// supports map directly to standard BCPL SIMD widths:
+    /// 2 names ⇒ PAIR (two i32 lanes), 4 names ⇒ QUAD (four i16
+    /// lanes), 8 names ⇒ OCT (eight i8 lanes). All extracted
+    /// values are sign-extended to i64 word-shape so the body
+    /// can use them in normal arithmetic. Anything else (e.g.
+    /// 3 or 5 names) falls back to extracting `lane = (elem >>
+    /// (lane_bits * i)) & lane_mask` with no special width — a
+    /// best-effort that produces *some* reasonable bindings
+    /// rather than zeros, with a warning that a future sema
+    /// pass will reject the mismatch.
+    fn unpack_lanes(&mut self, names: &[String], elem: Value) {
+        let lane_bits: u32 = match names.len() {
+            2 => 32,
+            4 => 16,
+            8 => 8,
+            _ => 64 / names.len().max(1) as u32,
+        };
+        let total_bits = 64u32;
+        for (i, n) in names.iter().enumerate() {
+            // Extract lane i: (elem << (top_pad)) >> (top_pad + low_drop)
+            // with arithmetic shifts, so the lane is sign-extended
+            // into a full i64 word.
+            let low_drop = (lane_bits as u64) * i as u64;
+            let top_pad = total_bits as u64 - lane_bits as u64 - low_drop;
+            let mut current = elem.clone();
+            if top_pad > 0 {
+                let shifted = self.b().alloc_value();
+                self.b().emit(Instr::BinOp {
+                    dst: shifted,
+                    op: IrBinOp::Shl,
+                    lhs: current.clone(),
+                    rhs: Value::Const(Const::Int(top_pad as i64)),
+                    hint: TypeHint::Int,
+                });
+                current = Value::Local(shifted);
+            }
+            let pulled_down = self.b().alloc_value();
+            self.b().emit(Instr::BinOp {
+                dst: pulled_down,
+                op: IrBinOp::Shr, // arithmetic — sign-extends
+                lhs: current,
+                rhs: Value::Const(Const::Int((top_pad + low_drop) as i64)),
+                hint: TypeHint::Int,
+            });
+            let slot = self.b().alloca(n, TypeHint::Word);
+            self.b().emit(Instr::Store {
+                slot,
+                value: Value::Local(pulled_down),
+            });
+            self.b().declare_local(n, slot, None);
+        }
+    }
+
     /// `SWITCHON value INTO $( CASE k1: ... CASE k2: ... DEFAULT: ... $)`.
     ///
     /// Each parsed `SwitchCase` may carry multiple labels that share
@@ -765,6 +1060,21 @@ impl<'a> Lowerer<'a> {
                 Expr::Ident { name, .. } => {
                     if let Some(slot) = self.b().lookup_local_slot(name) {
                         self.b().emit(Instr::Store { slot, value: v });
+                    } else if let Some(class_name) = self.current_class.clone() {
+                        // Bare-field assignment inside a class
+                        // method: `x := initialX` → field store
+                        // through SELF when `x` is a field of the
+                        // surrounding class.
+                        if let Some(offset) =
+                            self.lookup_field_offset(&class_name, name)
+                        {
+                            let base = self.load_self();
+                            self.b().emit(Instr::FieldStore {
+                                base,
+                                byte_offset: offset,
+                                value: v,
+                            });
+                        }
                     }
                 }
                 Expr::Binary {
@@ -832,12 +1142,17 @@ impl<'a> Lowerer<'a> {
     fn class_name_of_expr(&self, expr: &Expr) -> Option<String> {
         match expr {
             Expr::New { class_name, .. } => Some(class_name.clone()),
-            Expr::Ident { name, .. } => self
-                .current
-                .as_ref()
-                .and_then(|b| b.lookup_local_class(name)),
-            // SELF / SUPER inside a method body would resolve via the
-            // surrounding class scope; we don't yet track that.
+            Expr::Ident { name, .. } => {
+                // SELF / SUPER inside a class method resolve to the
+                // surrounding class so `SELF.field` and `SELF.m()`
+                // work.
+                if (name == "SELF" || name == "SUPER") && self.current_class.is_some() {
+                    return self.current_class.clone();
+                }
+                self.current
+                    .as_ref()
+                    .and_then(|b| b.lookup_local_class(name))
+            }
             _ => None,
         }
     }
@@ -1015,12 +1330,50 @@ impl<'a> Lowerer<'a> {
         if let Some(slot) = self.b().lookup_local_slot(name) {
             let dst = self.b().alloc_value();
             self.b().emit(Instr::Load { dst, slot, hint });
-            Value::Local(dst)
-        } else {
-            // Unknown name — assume it's a function reference that
-            // will be resolved at link time.
-            Value::Function(name.to_string())
+            return Value::Local(dst);
         }
+        // MANIFEST constants substitute their integer value inline
+        // — sema recorded these. Treat as a compile-time literal
+        // rather than a function reference.
+        if let Some(&v) = self.manifests.get(name) {
+            return Value::Const(Const::Int(v));
+        }
+        // Inside a class method body, an unrecognised bare name may
+        // be a field on `SELF`. Resolve through the surrounding
+        // class layout and emit a SELF-relative FieldLoad.
+        if let Some(class_name) = self.current_class.clone() {
+            if let Some(offset) = self.lookup_field_offset(&class_name, name) {
+                let self_v = self.load_self();
+                let dst = self.b().alloc_value();
+                self.b().emit(Instr::FieldLoad {
+                    dst,
+                    base: self_v,
+                    byte_offset: offset,
+                    hint,
+                });
+                return Value::Local(dst);
+            }
+        }
+        // Unknown name — assume it's a function reference that
+        // will be resolved at link time.
+        Value::Function(name.to_string())
+    }
+
+    /// Load the implicit `SELF` parameter as a Value. Only callable
+    /// while lowering a class method; unwraps because the entry
+    /// block always allocates SELF first via `start_method`.
+    fn load_self(&mut self) -> Value {
+        let slot = self
+            .b()
+            .lookup_local_slot("SELF")
+            .expect("SELF slot must exist inside a class method");
+        let dst = self.b().alloc_value();
+        self.b().emit(Instr::Load {
+            dst,
+            slot,
+            hint: TypeHint::Object,
+        });
+        Value::Local(dst)
     }
 
     fn lower_binary(&mut self, op: BinaryOp, lhs: &Expr, rhs: &Expr, hint: TypeHint) -> Value {
@@ -1028,11 +1381,18 @@ impl<'a> Lowerer<'a> {
         if matches!(op, BinaryOp::LaneAccess) {
             let vector = self.lower_expr(lhs);
             let lane = self.lower_expr(rhs);
+            // Map the source operand's TypeHint to a SIMD kind so
+            // codegen can pick packed-i64 bit-shift vs LLVM
+            // extractelement. Default to PAIR for unknown — the
+            // common case and the conservative fallback.
+            let kind = simd_kind_from_hint(lhs.hint())
+                .unwrap_or(crate::ir::TypedKind::Pair);
             let dst = self.b().alloc_value();
             self.b().emit(Instr::LaneExtract {
                 dst,
                 vector,
                 lane,
+                kind,
                 hint,
             });
             return Value::Local(dst);
@@ -1210,46 +1570,40 @@ impl<'a> Lowerer<'a> {
                     let receiver = self.lower_expr(lhs);
                     let arg_values: Vec<Value> =
                         args.iter().map(|a| self.lower_expr(a)).collect();
-                    let dst = if hint == TypeHint::Word {
-                        None
-                    } else {
-                        Some(self.b().alloc_value())
-                    };
+                    // Always capture the call's result. Routines
+                    // return i64 0 by the BCPL convention so callers
+                    // that ignore the value see a sensible zero;
+                    // functions return their inferred type.
+                    let dst = self.b().alloc_value();
                     self.b().emit(Instr::MethodCall {
-                        dst,
+                        dst: Some(dst),
                         receiver,
+                        class_name: class_name.clone(),
                         vtable_slot: slot,
                         method_name: method.clone(),
                         args: arg_values,
                         hint,
                     });
-                    return match dst {
-                        Some(d) => Value::Local(d),
-                        None => Value::Unit,
-                    };
+                    return Value::Local(dst);
                 }
             }
         }
 
         let callee_v = self.lower_expr(callee);
         let arg_values: Vec<Value> = args.iter().map(|a| self.lower_expr(a)).collect();
-        let dst = if hint == TypeHint::Word {
-            // Routine-shape call: discard the result. Codegen still
-            // emits a call instruction, just doesn't bind a result.
-            None
-        } else {
-            Some(self.b().alloc_value())
-        };
+        // Always capture the call's result. The hint tells us the
+        // *type* of what comes back, not whether to discard it — a
+        // user-defined function returning WORD still has a meaningful
+        // value, and BCPL routines return i64 0 by convention so
+        // ignoring it is harmless.
+        let dst = self.b().alloc_value();
         self.b().emit(Instr::Call {
-            dst,
+            dst: Some(dst),
             callee: callee_v,
             args: arg_values,
             hint,
         });
-        match dst {
-            Some(d) => Value::Local(d),
-            None => Value::Unit,
-        }
+        Value::Local(dst)
     }
 
     fn lower_conditional(
@@ -1392,6 +1746,33 @@ fn binop_to_ir(op: BinaryOp, lhs: TypeHint, rhs: TypeHint) -> Option<IrBinOp> {
             return None;
         }
     })
+}
+
+/// Map a SIMD-flavoured `TypeHint` to its IR `TypedKind`. Returns
+/// `None` for non-SIMD hints — callers that hit `None` should pick
+/// a sensible default (lane-access only ever fires on SIMD-typed
+/// expressions, but sema may have been less specific than ideal,
+/// so the IR layer keeps a conservative fallback).
+fn simd_kind_from_hint(h: TypeHint) -> Option<crate::ir::TypedKind> {
+    use crate::ir::TypedKind;
+    Some(match h {
+        TypeHint::Pair => TypedKind::Pair,
+        TypeHint::FPair => TypedKind::FPair,
+        TypeHint::Quad => TypedKind::Quad,
+        TypeHint::FQuad => TypedKind::FQuad,
+        TypeHint::Oct => TypedKind::Oct,
+        TypeHint::FOct => TypedKind::FOct,
+        _ => return None,
+    })
+}
+
+/// Symbol name for a class method as it appears in the LLVM
+/// module / vtable patch table. We use the simple `Class_method`
+/// scheme; collisions are impossible because BCPL identifiers
+/// reject `_`-only names. Re-used by JIT post-finalize patching
+/// when populating the vtable globals.
+pub fn mangle_method(class_name: &str, method_name: &str) -> String {
+    format!("{class_name}_{method_name}")
 }
 
 /// Map a list / vector keyword operator to its runtime helper

@@ -16,4 +16,5 @@
 //! - `iGui` integrated GUI on `x86_64-pc-windows-msvc`, backed by Direct2D
 //!   + DirectWrite, mirroring NewCP's `iGui` slice.
 
+pub mod builtins;
 pub mod gc;

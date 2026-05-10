@@ -13,6 +13,7 @@ use std::path::Path;
 
 use inkwell::OptimizationLevel;
 use inkwell::context::Context;
+use inkwell::execution_engine::JitFunction;
 use inkwell::targets::{
     CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
 };
@@ -110,6 +111,151 @@ pub fn dump_asm(path: &Path) -> String {
             error
         ),
     }
+}
+
+/// Build a JIT execution engine for the program at `path` and call
+/// its top-level `START` routine. Builtin addresses (WRITES, WRITEN,
+/// WRITEC, NEWLINE) are registered up-front so the JIT'd code can
+/// reach them.
+///
+/// Returns the value `START` produced — typically 0 by BCPL
+/// convention. Errors during compilation, linking, or execution
+/// surface as `Err(String)` so the driver can print them.
+pub fn run(path: &Path) -> Result<i64, String> {
+    let ir = build_ir(path)?;
+    let context = Context::create();
+    let module = emit::emit(&context, &ir);
+
+    // MCJIT initialisation. `Default` optimisation runs mem2reg /
+    // simple folding — enough to make the loops we already emit
+    // look like the assembly we showed earlier.
+    let exec_engine = module
+        .create_jit_execution_engine(OptimizationLevel::Default)
+        .map_err(|e| format!("create_jit_execution_engine: {}", e.to_string()))?;
+
+    // Register every builtin's host-process address with the JIT
+    // by symbol name. We can't rely on the dynamic linker finding
+    // them — this binary is the JIT host, so we hand the addresses
+    // over directly.
+    for builtin in newbcpl_runtime::builtins::builtin_addresses() {
+        if let Some(fv) = module.get_function(builtin.name) {
+            exec_engine.add_global_mapping(&fv, builtin.address);
+        }
+    }
+
+    // Catch unbound externs *before* execution. Any function the
+    // module declares without a body (linkage = external, no entry
+    // basic block) and that we did not just register a mapping for
+    // would otherwise be called at address 0 and segfault. Surface
+    // it as a clean diagnostic instead.
+    let mut missing: Vec<String> = Vec::new();
+    let mut fopt = module.get_first_function();
+    while let Some(f) = fopt {
+        if f.count_basic_blocks() == 0 {
+            let name = f.get_name().to_string_lossy().into_owned();
+            // Skip LLVM intrinsics (`llvm.memset.*` etc.) — those
+            // are resolved by LLVM itself, not by our table.
+            if !name.starts_with("llvm.")
+                && !newbcpl_runtime::builtins::is_builtin(&name)
+            {
+                missing.push(name);
+            }
+        }
+        fopt = f.get_next_function();
+    }
+    if !missing.is_empty() {
+        return Err(format!("missing builtin: {}", missing.join(", ")));
+    }
+
+    // ─── vtable patch loop (NewCP-style for MCJIT) ──────────────
+    //
+    // For each class layout, look up the @Class.vtable global's
+    // runtime storage address and write the JIT'd method addresses
+    // into each slot. We have to do this from Rust because MCJIT's
+    // RuntimeDyld does not reliably apply function-pointer
+    // relocations to constant data globals — the slots stay zero
+    // if you encode them as constant initialisers.
+    //
+    // `LLVMGetGlobalValueAddress` gives us the vtable storage;
+    // `LLVMGetPointerToGlobal` resolves a method's compiled address
+    // (more reliable than name-based `get_function_address` for
+    // non-exported / mangled methods, per NewCP's findings).
+    use inkwell::llvm_sys::execution_engine::{
+        LLVMGetGlobalValueAddress, LLVMGetPointerToGlobal,
+    };
+    use inkwell::values::AsValueRef;
+    use std::ffi::CString;
+    for layout in &ir.layouts {
+        if layout.vtable.is_empty() {
+            continue;
+        }
+        let vt_name = match CString::new(format!("{}.vtable", layout.class_name)) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let vt_addr = unsafe {
+            LLVMGetGlobalValueAddress(
+                exec_engine.as_mut_ptr(),
+                vt_name.as_ptr(),
+            )
+        };
+        if vt_addr == 0 {
+            // Vtable global was DCE'd by an LLVM pass. Skip — any
+            // virtual call into this class will read zero and the
+            // missing-builtin check above won't catch it; tests
+            // that depend on it will print zeros instead of method
+            // results.
+            continue;
+        }
+        let vt_ptr = vt_addr as *mut usize;
+        for entry in &layout.vtable {
+            let owner = match &entry.defining_class {
+                Some(c) => c,
+                // Default CREATE / RELEASE for classes that don't
+                // declare them: leave the slot at zero — virtual
+                // calls into these are harmless because nobody
+                // generates one (sema only emits MethodCall for
+                // declared methods).
+                None => continue,
+            };
+            let method_symbol = format!("{owner}_{}", entry.method_name);
+            let fv = match module.get_function(&method_symbol) {
+                Some(f) => f,
+                // The method's body lives in a different module
+                // (cross-module dispatch isn't wired yet) — skip.
+                None => continue,
+            };
+            let fn_addr = unsafe {
+                LLVMGetPointerToGlobal(
+                    exec_engine.as_mut_ptr(),
+                    fv.as_value_ref(),
+                )
+            } as usize;
+            if fn_addr == 0 {
+                continue;
+            }
+            unsafe {
+                vt_ptr.add(entry.slot).write(fn_addr);
+            }
+        }
+    }
+
+    // Locate START. Every BCPL program declares one; if it isn't
+    // there, the program is malformed for execution purposes.
+    let start_fn = module
+        .get_function("START")
+        .ok_or_else(|| "no START function declared".to_string())?;
+
+    // Safety: the function takes no args and returns i64 by our
+    // BCPL-routine ABI convention.
+    let start: JitFunction<unsafe extern "C" fn() -> i64> = unsafe {
+        exec_engine
+            .get_function("START")
+            .map_err(|e| format!("get_function START: {}", e.to_string()))?
+    };
+    let _ = start_fn; // suppress unused; we used .get_function for the name lookup
+    let result = unsafe { start.call() };
+    Ok(result)
 }
 
 fn build_ir(path: &Path) -> Result<IrModule, String> {
@@ -308,10 +454,11 @@ mod tests {
         let text = emit_text(
             "CLASS Foo $(\n  DECL x\n  ROUTINE CREATE(ix) BE $( SELF.x := ix $)\n$)\nLET S() BE { LET f = NEW Foo(42) }",
         );
-        // The CREATE method is called with the new instance as the
-        // first argument and 42 as the second.
-        assert!(text.contains("call i64 @CREATE"));
-        // Receiver pointer is passed.
+        // CREATE is now called via its mangled `{Class}_CREATE`
+        // symbol so multiple classes can each have their own.
+        // The receiver pointer is the first argument; 42 is the
+        // second.
+        assert!(text.contains("call i64 @Foo_CREATE"));
         assert!(text.contains("i64 42"));
     }
 

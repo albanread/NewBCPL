@@ -203,10 +203,12 @@ fn render_instr(i: &Instr) -> String {
             dst,
             vector,
             lane,
+            kind,
             hint,
         } => format!(
-            "%{} = lane {}[{}] : {}",
+            "%{} = lane {} of {}[{}] : {}",
             dst.0,
+            kind.as_str(),
             render_value(vector),
             render_value(lane),
             hint.as_str()
@@ -214,6 +216,7 @@ fn render_instr(i: &Instr) -> String {
         Instr::MethodCall {
             dst,
             receiver,
+            class_name,
             vtable_slot,
             method_name,
             args,
@@ -226,18 +229,20 @@ fn render_instr(i: &Instr) -> String {
                 .join(", ");
             match dst {
                 Some(d) => format!(
-                    "%{} = vcall {}.{}@slot{}({}) : {}",
+                    "%{} = vcall {}.{}@{}::slot{}({}) : {}",
                     d.0,
                     render_value(receiver),
                     method_name,
+                    class_name,
                     vtable_slot,
                     args_str,
                     hint.as_str()
                 ),
                 None => format!(
-                    "vcall {}.{}@slot{}({})",
+                    "vcall {}.{}@{}::slot{}({})",
                     render_value(receiver),
                     method_name,
+                    class_name,
                     vtable_slot,
                     args_str
                 ),

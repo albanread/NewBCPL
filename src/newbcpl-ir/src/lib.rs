@@ -480,7 +480,12 @@ mod tests {
     }
 
     #[test]
-    fn method_call_routine_shape_has_no_dst() {
+    fn method_call_always_binds_dst() {
+        // Even routine-shape calls bind a dst. BCPL routines return
+        // i64 0 by convention, so the result is harmless to ignore;
+        // always allocating keeps lowering uniform and stops
+        // user-defined WORD-returning functions from having their
+        // results discarded.
         let m = lower_source(
             "CLASS Point $(\n  DECL x\n  ROUTINE move() BE $( $)\n$)\nLET S() BE { LET p = NEW Point\n p.move() }",
         );
@@ -488,9 +493,9 @@ mod tests {
         let entry = &s.blocks[0];
         let routine_call = entry.instrs.iter().any(|i| matches!(
             i,
-            Instr::MethodCall { dst: None, method_name, .. } if method_name == "move"
+            Instr::MethodCall { dst: Some(_), method_name, .. } if method_name == "move"
         ));
-        assert!(routine_call, "expected void MethodCall for move()");
+        assert!(routine_call, "expected MethodCall with bound dst for move()");
     }
 
     #[test]

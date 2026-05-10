@@ -141,6 +141,11 @@ pub struct SemaOutput {
     /// after the main walk so all `ClassInfo` records (including
     /// inferred method results) are available.
     pub layouts: Vec<ClassLayout>,
+    /// `MANIFEST` constants — name → integer value. Lowering uses
+    /// this to substitute the literal value at every reference site
+    /// (BCPL convention: a MANIFEST is a compile-time constant, not
+    /// a real binding with a runtime address).
+    pub manifests: std::collections::HashMap<String, i64>,
     /// Non-fatal diagnostics. Sema never fails on type grounds, so
     /// every interesting observation lands here.
     pub warnings: Vec<SemaWarning>,
@@ -176,6 +181,7 @@ pub fn analyze(program: &Program) -> SemaOutput {
         classes: sema.class_log,
         functions: sema.function_log,
         layouts,
+        manifests: sema.manifests,
         warnings: sema.warnings,
     }
 }
@@ -357,6 +363,9 @@ struct Sema {
     /// frame is popped and merged into a single `TypeHint`. Empty when
     /// we're not inside any VALOF — `RESULTIS` in that case warns.
     valof_results: Vec<Vec<TypeHint>>,
+    /// `MANIFEST` constants — name → integer value. Lowering uses
+    /// this to substitute the literal value at every reference site.
+    manifests: HashMap<String, i64>,
     /// How many loop bodies (WHILE / UNTIL / FOR / FOREACH / REPEAT
     /// family) are currently open. `BREAK` / `LOOP` warn when 0.
     loop_depth: u32,
@@ -377,6 +386,7 @@ impl Sema {
             class_log: Vec::new(),
             function_log: Vec::new(),
             valof_results: Vec::new(),
+            manifests: HashMap::new(),
             loop_depth: 0,
             switchon_depth: 0,
             warnings: Vec::new(),
@@ -632,6 +642,13 @@ impl Sema {
                         .map(|e| self.type_of(e))
                         .unwrap_or(TypeHint::Int);
                     self.declare(&b.name, hint, None, b.span);
+                    // Record the literal value so lowering can
+                    // substitute it inline. Only integer literals
+                    // are recognised today — float manifests would
+                    // need a parallel `manifest_floats` table.
+                    if let Some(Expr::IntLit { value, .. }) = &b.value {
+                        self.manifests.insert(b.name.clone(), *value);
+                    }
                 }
             }
             Decl::Static(s) => {

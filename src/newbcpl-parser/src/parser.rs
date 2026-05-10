@@ -1155,13 +1155,54 @@ impl Parser {
         })
     }
 
-    /// `FOREACH name [, name2] [AS Type] IN iterable DO body`.
+    /// `FOREACH name [, name2] [AS Type] IN iterable DO body`
+    /// — or its parenthesised destructuring form
+    /// `FOREACH (name1, name2[, ...]) IN list-of-pairs DO body`.
+    ///
+    /// The parenthesised form is SIMD-lane unpack sugar (per the
+    /// reference's `test_foreach_destructuring.bcl`): each list
+    /// element is a packed value (PAIR / FPAIR / QUAD / ...) and
+    /// the names bind to its lanes in order — `FOREACH (x, y) IN
+    /// list-of-pairs` binds `x = element.|0|, y = element.|1|`
+    /// per iteration. Sema validates that the name count matches
+    /// the element type's lane count; lowering emits a
+    /// `LaneExtract` per name. The non-parenthesised form keeps
+    /// its original meaning (single-name iteration; the optional
+    /// second name was an old `(idx, val)` shape).
     fn parse_foreach(&mut self) -> Result<Stmt, ParseError> {
         let kw = self.eat();
-        let mut names = vec![self.eat_identifier()?.lexeme];
-        if self.check_sym(",") {
+        let mut names: Vec<String> = Vec::new();
+        if self.check_sym("(") {
+            // Parenthesised destructuring: collect every comma-
+            // separated identifier until the closing paren. Empty
+            // parens (`FOREACH ()`) are ill-formed and rejected by
+            // sema, but the parser accepts them so the diagnostic
+            // can be produced later with a better source span.
             self.eat();
+            if !self.check_sym(")") {
+                names.push(self.eat_identifier()?.lexeme);
+                while self.check_sym(",") {
+                    self.eat();
+                    names.push(self.eat_identifier()?.lexeme);
+                }
+            }
+            if !self.check_sym(")") {
+                let span = self.peek().span;
+                let lex = self.peek().lexeme.clone();
+                return Err(ParseError::new(
+                    format!(
+                        "expected `,` or `)` in FOREACH destructuring, got `{lex}`"
+                    ),
+                    span,
+                ));
+            }
+            self.eat(); // ')'
+        } else {
             names.push(self.eat_identifier()?.lexeme);
+            if self.check_sym(",") {
+                self.eat();
+                names.push(self.eat_identifier()?.lexeme);
+            }
         }
         let annotation = if self.check_kw("AS") {
             self.eat();

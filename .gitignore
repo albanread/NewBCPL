@@ -17,3 +17,6 @@ Thumbs.db
 
 # Old compiler reference (cloned via git, regenerable)
 /reference
+
+# Output of `newbcpl-driver test-folder ... <report>` runs
+*-results.txt

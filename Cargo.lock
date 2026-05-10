@@ -124,6 +124,7 @@ dependencies = [
  "inkwell",
  "newbcpl-ir",
  "newbcpl-parser",
+ "newbcpl-runtime",
  "newbcpl-sema",
 ]
 

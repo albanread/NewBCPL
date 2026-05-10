@@ -148,10 +148,14 @@ pub enum Instr {
     /// class layout assigns each method a stable `vtable_slot`.
     /// Codegen loads the vtable from the instance, indexes by slot,
     /// loads the method pointer, and emits an indirect call (with
-    /// the receiver as the implicit first argument).
+    /// the receiver as the implicit first argument). `class_name`
+    /// is the receiver's static class — codegen needs it to pick
+    /// the right `@Class.vtable` global at the call site (and to
+    /// know the function-pointer signature for the indirect call).
     MethodCall {
         dst: Option<ValueId>,
         receiver: Value,
+        class_name: String,
         vtable_slot: usize,
         method_name: String,
         args: Vec<Value>,
@@ -192,13 +196,20 @@ pub enum Instr {
         args: Vec<Value>,
         hint: TypeHint,
     },
-    /// `pair.|n|` — extract a single lane from a SIMD vector. The
-    /// lane index is a runtime value (codegen will emit
-    /// `extractelement` directly when it's a constant).
+    /// `pair.|n|` — extract a single lane from a SIMD value. The
+    /// lane index is a runtime value (codegen still picks the
+    /// `extractelement` form when it's a constant). `kind`
+    /// records the source operand's SIMD shape so codegen knows
+    /// whether to emit `extractelement` (for FQUAD / FOCT, which
+    /// live in real LLVM vectors) or a sign-aware bit-shift (for
+    /// the PAIR / FPAIR / QUAD / OCT family, which all pack into
+    /// a single 64-bit word per the reference's ABI — see
+    /// `docs/pair_and_multilane_types.md`).
     LaneExtract {
         dst: ValueId,
         vector: Value,
         lane: Value,
+        kind: TypedKind,
         hint: TypeHint,
     },
 }
