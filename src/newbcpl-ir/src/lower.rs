@@ -1228,6 +1228,19 @@ impl<'a> Lowerer<'a> {
     }
 
     fn lower_let_stmt(&mut self, l: &LetDecl) {
+        // Destructuring shape: `LET a, b = single_pair_expr`. The
+        // parser cloned the RHS into every binding's expr slot
+        // and set `destructure = true`. Lower-time semantics:
+        // evaluate the RHS once, then lane-unpack into each name
+        // (same machinery FOREACH destructuring uses).
+        if l.destructure && l.bindings.len() > 1 {
+            let names: Vec<String> =
+                l.bindings.iter().map(|(n, _)| n.clone()).collect();
+            let rhs = &l.bindings[0].1;
+            let elem = self.lower_expr(rhs);
+            self.unpack_lanes(&names, elem);
+            return;
+        }
         for (name, init) in &l.bindings {
             // Capture the class name (if any) before lowering, so
             // the LET binding can record it. Lowering a `NEW Foo()`

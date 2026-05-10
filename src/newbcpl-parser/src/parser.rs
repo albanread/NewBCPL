@@ -814,18 +814,39 @@ impl Parser {
             self.eat();
             exprs.push(self.parse_expr()?);
         }
-        if names.len() != exprs.len() {
-            let span = exprs.last().map(|e| e.span()).unwrap_or(let_token.span);
-            return Err(ParseError::new(
-                format!(
-                    "LET binding has {} names but {} expressions",
-                    names.len(),
-                    exprs.len()
-                ),
-                span,
-            ));
-        }
-        let bindings: Vec<(String, Expr)> = names.into_iter().zip(exprs).collect();
+        // Destructuring assignment: `LET a, b = single_pair` — N
+        // names with one RHS unpacks the RHS's lanes into each
+        // name. Same shape as `FOREACH (a, b) IN list-of-pairs`
+        // but on a plain binding. We pair each name with a clone
+        // of the RHS here; lower-time treats this as a single
+        // evaluation + lane-extract per binding, gated by
+        // `LetDecl.destructure`.
+        let mut destructure = false;
+        let bindings: Vec<(String, Expr)> = if names.len() != exprs.len() {
+            if exprs.len() == 1 && names.len() > 1 {
+                destructure = true;
+                let only = exprs.into_iter().next().expect("exprs len 1");
+                names
+                    .into_iter()
+                    .map(|n| (n, only.clone()))
+                    .collect()
+            } else {
+                let span = exprs
+                    .last()
+                    .map(|e| e.span())
+                    .unwrap_or(let_token.span);
+                return Err(ParseError::new(
+                    format!(
+                        "LET binding has {} names but {} expressions",
+                        names.len(),
+                        exprs.len()
+                    ),
+                    span,
+                ));
+            }
+        } else {
+            names.into_iter().zip(exprs).collect()
+        };
         let end = bindings
             .last()
             .map(|(_, e)| e.span().end)
@@ -833,6 +854,7 @@ impl Parser {
         Ok(Decl::Let(LetDecl {
             bindings,
             annotations,
+            destructure,
             span: SourceSpan { start, end },
             kind,
         }))

@@ -249,6 +249,14 @@ pub struct LetDecl {
     /// binding's hint instead of inferring from the initialiser
     /// alone — manifesto §2 ("looks untyped, secretly typed").
     pub annotations: Vec<Option<String>>,
+    /// True when the binding is a destructuring shape:
+    /// `LET a, b = single_pair_expr` (one RHS, N names). Lower
+    /// evaluates the RHS once and lane-unpacks it into each
+    /// name's slot — same semantics as `FOREACH (a, b) IN ...`.
+    /// Every `bindings[i].1` is a clone of the same RHS so
+    /// downstream walkers that don't care about destructuring
+    /// still see a well-formed (name, expr) pair per binding.
+    pub destructure: bool,
     pub span: Span,
     /// Which binder keyword was used. `LET` is the default; `FLET`
     /// signals to sema that the right-hand sides should be inferred

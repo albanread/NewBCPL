@@ -1720,6 +1720,35 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
     /// Used at the head of every integer-family binop so that
     /// e.g. `IF V = 0` (V is a VEC pointer, 0 is an int literal)
     /// lowers to a clean `ptrtoint` + `icmp.eq`.
+    /// Coerce a value to an f64 — the BCPL "float word" view.
+    /// Mirror of `as_int_word`. The interesting case is when sema
+    /// didn't bind an identifier (so `lower_ident` falls through
+    /// to `Value::Function(name)`, which becomes a pointer to a
+    /// declared-but-undefined external function): instead of
+    /// crashing the float emitter on `into_float_value()`, we
+    /// substitute 0.0 so the program runs to a clean
+    /// "missing builtin" error from the JIT's pre-flight scan.
+    /// Integer values go through `sitofp`. Floats pass through.
+    fn as_float_value(&self, v: BasicValueEnum<'ctx>) -> inkwell::values::FloatValue<'ctx> {
+        let f64_t = self.context.f64_type();
+        match v {
+            BasicValueEnum::FloatValue(fv) => fv,
+            BasicValueEnum::IntValue(iv) => self
+                .builder
+                .build_signed_int_to_float(iv, f64_t, "i2f")
+                .expect("sitofp"),
+            BasicValueEnum::PointerValue(_) | BasicValueEnum::VectorValue(_) => {
+                // Sema/IR gap: an unresolved identifier was used
+                // in float arithmetic. Substitute 0.0 so codegen
+                // succeeds — the JIT's missing-builtin scan
+                // catches the dangling extern at run-prep time
+                // and produces a clean error.
+                f64_t.const_zero()
+            }
+            _ => f64_t.const_zero(),
+        }
+    }
+
     fn as_int_word(&self, v: BasicValueEnum<'ctx>) -> inkwell::values::IntValue<'ctx> {
         let i64_t = self.context.i64_type();
         match v {
@@ -1813,22 +1842,22 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
                 .into(),
             IrBinOp::FAdd => self
                 .builder
-                .build_float_add(lhs.into_float_value(), rhs.into_float_value(), "fadd")
+                .build_float_add(self.as_float_value(lhs), self.as_float_value(rhs), "fadd")
                 .unwrap()
                 .into(),
             IrBinOp::FSub => self
                 .builder
-                .build_float_sub(lhs.into_float_value(), rhs.into_float_value(), "fsub")
+                .build_float_sub(self.as_float_value(lhs), self.as_float_value(rhs), "fsub")
                 .unwrap()
                 .into(),
             IrBinOp::FMul => self
                 .builder
-                .build_float_mul(lhs.into_float_value(), rhs.into_float_value(), "fmul")
+                .build_float_mul(self.as_float_value(lhs), self.as_float_value(rhs), "fmul")
                 .unwrap()
                 .into(),
             IrBinOp::FDiv => self
                 .builder
-                .build_float_div(lhs.into_float_value(), rhs.into_float_value(), "fdiv")
+                .build_float_div(self.as_float_value(lhs), self.as_float_value(rhs), "fdiv")
                 .unwrap()
                 .into(),
             IrBinOp::BitAnd => self
@@ -1907,8 +1936,8 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
                     .builder
                     .build_float_compare(
                         pred,
-                        lhs.into_float_value(),
-                        rhs.into_float_value(),
+                        self.as_float_value(lhs),
+                        self.as_float_value(rhs),
                         "fcmp",
                     )
                     .unwrap();
@@ -1929,7 +1958,7 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
                 .into(),
             IrUnOp::FNeg => self
                 .builder
-                .build_float_neg(operand.into_float_value(), "fneg")
+                .build_float_neg(self.as_float_value(operand), "fneg")
                 .unwrap()
                 .into(),
             IrUnOp::Not => self
