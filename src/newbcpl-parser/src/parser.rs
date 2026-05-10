@@ -288,7 +288,10 @@ impl Parser {
 
         let mut current_visibility = Visibility::Public;
         let mut members: Vec<ClassMember> = Vec::new();
-        let mut end_span = open.span.end;
+        // Loop body sets end_span before break; the initial value is
+        // overwritten and never observed, so the compiler is right to
+        // flag it. Use MaybeUninit-style "we'll assign before read."
+        let end_span;
 
         loop {
             while self.check_sym(";") {
@@ -635,6 +638,11 @@ impl Parser {
 
     fn parse_let_decl(&mut self) -> Result<Decl, ParseError> {
         let let_token = self.eat();
+        let kind = if let_token.lexeme == "FLET" {
+            LetKind::FLet
+        } else {
+            LetKind::Let
+        };
         let start = let_token.span.start;
         let first_name = self.eat_identifier()?.lexeme;
 
@@ -715,6 +723,7 @@ impl Parser {
         Ok(Decl::Let(LetDecl {
             bindings,
             span: SourceSpan { start, end },
+            kind,
         }))
     }
 
@@ -1214,7 +1223,10 @@ impl Parser {
 
         let mut cases: Vec<SwitchCase> = Vec::new();
         let mut default: Option<Vec<Stmt>> = None;
-        let mut end_span = open.span.end;
+        // Loop body sets end_span before break; the initial value is
+        // overwritten and never observed, so the compiler is right to
+        // flag it. Use MaybeUninit-style "we'll assign before read."
+        let end_span;
 
         loop {
             // Skip stray separators inside the SWITCHON body.

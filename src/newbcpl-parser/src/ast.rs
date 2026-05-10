@@ -137,6 +137,17 @@ pub struct RoutineDecl {
 pub struct LetDecl {
     pub bindings: Vec<(String, Expr)>,
     pub span: Span,
+    /// Which binder keyword was used. `LET` is the default; `FLET`
+    /// signals to sema that the right-hand sides should be inferred
+    /// as `FLOAT` when the literal evidence is otherwise neutral
+    /// (manifesto §1).
+    pub kind: LetKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LetKind {
+    Let,
+    FLet,
 }
 
 #[derive(Debug, Clone)]

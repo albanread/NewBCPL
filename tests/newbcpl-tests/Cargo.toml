@@ -10,6 +10,7 @@ path = "src/lib.rs"
 [dependencies]
 newbcpl-lexer = { path = "../../src/newbcpl-lexer" }
 newbcpl-parser = { path = "../../src/newbcpl-parser" }
+newbcpl-sema = { path = "../../src/newbcpl-sema" }
 
 [[test]]
 name = "lexer_smoke"
@@ -26,3 +27,11 @@ path = "tests/parser_smoke.rs"
 [[test]]
 name = "parser_corpus"
 path = "tests/parser_corpus.rs"
+
+[[test]]
+name = "sema_smoke"
+path = "tests/sema_smoke.rs"
+
+[[test]]
+name = "sema_corpus"
+path = "tests/sema_corpus.rs"

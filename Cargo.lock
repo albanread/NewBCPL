@@ -163,6 +163,7 @@ version = "0.1.0"
 dependencies = [
  "newbcpl-lexer",
  "newbcpl-parser",
+ "newbcpl-sema",
 ]
 
 [[package]]
