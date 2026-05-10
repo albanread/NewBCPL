@@ -1421,17 +1421,27 @@ impl Parser {
     fn peek_binary_op(&self) -> Option<(BinaryOp, u8)> {
         let t = self.peek();
         match (t.kind, t.lexeme.as_str()) {
-            // Multiplicative (precedence 7)
+            // Multiplicative (precedence 7). Float-flavoured forms
+            // accept either `.` or `#` as the trailing marker —
+            // both are tokenised as one symbol by the lexer.
             (TokenKind::Symbol, "*") => Some((BinaryOp::Mul, 7)),
             (TokenKind::Symbol, "/") => Some((BinaryOp::Div, 7)),
             (TokenKind::Keyword, "REM") => Some((BinaryOp::Rem, 7)),
-            (TokenKind::Symbol, "*.") => Some((BinaryOp::FMul, 7)),
-            (TokenKind::Symbol, "/.") => Some((BinaryOp::FDiv, 7)),
+            (TokenKind::Symbol, "*.") | (TokenKind::Symbol, "*#") => {
+                Some((BinaryOp::FMul, 7))
+            }
+            (TokenKind::Symbol, "/.") | (TokenKind::Symbol, "/#") => {
+                Some((BinaryOp::FDiv, 7))
+            }
             // Additive (precedence 6)
             (TokenKind::Symbol, "+") => Some((BinaryOp::Add, 6)),
             (TokenKind::Symbol, "-") => Some((BinaryOp::Sub, 6)),
-            (TokenKind::Symbol, "+.") => Some((BinaryOp::FAdd, 6)),
-            (TokenKind::Symbol, "-.") => Some((BinaryOp::FSub, 6)),
+            (TokenKind::Symbol, "+.") | (TokenKind::Symbol, "+#") => {
+                Some((BinaryOp::FAdd, 6))
+            }
+            (TokenKind::Symbol, "-.") | (TokenKind::Symbol, "-#") => {
+                Some((BinaryOp::FSub, 6))
+            }
             // Shifts (precedence 5)
             (TokenKind::Symbol, "<<") => Some((BinaryOp::Shl, 5)),
             (TokenKind::Symbol, ">>") => Some((BinaryOp::Shr, 5)),
@@ -1442,12 +1452,24 @@ impl Parser {
             (TokenKind::Symbol, "<=") => Some((BinaryOp::Le, 4)),
             (TokenKind::Symbol, ">") => Some((BinaryOp::Gt, 4)),
             (TokenKind::Symbol, ">=") => Some((BinaryOp::Ge, 4)),
-            (TokenKind::Symbol, "=.") => Some((BinaryOp::FEq, 4)),
-            (TokenKind::Symbol, "~=.") => Some((BinaryOp::FNe, 4)),
-            (TokenKind::Symbol, "<.") => Some((BinaryOp::FLt, 4)),
-            (TokenKind::Symbol, "<=.") => Some((BinaryOp::FLe, 4)),
-            (TokenKind::Symbol, ">.") => Some((BinaryOp::FGt, 4)),
-            (TokenKind::Symbol, ">=.") => Some((BinaryOp::FGe, 4)),
+            (TokenKind::Symbol, "=.") | (TokenKind::Symbol, "=#") => {
+                Some((BinaryOp::FEq, 4))
+            }
+            (TokenKind::Symbol, "~=.") | (TokenKind::Symbol, "~=#") => {
+                Some((BinaryOp::FNe, 4))
+            }
+            (TokenKind::Symbol, "<.") | (TokenKind::Symbol, "<#") => {
+                Some((BinaryOp::FLt, 4))
+            }
+            (TokenKind::Symbol, "<=.") | (TokenKind::Symbol, "<=#") => {
+                Some((BinaryOp::FLe, 4))
+            }
+            (TokenKind::Symbol, ">.") | (TokenKind::Symbol, ">#") => {
+                Some((BinaryOp::FGt, 4))
+            }
+            (TokenKind::Symbol, ">=.") | (TokenKind::Symbol, ">=#") => {
+                Some((BinaryOp::FGe, 4))
+            }
             // Bitwise / logical AND (precedence 3). `AND` is the
             // word-form synonym for `&` per the reference lexer; the
             // declaration-tail use (`LET f = ... AND g = ...`) is a

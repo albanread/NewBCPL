@@ -635,19 +635,25 @@ impl<'a> Lexer<'a> {
         let start_offset = self.pos.offset;
         let byte = self.peek().expect("lex_symbol called at EOF");
 
+        // BCPL's float-flavoured operators accept either `.` or `#`
+        // as the trailing marker — the reference uses `*#` / `+#`
+        // / etc. heavily, while older sources prefer `*.` / `+.`.
+        // Both produce the same token so the parser doesn't care.
+        let is_float_marker = |b: u8| matches!(b, b'.' | b'#');
+
         // A small table-driven dispatcher. We list multi-byte forms longest-
         // first within each leading byte so that `<=.` wins over `<=`, etc.
         match byte {
             b'+' => {
                 self.advance();
-                if self.peek() == Some(b'.') {
+                if self.peek().is_some_and(is_float_marker) {
                     self.advance();
                 }
             }
             b'-' => {
                 self.advance();
                 match self.peek() {
-                    Some(b'.') => {
+                    Some(b) if is_float_marker(b) => {
                         self.advance();
                     }
                     Some(b'>') => {
@@ -658,7 +664,7 @@ impl<'a> Lexer<'a> {
             }
             b'*' => {
                 self.advance();
-                if self.peek() == Some(b'.') {
+                if self.peek().is_some_and(is_float_marker) {
                     self.advance();
                 }
             }
@@ -666,7 +672,7 @@ impl<'a> Lexer<'a> {
                 // `//` and `/* */` were already handled by skip_trivia, so
                 // a `/` here is genuinely the division operator.
                 self.advance();
-                if self.peek() == Some(b'.') {
+                if self.peek().is_some_and(is_float_marker) {
                     self.advance();
                 }
             }
@@ -678,7 +684,7 @@ impl<'a> Lexer<'a> {
             }
             b'=' => {
                 self.advance();
-                if self.peek() == Some(b'.') {
+                if self.peek().is_some_and(is_float_marker) {
                     self.advance();
                 }
             }
@@ -686,7 +692,7 @@ impl<'a> Lexer<'a> {
                 self.advance();
                 if self.peek() == Some(b'=') {
                     self.advance();
-                    if self.peek() == Some(b'.') {
+                    if self.peek().is_some_and(is_float_marker) {
                         self.advance();
                     }
                 }
@@ -699,11 +705,11 @@ impl<'a> Lexer<'a> {
                     }
                     Some(b'=') => {
                         self.advance();
-                        if self.peek() == Some(b'.') {
+                        if self.peek().is_some_and(is_float_marker) {
                             self.advance();
                         }
                     }
-                    Some(b'.') => {
+                    Some(b) if is_float_marker(b) => {
                         self.advance();
                     }
                     _ => {}
@@ -717,11 +723,11 @@ impl<'a> Lexer<'a> {
                     }
                     Some(b'=') => {
                         self.advance();
-                        if self.peek() == Some(b'.') {
+                        if self.peek().is_some_and(is_float_marker) {
                             self.advance();
                         }
                     }
-                    Some(b'.') => {
+                    Some(b) if is_float_marker(b) => {
                         self.advance();
                     }
                     _ => {}
