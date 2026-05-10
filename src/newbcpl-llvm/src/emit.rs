@@ -632,55 +632,56 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
         let layout = self.lookup_layout(class_name);
         let size = layout.map(|l| l.instance_size).unwrap_or(8);
 
-        // Resolve the TypeDesc global for this class. If the
-        // class has no methods (and thus no vtable / desc), fall
-        // back to the stack-alloca path so simple data-only
-        // classes keep working.
-        let desc_global = self
-            .module
-            .get_global(&format!("{class_name}.desc"));
-        let obj_ptr: PointerValue<'ctx> = match desc_global {
-            Some(desc) => {
-                let new_rec_fn = match self.by_name.get("__newbcpl_new_rec") {
-                    Some(&f) => f,
-                    None => {
-                        // Specific signature: `ptr fn(ptr)`.
-                        let fn_ty = ptr_t.fn_type(&[ptr_t.into()], false);
-                        let fv = self.module.add_function(
-                            "__newbcpl_new_rec",
-                            fn_ty,
-                            Some(Linkage::External),
-                        );
-                        self.by_name.insert("__newbcpl_new_rec".to_string(), fv);
-                        fv
-                    }
-                };
-                let call_site = self
-                    .builder
-                    .build_call(
-                        new_rec_fn,
-                        &[desc.as_pointer_value().into()],
-                        &format!("new.{class_name}"),
-                    )
-                    .expect("call __newbcpl_new_rec");
-                use inkwell::values::ValueKind;
-                match call_site.try_as_basic_value() {
-                    ValueKind::Basic(rv) => self.as_pointer(rv),
-                    ValueKind::Instruction(_) => panic!(
-                        "__newbcpl_new_rec must return a pointer"
-                    ),
+        // Allocate the instance on the GC heap via the
+        // size-keyed allocator `__newbcpl_alloc_rec`. The
+        // runtime interns a TypeDesc per distinct payload
+        // size and stamps every BlockHeader with that stable
+        // address — see `docs/jit_typedesc_lifetime.md` for
+        // why we don't pass `@Class.desc` directly. Classes
+        // with no recorded layout fall back to a stack alloca
+        // so simple data-only classes still compile, but in
+        // practice every declared class has a layout.
+        let obj_ptr: PointerValue<'ctx> = if layout.is_some() {
+            let alloc_fn = match self.by_name.get("__newbcpl_alloc_rec") {
+                Some(&f) => f,
+                None => {
+                    // Signature: `ptr fn(i64)`.
+                    let fn_ty = ptr_t.fn_type(&[i64_t.into()], false);
+                    let fv = self.module.add_function(
+                        "__newbcpl_alloc_rec",
+                        fn_ty,
+                        Some(Linkage::External),
+                    );
+                    self.by_name
+                        .insert("__newbcpl_alloc_rec".to_string(), fv);
+                    fv
                 }
+            };
+            let size_arg = i64_t.const_int(size as u64, true);
+            let call_site = self
+                .builder
+                .build_call(
+                    alloc_fn,
+                    &[size_arg.into()],
+                    &format!("new.{class_name}"),
+                )
+                .expect("call __newbcpl_alloc_rec");
+            use inkwell::values::ValueKind;
+            match call_site.try_as_basic_value() {
+                ValueKind::Basic(rv) => self.as_pointer(rv),
+                ValueKind::Instruction(_) => panic!(
+                    "__newbcpl_alloc_rec must return a pointer"
+                ),
             }
-            None => {
-                let i8_t = self.context.i8_type();
-                let arr_t = i8_t.array_type(size as u32);
-                let alloca = self
-                    .builder
-                    .build_alloca(arr_t, &format!("obj.{class_name}"))
-                    .expect("alloca obj");
-                self.zero_memory(alloca, size);
-                alloca
-            }
+        } else {
+            let i8_t = self.context.i8_type();
+            let arr_t = i8_t.array_type(size as u32);
+            let alloca = self
+                .builder
+                .build_alloca(arr_t, &format!("obj.{class_name}"))
+                .expect("alloca obj");
+            self.zero_memory(alloca, size);
+            alloca
         };
 
         // Install the inline vtable pointer at offset 0 of the

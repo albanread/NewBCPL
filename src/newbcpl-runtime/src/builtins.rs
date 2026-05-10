@@ -574,6 +574,84 @@ pub unsafe extern "C" fn __newbcpl_freelist(_p: *mut i64) -> i64 {
     0
 }
 
+// ─── runtime-interned TypeDescs for safe `collect()` ─────────────
+//
+// See `docs/jit_typedesc_lifetime.md` for the long form. Short
+// version: TypeDesc constants in the JIT module's data section
+// die when the ExecutionEngine drops, but BlockHeader.tag pointers
+// in the GC heap survive — calling `collect()` afterwards reads
+// freed memory. Fix B: keep TypeDescs on the runtime side, hand
+// their stable address to `__newbcpl_new_rec`. This indirection
+// is `__newbcpl_alloc_rec(size)` — the JIT'd `NEW Class` site
+// passes the static instance size from the class layout, the
+// runtime interns a TypeDesc per size, and the BlockHeader's tag
+// points into newbcpl-runtime statics that live for the whole
+// process.
+
+/// Layout-frozen mirror of `gc::TypeDesc` plus a single i64 that
+/// serves as the `ptroffs` sentinel. Allocating these via
+/// `Box::leak` gives a stable address that the GC can stamp into
+/// `BlockHeader.tag` without worrying about JIT engine drops.
+#[repr(C)]
+struct RuntimeTypeDesc {
+    size: isize,
+    module: *const u8,
+    finalizer: *const u8,
+    base: *const u8,
+    vtable: *const u8,
+    vtable_len: u64,
+    name: *const u32,
+    /// `[isize; 1]` immediately after the TypeDesc fields, set to
+    /// `-1` so the GC's pointer-offset iterator stops without
+    /// reading any further memory. No traced fields today.
+    ptroffs_sentinel: isize,
+}
+
+unsafe impl Sync for RuntimeTypeDesc {}
+unsafe impl Send for RuntimeTypeDesc {}
+
+fn intern_typedesc_for_size(size: usize) -> *const crate::gc::TypeDesc {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+
+    // The map stores the leaked TypeDesc address as a `usize` so
+    // the inner type stays `Send + Sync`. We cast back to a
+    // `*const TypeDesc` on the way out.
+    static CACHE: OnceLock<Mutex<HashMap<usize, usize>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = cache.lock().expect("typedesc cache poisoned");
+    if let Some(&existing) = guard.get(&size) {
+        return existing as *const crate::gc::TypeDesc;
+    }
+    let boxed = Box::new(RuntimeTypeDesc {
+        size: size as isize,
+        module: std::ptr::null(),
+        finalizer: std::ptr::null(),
+        base: std::ptr::null(),
+        vtable: std::ptr::null(),
+        vtable_len: 0,
+        name: std::ptr::null(),
+        ptroffs_sentinel: -1,
+    });
+    let leaked = Box::leak(boxed) as *const RuntimeTypeDesc as *const crate::gc::TypeDesc;
+    guard.insert(size, leaked as usize);
+    leaked
+}
+
+/// `__newbcpl_alloc_rec(size)` — heap-allocate a record of `size`
+/// payload bytes via the GC. Takes a plain integer instead of a
+/// JIT-emitted TypeDesc address so the BlockHeader's tag points
+/// to runtime-interned storage that survives JIT engine drops.
+/// The JIT'd `NEW Class` site passes
+/// `layout.instance_size` from sema.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __newbcpl_alloc_rec(size: i64) -> *mut u8 {
+    let size = size.max(0) as usize;
+    let td = intern_typedesc_for_size(size);
+    unsafe { crate::gc::__newbcpl_new_rec(td) }
+}
+
 /// `HD(list)` — read the value of the first atom. Returns 0 if
 /// the list is null or empty. The atom's `type_tag` is ignored
 /// here; BCPL treats every value as a 64-bit word at the call
@@ -780,6 +858,7 @@ pub fn builtin_addresses() -> &'static [Builtin] {
                 name: "__newbcpl_safepoint",
                 address: crate::gc::__newbcpl_safepoint as *const () as usize,
             },
+            builtin!(__newbcpl_alloc_rec),
         ]
     })
 }

@@ -422,12 +422,15 @@ mod tests {
         let text = emit_text(
             "CLASS Point $( DECL x, y $)\nLET S() BE { LET p = NEW Point }",
         );
-        // `NEW Class` now allocates on the GC heap via
-        // `__newbcpl_new_rec(@Class.desc)`. The desc global holds
-        // the TypeDesc constant; the runtime stamps the
-        // BlockHeader and returns the data pointer.
-        assert!(text.contains("@Point.desc"));
-        assert!(text.contains("call ptr @__newbcpl_new_rec"));
+        // `NEW Class` allocates on the GC heap via
+        // `__newbcpl_alloc_rec(size)`. The runtime interns a
+        // TypeDesc per distinct payload size and stamps every
+        // BlockHeader with that stable address — see
+        // `docs/jit_typedesc_lifetime.md`. The size argument is
+        // sema's `instance_size` (24 for Point: 8 vtable header
+        // + 2 word fields).
+        assert!(text.contains("@__newbcpl_alloc_rec"));
+        assert!(text.contains("i64 24"));
     }
 
     #[test]
@@ -502,17 +505,6 @@ mod tests {
         // through the GC: compile a program that creates three
         // class instances, run it, and check the global block
         // counter advanced by at least three.
-        //
-        // We deliberately do **not** call `collect()` here.
-        // The TypeDesc constants for these classes live in the
-        // JIT module's data section, which the `ExecutionEngine`
-        // owns. When `run()` returns the engine drops and the
-        // memory backing the TypeDescs goes with it — calling
-        // `collect()` afterwards would dereference dangling
-        // `BlockHeader.tag` pointers. Lifting that constraint
-        // requires either keeping JIT modules alive for the
-        // life of the heap, or copying TypeDescs out of the
-        // JIT into stable storage. Tracked as a follow-up.
         let tmp = std::env::temp_dir().join("newbcpl_jit_alloc.bcl");
         std::fs::write(
             &tmp,
@@ -538,6 +530,35 @@ mod tests {
              only moved {} → {} (expected ≥ +3)",
             blocks_before, blocks_after
         );
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn collect_after_jit_run_does_not_crash() {
+        // Fix B in `docs/jit_typedesc_lifetime.md`: TypeDescs
+        // are interned by `__newbcpl_alloc_rec` on the runtime
+        // side, so they survive the JIT engine drop. After
+        // `run()` returns we can safely walk the heap with
+        // `collect()` and start a fresh JIT run on top of it.
+        //
+        // The previous incarnation of this test crashed in
+        // `collect()` because `BlockHeader.tag` pointed into the
+        // JIT module's freed data section. With `__newbcpl_alloc_rec`
+        // in place, every tag points into a `Box::leak`'d
+        // `RuntimeTypeDesc` that lives for the process lifetime.
+        let tmp = std::env::temp_dir().join("newbcpl_jit_collect.bcl");
+        std::fs::write(
+            &tmp,
+            "CLASS Point $(\n  DECL x, y\n  ROUTINE CREATE(ix, iy) BE $( SELF.x := ix\n SELF.y := iy $)\n$)\nLET START() BE $(\n LET a = NEW Point(1, 2)\n LET b = NEW Point(3, 4)\n LET c = NEW Point(5, 6)\n$)",
+        )
+        .unwrap();
+        run(&tmp).expect("first JIT run should succeed");
+        // collect() walks every BlockHeader; if any tag pointed
+        // into freed JIT memory this would access-violation.
+        newbcpl_runtime::gc::collect();
+        // Heap must remain usable for subsequent JIT runs.
+        run(&tmp).expect("post-collect JIT run should succeed");
+        newbcpl_runtime::gc::collect();
         let _ = std::fs::remove_file(&tmp);
     }
 }
