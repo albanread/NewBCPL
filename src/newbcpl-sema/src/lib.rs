@@ -42,98 +42,7 @@ use newbcpl_parser::{
     LetDecl, LetKind, Program, Span, Stmt, TypeConstructorKind, UnaryOp, Visibility,
 };
 
-/// Register-class hint for a value. The lattice from
-/// `docs/manifesto.md` §2 — each variant corresponds to a concrete
-/// LLVM type and a concrete machine register class.
-///
-/// `Word` is the universal escape hatch: classic BCPL programs that
-/// don't carry strong type evidence stay `Word`, and any operator
-/// applied to one or more `Word`s falls back to integer codegen.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum TypeHint {
-    /// Untyped 64-bit word. The default and the universal escape hatch.
-    Word,
-    /// Signed 64-bit integer (X-register, `i64`).
-    Int,
-    /// IEEE-754 double-precision (D-register, `double`).
-    Float,
-    /// Pointer to a heap-allocated UTF-8 string.
-    String,
-    /// `?` null literal — coerces to any pointer-shaped target.
-    Null,
-    /// 128-bit V-register, `<2 x i64>`.
-    Pair,
-    /// 128-bit V-register, `<2 x double>`.
-    FPair,
-    /// 256-bit, `<4 x i64>`.
-    Quad,
-    /// 256-bit, `<4 x double>`.
-    FQuad,
-    /// 512-bit (SVE), `<8 x i64>`.
-    Oct,
-    /// 512-bit (SVE), `<8 x double>`.
-    FOct,
-    /// Heap-allocated cons-cell list (heterogeneous capable).
-    List,
-    /// Heap-allocated word vector.
-    Vec,
-    /// Heap-allocated float vector.
-    FVec,
-    /// Heap-allocated object instance. Class identity is recorded in
-    /// `SemaOutput::bindings` and `SemaOutput::classes` separately.
-    Object,
-    /// Function value (callable).
-    Function,
-    /// Sema couldn't determine the type. Codegen treats this as `Word`.
-    Unknown,
-}
-
-impl TypeHint {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            TypeHint::Word => "WORD",
-            TypeHint::Int => "INT",
-            TypeHint::Float => "FLOAT",
-            TypeHint::String => "STRING",
-            TypeHint::Null => "NULL",
-            TypeHint::Pair => "PAIR",
-            TypeHint::FPair => "FPAIR",
-            TypeHint::Quad => "QUAD",
-            TypeHint::FQuad => "FQUAD",
-            TypeHint::Oct => "OCT",
-            TypeHint::FOct => "FOCT",
-            TypeHint::List => "LIST",
-            TypeHint::Vec => "VEC",
-            TypeHint::FVec => "FVEC",
-            TypeHint::Object => "OBJECT",
-            TypeHint::Function => "FUNCTION",
-            TypeHint::Unknown => "?",
-        }
-    }
-
-    /// True if the type lives in a floating-point register family
-    /// (D-register or a NEON / SVE V-register holding floats).
-    pub fn is_float_family(self) -> bool {
-        matches!(
-            self,
-            TypeHint::Float | TypeHint::FPair | TypeHint::FQuad | TypeHint::FOct | TypeHint::FVec
-        )
-    }
-
-    /// True if both sides being this type means an integer-family op
-    /// (X-register or NEON / SVE integer lanes).
-    pub fn is_int_family(self) -> bool {
-        matches!(
-            self,
-            TypeHint::Int
-                | TypeHint::Word
-                | TypeHint::Pair
-                | TypeHint::Quad
-                | TypeHint::Oct
-                | TypeHint::Vec
-        )
-    }
-}
+pub use newbcpl_parser::TypeHint;
 
 #[derive(Debug, Clone)]
 pub struct BindingInfo {
@@ -1006,9 +915,18 @@ impl Sema {
         );
     }
 
-    /// The heart of inference: compute a TypeHint for any expression.
-    /// Always returns *something* — even unknowns are a known value.
+    /// The heart of inference: compute a TypeHint for any expression
+    /// and store it on the expression's `hint` Cell so downstream
+    /// phases (IR, codegen, dump-ast) can read it without re-running
+    /// sema. Always returns *something* — even `Unknown` is a known
+    /// value.
     fn type_of(&mut self, expr: &Expr) -> TypeHint {
+        let hint = self.compute_type_of(expr);
+        expr.set_hint(hint);
+        hint
+    }
+
+    fn compute_type_of(&mut self, expr: &Expr) -> TypeHint {
         match expr {
             Expr::IntLit { .. } => TypeHint::Int,
             Expr::FloatLit { .. } => TypeHint::Float,
@@ -1771,6 +1689,72 @@ mod tests {
             "LET S() BE { WHILE x DO $( WHILE y DO BREAK\n BREAK $) }",
         );
         assert_eq!(warning_count_matching(&out, "BREAK outside"), 0);
+    }
+
+    // ─── per-expression hint storage on AST ────────────────────
+
+    #[test]
+    fn ast_expr_hint_is_unknown_before_sema_runs() {
+        // Parse without running sema. Every expression's hint should
+        // start at `Unknown` — sema's job is to fill them in.
+        let program = newbcpl_parser::parse_source("LET x = 3.14")
+            .expect("parse");
+        let Decl::Let(l) = &program.items[0] else { panic!() };
+        let (_, expr) = &l.bindings[0];
+        assert_eq!(expr.hint(), TypeHint::Unknown);
+    }
+
+    #[test]
+    fn ast_expr_hint_set_by_sema_walk() {
+        // After sema, every expression visited gets its hint stamped.
+        let program = newbcpl_parser::parse_source("LET x = 3.14\nLET y = x + 1.0")
+            .expect("parse");
+        let _ = analyze(&program);
+
+        // x: FloatLit → Float
+        let Decl::Let(l0) = &program.items[0] else { panic!() };
+        let (_, e0) = &l0.bindings[0];
+        assert_eq!(e0.hint(), TypeHint::Float);
+
+        // y: Binary { Add, Ident x (Float), FloatLit 1.0 } → Float
+        let Decl::Let(l1) = &program.items[1] else { panic!() };
+        let (_, e1) = &l1.bindings[0];
+        assert_eq!(e1.hint(), TypeHint::Float);
+        let Expr::Binary { lhs, rhs, .. } = e1 else {
+            panic!()
+        };
+        assert_eq!(lhs.hint(), TypeHint::Float); // looked up x
+        assert_eq!(rhs.hint(), TypeHint::Float); // 1.0
+    }
+
+    #[test]
+    fn ast_hints_pick_up_subscript_results() {
+        let program = newbcpl_parser::parse_source(
+            "LET v = VEC 10\nLET fv = FVEC 10\nLET a = v!0\nLET b = fv.%0",
+        )
+        .expect("parse");
+        let _ = analyze(&program);
+        let Decl::Let(l_a) = &program.items[2] else { panic!() };
+        let Decl::Let(l_b) = &program.items[3] else { panic!() };
+        // v!0 → Word (vector elements are typeless words)
+        assert_eq!(l_a.bindings[0].1.hint(), TypeHint::Word);
+        // fv.%0 → Float
+        assert_eq!(l_b.bindings[0].1.hint(), TypeHint::Float);
+    }
+
+    #[test]
+    fn ast_hint_for_nested_call_callee() {
+        // The callee inside `f(x)` has its own hint stamped, even
+        // when the parser model wraps it in a Call.
+        let program =
+            newbcpl_parser::parse_source("LET f() = 3.14\nLET y = f()").expect("parse");
+        let _ = analyze(&program);
+        let Decl::Let(l) = &program.items[1] else { panic!() };
+        let Expr::Call { callee, .. } = &l.bindings[0].1 else {
+            panic!()
+        };
+        // Callee is the ident `f`; sema looks up its binding → FUNCTION.
+        assert_eq!(callee.hint(), TypeHint::Function);
     }
 
     #[test]

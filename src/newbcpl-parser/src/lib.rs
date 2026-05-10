@@ -12,7 +12,8 @@ use std::path::Path;
 pub use ast::{
     BinaryOp, Block, ClassDecl, ClassMember, ClassMemberKind, ClassMethod, ClassMethodBody, Decl,
     Expr, FunctionDecl, GetDirective, LetDecl, LetKind, NamedBinding, NamedBindingsDecl, Program,
-    RoutineDecl, Span, Stmt, SwitchCase, TypeConstructorKind, UnaryOp, Visibility,
+    RoutineDecl, Span, Stmt, SwitchCase, TypeConstructorKind, TypeHint, UnaryOp, Visibility,
+    unknown_hint,
 };
 pub use parser::{ParseError, parse_source};
 

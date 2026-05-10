@@ -1339,6 +1339,7 @@ impl Parser {
                 then_expr: Box::new(then_expr),
                 else_expr: Box::new(else_expr),
                 span,
+                hint: unknown_hint(),
             });
         }
         Ok(cond)
@@ -1366,6 +1367,7 @@ impl Parser {
                 lhs: Box::new(lhs),
                 rhs: Box::new(rhs),
                 span,
+                hint: unknown_hint(),
             };
         }
         Ok(lhs)
@@ -1437,6 +1439,7 @@ impl Parser {
                 op: UnaryOp::Neg,
                 operand: Box::new(operand),
                 span,
+                hint: unknown_hint(),
             });
         }
         if self.check_sym("~") || self.check_kw("NOT") {
@@ -1450,6 +1453,7 @@ impl Parser {
                 op: UnaryOp::Not,
                 operand: Box::new(operand),
                 span,
+                hint: unknown_hint(),
             });
         }
 
@@ -1477,6 +1481,7 @@ impl Parser {
                 op,
                 operand: Box::new(operand),
                 span,
+                hint: unknown_hint(),
             });
         }
         if self.check_sym("!") {
@@ -1490,6 +1495,7 @@ impl Parser {
                 op: UnaryOp::Indirection,
                 operand: Box::new(operand),
                 span,
+                hint: unknown_hint(),
             });
         }
         if self.check_sym("@") {
@@ -1503,6 +1509,7 @@ impl Parser {
                 op: UnaryOp::AddressOf,
                 operand: Box::new(operand),
                 span,
+                hint: unknown_hint(),
             });
         }
         if self.check_sym("%") {
@@ -1516,6 +1523,7 @@ impl Parser {
                 op: UnaryOp::CharIndirection,
                 operand: Box::new(operand),
                 span,
+                hint: unknown_hint(),
             });
         }
         self.parse_postfix()
@@ -1545,6 +1553,7 @@ impl Parser {
                     callee: Box::new(expr),
                     args,
                     span,
+                    hint: unknown_hint(),
                 };
                 continue;
             }
@@ -1597,6 +1606,7 @@ impl Parser {
                             lhs: Box::new(start_arg),
                             rhs: Box::new(w),
                             span: inner_span,
+                            hint: unknown_hint(),
                         }
                     }
                     None => start_arg,
@@ -1606,6 +1616,7 @@ impl Parser {
                     lhs: Box::new(expr),
                     rhs: Box::new(rhs),
                     span,
+                    hint: unknown_hint(),
                 };
                 continue;
             }
@@ -1635,6 +1646,7 @@ impl Parser {
                     lhs: Box::new(expr),
                     rhs: Box::new(rhs),
                     span,
+                    hint: unknown_hint(),
                 };
                 continue;
             }
@@ -1660,6 +1672,7 @@ impl Parser {
                         lhs: Box::new(expr),
                         rhs: Box::new(idx),
                         span,
+                        hint: unknown_hint(),
                     };
                     continue;
                 }
@@ -1667,6 +1680,7 @@ impl Parser {
                 let rhs = Expr::Ident {
                     name: field.lexeme,
                     span: field.span,
+                    hint: unknown_hint(),
                 };
                 let span = SourceSpan {
                     start: expr.span().start,
@@ -1677,6 +1691,7 @@ impl Parser {
                     lhs: Box::new(expr),
                     rhs: Box::new(rhs),
                     span,
+                    hint: unknown_hint(),
                 };
                 continue;
             }
@@ -1688,6 +1703,7 @@ impl Parser {
                 let rhs = Expr::Ident {
                     name: field.lexeme,
                     span: field.span,
+                    hint: unknown_hint(),
                 };
                 let span = SourceSpan {
                     start: expr.span().start,
@@ -1698,6 +1714,7 @@ impl Parser {
                     lhs: Box::new(expr),
                     rhs: Box::new(rhs),
                     span,
+                    hint: unknown_hint(),
                 };
                 continue;
             }
@@ -1715,6 +1732,7 @@ impl Parser {
                 Ok(Expr::Ident {
                     name: tok.lexeme,
                     span: tok.span,
+                    hint: unknown_hint(),
                 })
             }
             TokenKind::Integer => {
@@ -1725,6 +1743,7 @@ impl Parser {
                 Ok(Expr::IntLit {
                     value,
                     span: tok.span,
+                    hint: unknown_hint(),
                 })
             }
             TokenKind::Real => {
@@ -1735,6 +1754,7 @@ impl Parser {
                 Ok(Expr::FloatLit {
                     value,
                     span: tok.span,
+                    hint: unknown_hint(),
                 })
             }
             TokenKind::String => {
@@ -1742,6 +1762,7 @@ impl Parser {
                 Ok(Expr::StringLit {
                     value: tok.lexeme,
                     span: tok.span,
+                    hint: unknown_hint(),
                 })
             }
             TokenKind::Character => {
@@ -1749,6 +1770,7 @@ impl Parser {
                 Ok(Expr::CharLit {
                     lexeme: tok.lexeme,
                     span: tok.span,
+                    hint: unknown_hint(),
                 })
             }
             TokenKind::Keyword if tok.lexeme == "TRUE" => {
@@ -1756,6 +1778,7 @@ impl Parser {
                 Ok(Expr::BoolLit {
                     value: true,
                     span: tok.span,
+                    hint: unknown_hint(),
                 })
             }
             TokenKind::Keyword if tok.lexeme == "FALSE" => {
@@ -1763,6 +1786,7 @@ impl Parser {
                 Ok(Expr::BoolLit {
                     value: false,
                     span: tok.span,
+                    hint: unknown_hint(),
                 })
             }
             TokenKind::Keyword if tok.lexeme == "VALOF" || tok.lexeme == "FVALOF" => {
@@ -1775,6 +1799,7 @@ impl Parser {
                 Ok(Expr::Valof {
                     body: Box::new(body),
                     span,
+                    hint: unknown_hint(),
                 })
             }
             TokenKind::Keyword
@@ -1812,6 +1837,7 @@ impl Parser {
                             start: tok.span.start,
                             end: close.span.end,
                         },
+                        hint: unknown_hint(),
                     });
                 }
                 let size = self.parse_unary()?;
@@ -1823,6 +1849,7 @@ impl Parser {
                     kind,
                     args: vec![size],
                     span,
+                    hint: unknown_hint(),
                 })
             }
             TokenKind::Keyword
@@ -1866,7 +1893,9 @@ impl Parser {
                     start: tok.span.start,
                     end: close.span.end,
                 };
-                Ok(Expr::TypedConstruct { kind, args, span })
+                Ok(Expr::TypedConstruct { kind, args, span,
+                    hint: unknown_hint(),
+                })
             }
             // Intrinsic conversion functions written as keywords:
             // FLOAT(n), TRUNC(f), FIX(f), FSQRT(f), ENTIER(f). Treat
@@ -1882,6 +1911,7 @@ impl Parser {
                 Ok(Expr::Ident {
                     name: tok.lexeme,
                     span: tok.span,
+                    hint: unknown_hint(),
                 })
             }
             // SELF and SUPER — surface as identifier-shaped expressions
@@ -1893,6 +1923,7 @@ impl Parser {
                 Ok(Expr::Ident {
                     name: tok.lexeme,
                     span: tok.span,
+                    hint: unknown_hint(),
                 })
             }
             // `NEW Class` or `NEW Class(args)` — heap object construction.
@@ -1923,11 +1954,14 @@ impl Parser {
                         start: tok.span.start,
                         end,
                     },
+                    hint: unknown_hint(),
                 })
             }
             TokenKind::Symbol if tok.lexeme == "?" => {
                 self.pos += 1;
-                Ok(Expr::Null { span: tok.span })
+                Ok(Expr::Null { span: tok.span,
+                    hint: unknown_hint(),
+                })
             }
             TokenKind::Symbol if tok.lexeme == "(" => {
                 self.pos += 1;

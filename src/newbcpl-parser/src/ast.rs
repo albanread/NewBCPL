@@ -7,9 +7,113 @@
 //! Spans are reused from `newbcpl_lexer::SourceSpan` so the whole
 //! pipeline shares one notion of source location.
 
+use std::cell::Cell;
+
 use newbcpl_lexer::SourceSpan;
 
 pub type Span = SourceSpan;
+
+/// Register-class hint per `docs/manifesto.md` §2.
+///
+/// This enum is the shared vocabulary between sema and codegen for
+/// "what kind of value lives here." Sema fills the hint in on every
+/// `Expr` during its walk; later phases read `Expr::hint()` directly
+/// instead of re-deriving.
+///
+/// `Word` is the universal escape hatch: any classic-BCPL expression
+/// without strong type evidence stays `Word`, and codegen treats it
+/// as a generic 64-bit integer in an X-register.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TypeHint {
+    /// Untyped 64-bit word. The default and the universal escape hatch.
+    Word,
+    /// Signed 64-bit integer (X-register, `i64`).
+    Int,
+    /// IEEE-754 double-precision (D-register, `double`).
+    Float,
+    /// Pointer to a heap-allocated UTF-8 string.
+    String,
+    /// `?` null literal — coerces to any pointer-shaped target.
+    Null,
+    /// 128-bit V-register, `<2 x i64>`.
+    Pair,
+    /// 128-bit V-register, `<2 x double>`.
+    FPair,
+    /// 256-bit, `<4 x i64>`.
+    Quad,
+    /// 256-bit, `<4 x double>`.
+    FQuad,
+    /// 512-bit (SVE), `<8 x i64>`.
+    Oct,
+    /// 512-bit (SVE), `<8 x double>`.
+    FOct,
+    /// Heap-allocated cons-cell list (heterogeneous capable).
+    List,
+    /// Heap-allocated word vector.
+    Vec,
+    /// Heap-allocated float vector.
+    FVec,
+    /// Heap-allocated object instance. Class identity is recorded in
+    /// the sema-side `BindingInfo` / `ClassInfo` separately.
+    Object,
+    /// Function value (callable).
+    Function,
+    /// Sema didn't determine the type. Codegen treats this as `Word`.
+    Unknown,
+}
+
+impl Default for TypeHint {
+    fn default() -> Self {
+        TypeHint::Unknown
+    }
+}
+
+impl TypeHint {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TypeHint::Word => "WORD",
+            TypeHint::Int => "INT",
+            TypeHint::Float => "FLOAT",
+            TypeHint::String => "STRING",
+            TypeHint::Null => "NULL",
+            TypeHint::Pair => "PAIR",
+            TypeHint::FPair => "FPAIR",
+            TypeHint::Quad => "QUAD",
+            TypeHint::FQuad => "FQUAD",
+            TypeHint::Oct => "OCT",
+            TypeHint::FOct => "FOCT",
+            TypeHint::List => "LIST",
+            TypeHint::Vec => "VEC",
+            TypeHint::FVec => "FVEC",
+            TypeHint::Object => "OBJECT",
+            TypeHint::Function => "FUNCTION",
+            TypeHint::Unknown => "?",
+        }
+    }
+
+    /// Lives in a floating-point register family (D-register or
+    /// NEON / SVE V-register holding floats).
+    pub fn is_float_family(self) -> bool {
+        matches!(
+            self,
+            TypeHint::Float | TypeHint::FPair | TypeHint::FQuad | TypeHint::FOct | TypeHint::FVec
+        )
+    }
+
+    /// Both sides being this type means an integer-family op
+    /// (X-register or NEON / SVE integer lanes).
+    pub fn is_int_family(self) -> bool {
+        matches!(
+            self,
+            TypeHint::Int
+                | TypeHint::Word
+                | TypeHint::Pair
+                | TypeHint::Quad
+                | TypeHint::Oct
+                | TypeHint::Vec
+        )
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Program {
@@ -270,38 +374,73 @@ pub struct SwitchCase {
     pub span: Span,
 }
 
+/// Every variant carries a `hint: Cell<TypeHint>` that sema fills
+/// in during its walk and that downstream phases read via
+/// [`Expr::hint`]. The default is `TypeHint::Unknown`; codegen treats
+/// that as `Word`. The `Cell` gives sema interior mutability without
+/// requiring a `&mut` borrow of the AST.
 #[derive(Debug, Clone)]
 pub enum Expr {
-    Ident { name: String, span: Span },
-    IntLit { value: i64, span: Span },
+    Ident {
+        name: String,
+        span: Span,
+        hint: Cell<TypeHint>,
+    },
+    IntLit {
+        value: i64,
+        span: Span,
+        hint: Cell<TypeHint>,
+    },
     /// IEEE-754 double-precision. Stored as the bit pattern so
     /// the parser does not lose precision through the `f64` round-trip.
-    FloatLit { value: f64, span: Span },
+    FloatLit {
+        value: f64,
+        span: Span,
+        hint: Cell<TypeHint>,
+    },
     /// Single character; lexeme retained including surrounding quotes
     /// so a pretty-printer can round-trip the source style.
-    CharLit { lexeme: String, span: Span },
+    CharLit {
+        lexeme: String,
+        span: Span,
+        hint: Cell<TypeHint>,
+    },
     /// Raw string lexeme including surrounding `"` and `*`-escape
     /// sequences. Sema cooks the escapes when needed.
-    StringLit { value: String, span: Span },
+    StringLit {
+        value: String,
+        span: Span,
+        hint: Cell<TypeHint>,
+    },
     /// True / False as integer-valued literals (TRUE = 1, FALSE = 0).
-    BoolLit { value: bool, span: Span },
+    BoolLit {
+        value: bool,
+        span: Span,
+        hint: Cell<TypeHint>,
+    },
     /// `?` — null pointer literal.
-    Null { span: Span },
+    Null {
+        span: Span,
+        hint: Cell<TypeHint>,
+    },
     Call {
         callee: Box<Expr>,
         args: Vec<Expr>,
         span: Span,
+        hint: Cell<TypeHint>,
     },
     Unary {
         op: UnaryOp,
         operand: Box<Expr>,
         span: Span,
+        hint: Cell<TypeHint>,
     },
     Binary {
         op: BinaryOp,
         lhs: Box<Expr>,
         rhs: Box<Expr>,
         span: Span,
+        hint: Cell<TypeHint>,
     },
     /// `cond -> then_expr, else_expr`
     Conditional {
@@ -309,9 +448,14 @@ pub enum Expr {
         then_expr: Box<Expr>,
         else_expr: Box<Expr>,
         span: Span,
+        hint: Cell<TypeHint>,
     },
     /// `VALOF stmt` — yields the value passed to `RESULTIS`.
-    Valof { body: Box<Stmt>, span: Span },
+    Valof {
+        body: Box<Stmt>,
+        span: Span,
+        hint: Cell<TypeHint>,
+    },
     /// Typed constructor — covers heap allocation (`VEC k`, `FVEC k`),
     /// SIMD primitives (`PAIR`/`FPAIR`/`QUAD`/`FQUAD`/`OCT`/`FOCT`),
     /// and table literals (`TABLE`/`FTABLE`). All expressed as a kind
@@ -321,6 +465,7 @@ pub enum Expr {
         kind: TypeConstructorKind,
         args: Vec<Expr>,
         span: Span,
+        hint: Cell<TypeHint>,
     },
     /// `NEW Class(args)` — heap-allocate an object and call its
     /// `CREATE`. The argument list is empty for `NEW Class`.
@@ -328,6 +473,7 @@ pub enum Expr {
         class_name: String,
         args: Vec<Expr>,
         span: Span,
+        hint: Cell<TypeHint>,
     },
 }
 
@@ -466,7 +612,7 @@ impl Expr {
             | Expr::CharLit { span, .. }
             | Expr::StringLit { span, .. }
             | Expr::BoolLit { span, .. }
-            | Expr::Null { span }
+            | Expr::Null { span, .. }
             | Expr::Call { span, .. }
             | Expr::Unary { span, .. }
             | Expr::Binary { span, .. }
@@ -476,6 +622,57 @@ impl Expr {
             | Expr::New { span, .. } => *span,
         }
     }
+
+    /// Read the sema-attached register-class hint for this expression.
+    /// Returns `TypeHint::Unknown` until sema has run.
+    pub fn hint(&self) -> TypeHint {
+        match self {
+            Expr::Ident { hint, .. }
+            | Expr::IntLit { hint, .. }
+            | Expr::FloatLit { hint, .. }
+            | Expr::CharLit { hint, .. }
+            | Expr::StringLit { hint, .. }
+            | Expr::BoolLit { hint, .. }
+            | Expr::Null { hint, .. }
+            | Expr::Call { hint, .. }
+            | Expr::Unary { hint, .. }
+            | Expr::Binary { hint, .. }
+            | Expr::Conditional { hint, .. }
+            | Expr::Valof { hint, .. }
+            | Expr::TypedConstruct { hint, .. }
+            | Expr::New { hint, .. } => hint.get(),
+        }
+    }
+
+    /// Sema's writer side: stamp a register-class hint onto this
+    /// expression in place. Cell gives interior mutability so sema
+    /// can take `&Expr` rather than `&mut Expr`, which keeps
+    /// traversal shapes simple.
+    pub fn set_hint(&self, h: TypeHint) {
+        match self {
+            Expr::Ident { hint, .. }
+            | Expr::IntLit { hint, .. }
+            | Expr::FloatLit { hint, .. }
+            | Expr::CharLit { hint, .. }
+            | Expr::StringLit { hint, .. }
+            | Expr::BoolLit { hint, .. }
+            | Expr::Null { hint, .. }
+            | Expr::Call { hint, .. }
+            | Expr::Unary { hint, .. }
+            | Expr::Binary { hint, .. }
+            | Expr::Conditional { hint, .. }
+            | Expr::Valof { hint, .. }
+            | Expr::TypedConstruct { hint, .. }
+            | Expr::New { hint, .. } => hint.set(h),
+        }
+    }
+}
+
+/// Convenience constructor: a fresh `Cell<TypeHint>` initialised to
+/// `Unknown`. Used by every parser construction site so sema has an
+/// existing slot to fill.
+pub fn unknown_hint() -> Cell<TypeHint> {
+    Cell::new(TypeHint::Unknown)
 }
 
 impl Stmt {
