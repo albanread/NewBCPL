@@ -1,0 +1,28 @@
+[package]
+name = "newbcpl-tests"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+newbcpl-lexer = { path = "../../src/newbcpl-lexer" }
+newbcpl-parser = { path = "../../src/newbcpl-parser" }
+
+[[test]]
+name = "lexer_smoke"
+path = "tests/lexer_smoke.rs"
+
+[[test]]
+name = "lexer_corpus"
+path = "tests/lexer_corpus.rs"
+
+[[test]]
+name = "parser_smoke"
+path = "tests/parser_smoke.rs"
+
+[[test]]
+name = "parser_corpus"
+path = "tests/parser_corpus.rs"

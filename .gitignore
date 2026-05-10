@@ -1,0 +1,19 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# Per-user Claude Code session settings
+.claude/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Old compiler reference (cloned via git, regenerable)
+/reference

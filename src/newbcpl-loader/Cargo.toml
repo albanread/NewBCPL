@@ -1,0 +1,9 @@
+[package]
+name = "newbcpl-loader"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+newbcpl-ir = { path = "../newbcpl-ir" }
+newbcpl-llvm = { path = "../newbcpl-llvm" }
+newbcpl-runtime = { path = "../newbcpl-runtime" }

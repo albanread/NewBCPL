@@ -1,0 +1,17 @@
+[package]
+name = "newbcpl-driver"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "newbcpl-driver"
+path = "src/main.rs"
+
+[dependencies]
+newbcpl-ir = { path = "../newbcpl-ir" }
+newbcpl-lexer = { path = "../newbcpl-lexer" }
+newbcpl-llvm = { path = "../newbcpl-llvm" }
+newbcpl-loader = { path = "../newbcpl-loader" }
+newbcpl-parser = { path = "../newbcpl-parser" }
+newbcpl-runtime = { path = "../newbcpl-runtime" }
+newbcpl-sema = { path = "../newbcpl-sema" }

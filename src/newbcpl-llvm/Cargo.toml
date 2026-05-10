@@ -1,0 +1,15 @@
+[package]
+name = "newbcpl-llvm"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+newbcpl-ir = { path = "../newbcpl-ir" }
+newbcpl-runtime = { path = "../newbcpl-runtime" }
+# Match NewCP's pin: Inkwell 0.9 against LLVM 22.
+# Disabled by default — wire in with the `llvm` feature once codegen lands.
+inkwell = { version = "=0.9.0", default-features = false, features = ["llvm22-1", "target-x86"], optional = true }
+
+[features]
+default = []
+llvm = ["dep:inkwell"]
