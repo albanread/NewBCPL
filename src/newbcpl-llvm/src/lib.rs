@@ -422,9 +422,12 @@ mod tests {
         let text = emit_text(
             "CLASS Point $( DECL x, y $)\nLET S() BE { LET p = NEW Point }",
         );
-        // Stack-alloca placeholder: [size x i8] for the instance.
-        // Class Point has size 24 (vtable header + 2 word fields).
-        assert!(text.contains("alloca [24 x i8]"));
+        // `NEW Class` now allocates on the GC heap via
+        // `__newbcpl_new_rec(@Class.desc)`. The desc global holds
+        // the TypeDesc constant; the runtime stamps the
+        // BlockHeader and returns the data pointer.
+        assert!(text.contains("@Point.desc"));
+        assert!(text.contains("call ptr @__newbcpl_new_rec"));
     }
 
     #[test]

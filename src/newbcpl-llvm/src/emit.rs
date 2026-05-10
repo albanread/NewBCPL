@@ -101,6 +101,7 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
         // here because we put the vtable pointer inline at the
         // first word of every instance.
         self.declare_vtable_globals(&ir.layouts);
+        self.declare_typedesc_globals(&ir.layouts);
         // Pass 3: emit each body. Per-function maps reset between
         // functions since ValueIds and BlockIds are function-local.
         for f in &ir.functions {
@@ -126,6 +127,81 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
                 .module
                 .add_global(vtable_ty, None, &global_name);
             g.set_initializer(&vtable_ty.const_zero());
+            g.set_constant(false);
+            g.set_linkage(Linkage::External);
+        }
+    }
+
+    /// Emit `@{Class}.desc` constant globals — one `TypeDesc` per
+    /// class, matching the `#[repr(C)]` layout in
+    /// `newbcpl_runtime::gc::TypeDesc` exactly. The GC tags every
+    /// heap block's `BlockHeader.tag` with the TypeDesc address;
+    /// the size field is read on each allocation. The vtable
+    /// pointer is included for forward compatibility with the
+    /// NewCP-style `obj → header → desc → desc.vtable[slot]`
+    /// dispatch path; today we still keep an inline vtable header
+    /// at offset 0 of the instance, so MethodCall reads it
+    /// directly without touching the TypeDesc.
+    ///
+    /// Layout (must mirror gc::TypeDesc):
+    /// `{ i64 size, ptr module, ptr finalizer, ptr base, ptr vtable,
+    ///    i64 vtable_len, ptr name, [1 x i64] ptroffs }`
+    /// — 7 fixed fields then a sentinel-terminated `ptroffs` array.
+    /// We emit `[1 x i64] = [-1]` so the GC's pointer-offset
+    /// iterator stops immediately (no pointer fields tracked yet).
+    fn declare_typedesc_globals(&mut self, layouts: &[ClassLayout]) {
+        let i64_t = self.context.i64_type();
+        let ptr_t = self.context.ptr_type(AddressSpace::default());
+        let ptroffs_arr_ty = i64_t.array_type(1);
+        let typedesc_ty = self.context.struct_type(
+            &[
+                i64_t.into(),         // 0: size
+                ptr_t.into(),         // 1: module
+                ptr_t.into(),         // 2: finalizer
+                ptr_t.into(),         // 3: base
+                ptr_t.into(),         // 4: vtable
+                i64_t.into(),         // 5: vtable_len
+                ptr_t.into(),         // 6: name
+                ptroffs_arr_ty.into(),// 7: ptroffs[1] sentinel
+            ],
+            false,
+        );
+        for layout in layouts {
+            let (vtable_ptr, vtable_len) = if layout.vtable.is_empty() {
+                (ptr_t.const_null(), 0u64)
+            } else {
+                let vg = self
+                    .module
+                    .get_global(&format!("{}.vtable", layout.class_name))
+                    .expect("vtable global declared above")
+                    .as_pointer_value();
+                (vg, layout.vtable.len() as u64)
+            };
+            // Sentinel -1: tells the GC "no pointer fields".
+            // Pointer-tracking ports later by emitting the real
+            // offsets from `layout.ptroffs` followed by -1.
+            let sentinel = i64_t.const_int(u64::MAX, true);
+            let ptroffs_init = i64_t.const_array(&[sentinel]);
+            let init = typedesc_ty.const_named_struct(&[
+                i64_t.const_int(layout.instance_size as u64, true).into(),
+                ptr_t.const_null().into(),
+                ptr_t.const_null().into(),
+                ptr_t.const_null().into(),
+                vtable_ptr.into(),
+                i64_t.const_int(vtable_len, false).into(),
+                ptr_t.const_null().into(),
+                ptroffs_init.into(),
+            ]);
+            let g = self.module.add_global(
+                typedesc_ty,
+                None,
+                &format!("{}.desc", layout.class_name),
+            );
+            g.set_initializer(&init);
+            // Non-constant + external linkage so MCJIT can hand
+            // out a stable runtime address (the `__newbcpl_new_rec`
+            // call site loads this address and the GC stores it
+            // in every BlockHeader it allocates).
             g.set_constant(false);
             g.set_linkage(Linkage::External);
         }
@@ -502,51 +578,93 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
         }
     }
 
-    /// `NEW Class(args)` lowers to a stack-allocated instance whose
-    /// first word holds the `@Class.vtable` global address (so a
-    /// virtual call can read it back), followed by the field
-    /// payload sema laid out at offsets `+8` onwards. After
-    /// installing the header we call `Class_CREATE(obj, args...)`
-    /// when the class declares a CREATE; otherwise the user gets a
-    /// zeroed instance with the vtable header in place.
+    /// `NEW Class(args)` allocates an instance on the GC heap via
+    /// `__newbcpl_new_rec(@Class.desc)`. The runtime stamps the
+    /// `BlockHeader.tag` (at `obj - 16`) with the TypeDesc address
+    /// so the collector can find the layout / size / pointer
+    /// offsets on a sweep. The first word of the data area still
+    /// holds an inline vtable pointer (we keep the cheap
+    /// `obj → vtable → slot` MethodCall path); fields follow at
+    /// `+8`, `+16`, … as sema laid them out. Finally we call the
+    /// mangled `Class_CREATE` to run the constructor — direct
+    /// dispatch because the static class is known here.
     ///
-    /// Stack allocation is fine for now — the object lives no
-    /// longer than the surrounding stack frame. Heap allocation
-    /// (with GC root tracking) lands together with the
-    /// `__newbcpl_new_rec` integration.
+    /// On the first allocation per TypeDesc the GC auto-registers
+    /// it (see `__newbcpl_new_rec` in `gc.rs`), so we don't need
+    /// an explicit init pass.
     fn emit_new(&mut self, class_name: &str, args: &[Value]) -> BasicValueEnum<'ctx> {
-        let size = self
-            .lookup_layout(class_name)
-            .map(|l| l.instance_size)
-            .unwrap_or(8);
-        let i8_t = self.context.i8_type();
-        let arr_t = i8_t.array_type(size as u32);
-        let alloca = self
-            .builder
-            .build_alloca(arr_t, &format!("obj.{class_name}"))
-            .expect("alloca obj");
-        self.zero_memory(alloca, size);
+        let i64_t = self.context.i64_type();
+        let ptr_t = self.context.ptr_type(AddressSpace::default());
+        let layout = self.lookup_layout(class_name);
+        let size = layout.map(|l| l.instance_size).unwrap_or(8);
 
-        // Install the vtable pointer at offset 0 of the instance.
-        // The vtable global was declared earlier in `emit_module`;
-        // we look it up by name and store its address there. The
-        // store is the same for every instance of the class.
+        // Resolve the TypeDesc global for this class. If the
+        // class has no methods (and thus no vtable / desc), fall
+        // back to the stack-alloca path so simple data-only
+        // classes keep working.
+        let desc_global = self
+            .module
+            .get_global(&format!("{class_name}.desc"));
+        let obj_ptr: PointerValue<'ctx> = match desc_global {
+            Some(desc) => {
+                let new_rec_fn = match self.by_name.get("__newbcpl_new_rec") {
+                    Some(&f) => f,
+                    None => {
+                        // Specific signature: `ptr fn(ptr)`.
+                        let fn_ty = ptr_t.fn_type(&[ptr_t.into()], false);
+                        let fv = self.module.add_function(
+                            "__newbcpl_new_rec",
+                            fn_ty,
+                            Some(Linkage::External),
+                        );
+                        self.by_name.insert("__newbcpl_new_rec".to_string(), fv);
+                        fv
+                    }
+                };
+                let call_site = self
+                    .builder
+                    .build_call(
+                        new_rec_fn,
+                        &[desc.as_pointer_value().into()],
+                        &format!("new.{class_name}"),
+                    )
+                    .expect("call __newbcpl_new_rec");
+                use inkwell::values::ValueKind;
+                match call_site.try_as_basic_value() {
+                    ValueKind::Basic(rv) => self.as_pointer(rv),
+                    ValueKind::Instruction(_) => panic!(
+                        "__newbcpl_new_rec must return a pointer"
+                    ),
+                }
+            }
+            None => {
+                let i8_t = self.context.i8_type();
+                let arr_t = i8_t.array_type(size as u32);
+                let alloca = self
+                    .builder
+                    .build_alloca(arr_t, &format!("obj.{class_name}"))
+                    .expect("alloca obj");
+                self.zero_memory(alloca, size);
+                alloca
+            }
+        };
+
+        // Install the inline vtable pointer at offset 0 of the
+        // instance. The GC already zeroes the block, so other
+        // fields start as zero — matches sema's documented "zeroed
+        // instance" contract.
         let vtable_global_name = format!("{class_name}.vtable");
         if let Some(vtable_global) = self.module.get_global(&vtable_global_name) {
             let _ = self
                 .builder
-                .build_store(alloca, vtable_global.as_pointer_value())
+                .build_store(obj_ptr, vtable_global.as_pointer_value())
                 .expect("store vtable header");
         }
 
-        // Call CREATE through its mangled name when the class
-        // declares one. We dispatch directly (no vtable lookup)
-        // because at the construction site we know the static
-        // class — virtual dispatch is unnecessary here, and CREATE
-        // would otherwise need the vtable already installed before
-        // its own call site, which we just did.
-        let has_create = self
-            .lookup_layout(class_name)
+        let _ = i64_t; // silence unused if no other use below
+
+        // Call the mangled CREATE if declared.
+        let has_create = layout
             .and_then(|l| {
                 l.vtable
                     .iter()
@@ -561,7 +679,7 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
             };
             let mut call_args: Vec<BasicMetadataValueEnum> =
                 Vec::with_capacity(args.len() + 1);
-            call_args.push(alloca.into());
+            call_args.push(obj_ptr.into());
             for a in args {
                 call_args.push(self.lower_value(a).into());
             }
@@ -569,7 +687,7 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
                 .build_call(create_fn, &call_args, "create")
                 .expect("call CREATE");
         }
-        alloca.into()
+        obj_ptr.into()
     }
 
     /// Lower `Instr::MethodCall` to an indirect call through the
