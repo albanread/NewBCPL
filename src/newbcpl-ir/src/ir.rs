@@ -121,6 +121,42 @@ pub enum Instr {
         args: Vec<Value>,
         hint: TypeHint,
     },
+    /// `NEW Class(args)` — heap-allocate a new instance of `class`
+    /// (codegen calls the GC allocator with the class's TypeDesc),
+    /// then invoke `CREATE` on the new object with `args`. Result
+    /// is the instance pointer.
+    New {
+        dst: ValueId,
+        class_name: String,
+        args: Vec<Value>,
+    },
+    /// Load a field from a class instance. `byte_offset` comes from
+    /// the class layout; codegen emits a GEP + load.
+    FieldLoad {
+        dst: ValueId,
+        base: Value,
+        byte_offset: usize,
+        hint: TypeHint,
+    },
+    /// Store a value into a class instance field.
+    FieldStore {
+        base: Value,
+        byte_offset: usize,
+        value: Value,
+    },
+    /// `obj.method(args)` — virtual method dispatch. The receiver's
+    /// class layout assigns each method a stable `vtable_slot`.
+    /// Codegen loads the vtable from the instance, indexes by slot,
+    /// loads the method pointer, and emits an indirect call (with
+    /// the receiver as the implicit first argument).
+    MethodCall {
+        dst: Option<ValueId>,
+        receiver: Value,
+        vtable_slot: usize,
+        method_name: String,
+        args: Vec<Value>,
+        hint: TypeHint,
+    },
 }
 
 #[derive(Debug, Clone)]

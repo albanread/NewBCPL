@@ -394,6 +394,120 @@ mod tests {
         assert_eq!(cb, 1);
     }
 
+    // ─── classes: NEW / field access / method dispatch ──────────
+
+    #[test]
+    fn new_lowers_to_new_instruction() {
+        let m = lower_source(
+            "CLASS Point $( DECL x, y $)\nLET S() BE { LET p = NEW Point }",
+        );
+        let s = function(&m, "S");
+        let entry = &s.blocks[0];
+        let has_new = entry.instrs.iter().any(|i| matches!(
+            i,
+            Instr::New { class_name, .. } if class_name == "Point"
+        ));
+        assert!(has_new, "expected New instruction");
+    }
+
+    #[test]
+    fn field_load_uses_layout_offset() {
+        let m = lower_source(
+            "CLASS Point $( DECL x, y $)\nLET S() BE { LET p = NEW Point\n LET q = p.y }",
+        );
+        let s = function(&m, "S");
+        let entry = &s.blocks[0];
+        // y is the second field — offset 8 (vtable header) + 8 (x) = 16.
+        let has_field_load = entry.instrs.iter().any(|i| matches!(
+            i,
+            Instr::FieldLoad { byte_offset: 16, .. }
+        ));
+        assert!(has_field_load, "expected FieldLoad with byte_offset=16");
+    }
+
+    #[test]
+    fn field_load_first_field_offset_8() {
+        let m = lower_source(
+            "CLASS Point $( DECL x, y $)\nLET S() BE { LET p = NEW Point\n LET q = p.x }",
+        );
+        let s = function(&m, "S");
+        let entry = &s.blocks[0];
+        let has_field_load = entry.instrs.iter().any(|i| matches!(
+            i,
+            Instr::FieldLoad { byte_offset: 8, .. }
+        ));
+        assert!(has_field_load, "expected FieldLoad at offset 8");
+    }
+
+    #[test]
+    fn field_store_emits_field_store_instruction() {
+        let m = lower_source(
+            "CLASS Point $( DECL x, y $)\nLET S() BE { LET p = NEW Point\n p.y := 99 }",
+        );
+        let s = function(&m, "S");
+        let entry = &s.blocks[0];
+        let has_field_store = entry.instrs.iter().any(|i| matches!(
+            i,
+            Instr::FieldStore {
+                byte_offset: 16,
+                value: Value::Const(Const::Int(99)),
+                ..
+            }
+        ));
+        assert!(has_field_store, "expected FieldStore at +16 storing 99");
+    }
+
+    #[test]
+    fn method_call_resolves_vtable_slot() {
+        let m = lower_source(
+            "CLASS Point $(\n  DECL x\n  FUNCTION getX() = x\n$)\nLET S() BE { LET p = NEW Point\n LET v = p.getX() }",
+        );
+        let s = function(&m, "S");
+        // CREATE = slot 0, RELEASE = slot 1, getX = slot 2.
+        let has_vcall = s.blocks.iter().any(|b| {
+            b.instrs.iter().any(|i| {
+                matches!(
+                    i,
+                    Instr::MethodCall {
+                        method_name,
+                        vtable_slot: 2,
+                        ..
+                    } if method_name == "getX"
+                )
+            })
+        });
+        assert!(has_vcall, "expected MethodCall with vtable_slot=2");
+    }
+
+    #[test]
+    fn method_call_routine_shape_has_no_dst() {
+        let m = lower_source(
+            "CLASS Point $(\n  DECL x\n  ROUTINE move() BE $( $)\n$)\nLET S() BE { LET p = NEW Point\n p.move() }",
+        );
+        let s = function(&m, "S");
+        let entry = &s.blocks[0];
+        let routine_call = entry.instrs.iter().any(|i| matches!(
+            i,
+            Instr::MethodCall { dst: None, method_name, .. } if method_name == "move"
+        ));
+        assert!(routine_call, "expected void MethodCall for move()");
+    }
+
+    #[test]
+    fn class_name_propagates_through_let_alias() {
+        // LET q = p (where p is OBJECT[Point]) should make q.field
+        // work too. This relies on `class_name_of_expr` looking up
+        // local class names.
+        let m = lower_source(
+            "CLASS Point $( DECL x $)\nLET S() BE { LET p = NEW Point\n LET q = p\n LET v = q.x }",
+        );
+        let s = function(&m, "S");
+        let has_field_load = s.blocks.iter().any(|b| {
+            b.instrs.iter().any(|i| matches!(i, Instr::FieldLoad { .. }))
+        });
+        assert!(has_field_load, "expected FieldLoad after LET alias");
+    }
+
     #[test]
     fn dump_smoke() {
         let m = lower_source("LET S() BE { LET y = 1 + 2 }");

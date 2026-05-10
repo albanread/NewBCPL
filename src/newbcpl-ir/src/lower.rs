@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use newbcpl_parser::{
     BinaryOp, Block, Decl, Expr, FunctionDecl, LetDecl, Program, RoutineDecl, Stmt, UnaryOp,
 };
-use newbcpl_sema::{SemaOutput, TypeHint};
+use newbcpl_sema::{ClassLayout, SemaOutput, TypeHint};
 
 use crate::ir::*;
 
@@ -25,7 +25,7 @@ use crate::ir::*;
 /// caller must have run `newbcpl_sema::analyze(&program)` first so
 /// expressions carry their hints.
 pub fn lower(program: &Program, sema: &SemaOutput, module_name: &str) -> Module {
-    let mut lowerer = Lowerer::new();
+    let mut lowerer = Lowerer::new(&sema.layouts);
     for decl in &program.items {
         match decl {
             Decl::Routine(r) => lowerer.lower_routine(r),
@@ -43,10 +43,10 @@ pub fn lower(program: &Program, sema: &SemaOutput, module_name: &str) -> Module 
     }
 }
 
-#[derive(Default)]
-struct Lowerer {
+struct Lowerer<'a> {
     functions: Vec<Function>,
     current: Option<Builder>,
+    layouts: &'a [ClassLayout],
 }
 
 /// Per-function state during lowering.
@@ -57,13 +57,25 @@ struct Builder {
     /// Block currently receiving instructions. When we terminate it
     /// and switch to a new one, this updates.
     current_block: BlockId,
-    /// Lexical scope stack: name → slot ValueId.
-    scopes: Vec<HashMap<String, ValueId>>,
+    /// Lexical scope stack: name → (slot, optional class name).
+    /// The class name lets `obj.field` and `obj.method(...)` resolve
+    /// through the layout / vtable tables.
+    scopes: Vec<HashMap<String, LocalInfo>>,
     /// Stack of currently-active control-flow frames so `BREAK` /
     /// `LOOP` know which loop to target. Every loop pushes one frame
     /// on entry and pops on exit; the innermost frame is the BREAK
     /// / LOOP target.
     loops: Vec<LoopFrame>,
+}
+
+#[derive(Debug, Clone)]
+struct LocalInfo {
+    slot: ValueId,
+    /// Class name if this binding holds an OBJECT instance, so
+    /// member access can route through the class layout. Set when
+    /// the LET initialiser is `NEW Foo()` or another Ident whose
+    /// own class is known.
+    class_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -168,19 +180,27 @@ impl Builder {
         }
     }
 
-    fn declare_local(&mut self, name: &str, slot: ValueId) {
+    fn declare_local(&mut self, name: &str, slot: ValueId, class_name: Option<String>) {
         if let Some(top) = self.scopes.last_mut() {
-            top.insert(name.to_string(), slot);
+            top.insert(name.to_string(), LocalInfo { slot, class_name });
         }
     }
 
-    fn lookup_local(&self, name: &str) -> Option<ValueId> {
+    fn lookup_local(&self, name: &str) -> Option<&LocalInfo> {
         for frame in self.scopes.iter().rev() {
-            if let Some(&slot) = frame.get(name) {
-                return Some(slot);
+            if let Some(info) = frame.get(name) {
+                return Some(info);
             }
         }
         None
+    }
+
+    fn lookup_local_slot(&self, name: &str) -> Option<ValueId> {
+        self.lookup_local(name).map(|i| i.slot)
+    }
+
+    fn lookup_local_class(&self, name: &str) -> Option<String> {
+        self.lookup_local(name).and_then(|i| i.class_name.clone())
     }
 
     fn alloca(&mut self, name: &str, hint: TypeHint) -> ValueId {
@@ -194,9 +214,13 @@ impl Builder {
     }
 }
 
-impl Lowerer {
-    fn new() -> Self {
-        Self::default()
+impl<'a> Lowerer<'a> {
+    fn new(layouts: &'a [ClassLayout]) -> Self {
+        Self {
+            functions: Vec::new(),
+            current: None,
+            layouts,
+        }
     }
 
     fn b(&mut self) -> &mut Builder {
@@ -236,7 +260,7 @@ impl Lowerer {
                 slot,
                 value: Value::Local(in_value),
             });
-            b.declare_local(p, slot);
+            b.declare_local(p, slot, None);
             b.function.params.push(Param {
                 name: p.clone(),
                 hint: TypeHint::Word,
@@ -462,7 +486,7 @@ impl Lowerer {
             value: start_v,
         });
         self.b().push_scope();
-        self.b().declare_local(name, i_slot);
+        self.b().declare_local(name, i_slot, None);
 
         let header = self.b().alloc_block("for.header");
         let body_block = self.b().alloc_block("for.body");
@@ -543,25 +567,92 @@ impl Lowerer {
 
     fn lower_let_stmt(&mut self, l: &LetDecl) {
         for (name, init) in &l.bindings {
+            // Capture the class name (if any) before lowering, so
+            // the LET binding can record it. Lowering a `NEW Foo()`
+            // produces a fresh ValueId but doesn't return the class
+            // name; we read it from the AST shape.
+            let class_name = self.class_name_of_expr(init);
             let value = self.lower_expr(init);
             let slot = self.b().alloca(name, init.hint());
             self.b().emit(Instr::Store { slot, value });
-            self.b().declare_local(name, slot);
+            self.b().declare_local(name, slot, class_name);
         }
     }
 
     fn lower_assign(&mut self, targets: &[Expr], values: &[Expr]) {
         for (target, value) in targets.iter().zip(values.iter()) {
             let v = self.lower_expr(value);
-            // Only simple-name lvalues are lowered here; subscripts,
-            // member access, and indirection fall through (sema has
-            // already type-checked them, codegen handles them later).
-            if let Expr::Ident { name, .. } = target {
-                if let Some(slot) = self.b().lookup_local(name) {
-                    self.b().emit(Instr::Store { slot, value: v });
+            match target {
+                Expr::Ident { name, .. } => {
+                    if let Some(slot) = self.b().lookup_local_slot(name) {
+                        self.b().emit(Instr::Store { slot, value: v });
+                    }
+                }
+                Expr::Binary {
+                    op: newbcpl_parser::BinaryOp::Dot,
+                    lhs,
+                    rhs,
+                    ..
+                } => {
+                    // `obj.field := value` — resolve field offset
+                    // from the receiver's class layout.
+                    if let (Some(class_name), Expr::Ident { name: field, .. }) =
+                        (self.class_name_of_expr(lhs), rhs.as_ref())
+                    {
+                        let base = self.lower_expr(lhs);
+                        if let Some(offset) = self.lookup_field_offset(&class_name, field)
+                        {
+                            self.b().emit(Instr::FieldStore {
+                                base,
+                                byte_offset: offset,
+                                value: v,
+                            });
+                        }
+                    }
+                }
+                _ => {
+                    // Subscript / indirection lvalues fall through.
                 }
             }
         }
+    }
+
+    /// Best-effort: return the class name an AST expression
+    /// evaluates to, when lowering knows. Used by LET-binding
+    /// recording and member access resolution.
+    fn class_name_of_expr(&self, expr: &Expr) -> Option<String> {
+        match expr {
+            Expr::New { class_name, .. } => Some(class_name.clone()),
+            Expr::Ident { name, .. } => self
+                .current
+                .as_ref()
+                .and_then(|b| b.lookup_local_class(name)),
+            // SELF / SUPER inside a method body would resolve via the
+            // surrounding class scope; we don't yet track that.
+            _ => None,
+        }
+    }
+
+    /// Look up a field's byte offset by class name + field name.
+    /// Walks the layout's `fields` list (already inheritance-flat
+    /// from sema's compute_layouts).
+    fn lookup_field_offset(&self, class_name: &str, field: &str) -> Option<usize> {
+        let layout = self.layouts.iter().find(|l| l.class_name == class_name)?;
+        layout
+            .fields
+            .iter()
+            .find(|f| f.name == field)
+            .map(|f| f.offset)
+    }
+
+    /// Look up a method's vtable slot by class name + method name.
+    fn lookup_method_slot(&self, class_name: &str, method: &str) -> Option<usize> {
+        let layout = self.layouts.iter().find(|l| l.class_name == class_name)?;
+        layout
+            .vtable
+            .iter()
+            .find(|v| v.method_name == method)
+            .map(|v| v.slot)
     }
 
     fn lower_if(&mut self, cond: &Expr, then_stmt: &Stmt, else_stmt: Option<&Stmt>) {
@@ -644,6 +735,9 @@ impl Lowerer {
                 else_expr,
                 ..
             } => self.lower_conditional(cond, then_expr, else_expr, e.hint()),
+            Expr::New {
+                class_name, args, ..
+            } => self.lower_new(class_name, args),
             // Forms not yet lowered — return a typed null/zero so
             // downstream uses don't crash. Sema warnings already
             // fired for whatever real handling these need.
@@ -651,8 +745,19 @@ impl Lowerer {
         }
     }
 
+    fn lower_new(&mut self, class_name: &str, args: &[Expr]) -> Value {
+        let arg_values: Vec<Value> = args.iter().map(|a| self.lower_expr(a)).collect();
+        let dst = self.b().alloc_value();
+        self.b().emit(Instr::New {
+            dst,
+            class_name: class_name.to_string(),
+            args: arg_values,
+        });
+        Value::Local(dst)
+    }
+
     fn lower_ident(&mut self, name: &str, hint: TypeHint) -> Value {
-        if let Some(slot) = self.b().lookup_local(name) {
+        if let Some(slot) = self.b().lookup_local_slot(name) {
             let dst = self.b().alloc_value();
             self.b().emit(Instr::Load { dst, slot, hint });
             Value::Local(dst)
@@ -664,13 +769,34 @@ impl Lowerer {
     }
 
     fn lower_binary(&mut self, op: BinaryOp, lhs: &Expr, rhs: &Expr, hint: TypeHint) -> Value {
+        // Member access (`obj.field`) lowers through the class
+        // layout, not the generic binary-op path. RHS is an Ident.
+        if matches!(op, BinaryOp::Dot | BinaryOp::Of) {
+            if let (Some(class_name), Expr::Ident { name: field, .. }) =
+                (self.class_name_of_expr(lhs), rhs)
+            {
+                let base = self.lower_expr(lhs);
+                if let Some(offset) = self.lookup_field_offset(&class_name, field) {
+                    let dst = self.b().alloc_value();
+                    self.b().emit(Instr::FieldLoad {
+                        dst,
+                        base,
+                        byte_offset: offset,
+                        hint,
+                    });
+                    return Value::Local(dst);
+                }
+            }
+            // Class unknown or field missing — fall through to null.
+            return Value::Const(Const::Null);
+        }
+
         let lhs_v = self.lower_expr(lhs);
         let rhs_v = self.lower_expr(rhs);
         let lhs_h = lhs.hint();
         let rhs_h = rhs.hint();
         let Some(ir_op) = binop_to_ir(op, lhs_h, rhs_h) else {
-            // Subscript family, member access, lane access etc. are
-            // not yet IR-lowered; fall through to a placeholder.
+            // Subscript family, lane access — not yet IR-lowered.
             return Value::Const(Const::Null);
         };
         let dst = self.b().alloc_value();
@@ -700,6 +826,45 @@ impl Lowerer {
     }
 
     fn lower_call(&mut self, callee: &Expr, args: &[Expr], hint: TypeHint) -> Value {
+        // Method dispatch: callee is `obj.methodName`. When sema /
+        // class lookup tells us the receiver's class and that class
+        // has the named method in its vtable, lower as a MethodCall
+        // — codegen emits the vtable load + indirect call.
+        if let Expr::Binary {
+            op: BinaryOp::Dot,
+            lhs,
+            rhs,
+            ..
+        } = callee
+        {
+            if let (Some(class_name), Expr::Ident { name: method, .. }) =
+                (self.class_name_of_expr(lhs), rhs.as_ref())
+            {
+                if let Some(slot) = self.lookup_method_slot(&class_name, method) {
+                    let receiver = self.lower_expr(lhs);
+                    let arg_values: Vec<Value> =
+                        args.iter().map(|a| self.lower_expr(a)).collect();
+                    let dst = if hint == TypeHint::Word {
+                        None
+                    } else {
+                        Some(self.b().alloc_value())
+                    };
+                    self.b().emit(Instr::MethodCall {
+                        dst,
+                        receiver,
+                        vtable_slot: slot,
+                        method_name: method.clone(),
+                        args: arg_values,
+                        hint,
+                    });
+                    return match dst {
+                        Some(d) => Value::Local(d),
+                        None => Value::Unit,
+                    };
+                }
+            }
+        }
+
         let callee_v = self.lower_expr(callee);
         let arg_values: Vec<Value> = args.iter().map(|a| self.lower_expr(a)).collect();
         let dst = if hint == TypeHint::Word {

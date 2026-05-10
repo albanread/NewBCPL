@@ -123,6 +123,72 @@ fn render_instr(i: &Instr) -> String {
                 None => format!("call {}({})", render_value(callee), args_str),
             }
         }
+        Instr::New {
+            dst,
+            class_name,
+            args,
+        } => {
+            let args_str = args
+                .iter()
+                .map(render_value)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("%{} = new {}({})", dst.0, class_name, args_str)
+        }
+        Instr::FieldLoad {
+            dst,
+            base,
+            byte_offset,
+            hint,
+        } => format!(
+            "%{} = field.load {}, +{} : {}",
+            dst.0,
+            render_value(base),
+            byte_offset,
+            hint.as_str()
+        ),
+        Instr::FieldStore {
+            base,
+            byte_offset,
+            value,
+        } => format!(
+            "field.store {}, +{}, {}",
+            render_value(base),
+            byte_offset,
+            render_value(value)
+        ),
+        Instr::MethodCall {
+            dst,
+            receiver,
+            vtable_slot,
+            method_name,
+            args,
+            hint,
+        } => {
+            let args_str = args
+                .iter()
+                .map(render_value)
+                .collect::<Vec<_>>()
+                .join(", ");
+            match dst {
+                Some(d) => format!(
+                    "%{} = vcall {}.{}@slot{}({}) : {}",
+                    d.0,
+                    render_value(receiver),
+                    method_name,
+                    vtable_slot,
+                    args_str,
+                    hint.as_str()
+                ),
+                None => format!(
+                    "vcall {}.{}@slot{}({})",
+                    render_value(receiver),
+                    method_name,
+                    vtable_slot,
+                    args_str
+                ),
+            }
+        }
     }
 }
 
