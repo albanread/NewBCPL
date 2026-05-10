@@ -64,11 +64,20 @@ pub fn parse_source(source: &str) -> Result<Program, ParseError> {
 pub(crate) struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    /// Nesting depth of `.|…|` lane-access brackets currently open.
+    /// While > 0 the binary-operator dispatcher refuses to consume `|`
+    /// (which would otherwise eat the closing delimiter as a logical
+    /// OR), so lane indices like `f.|i+1|` parse as expected.
+    lane_depth: u32,
 }
 
 impl Parser {
     fn new(tokens: Vec<Token>) -> Self {
-        Self { tokens, pos: 0 }
+        Self {
+            tokens,
+            pos: 0,
+            lane_depth: 0,
+        }
     }
 
     fn peek(&self) -> &Token {
@@ -158,6 +167,9 @@ impl Parser {
         if self.check_kw("GLOBAL") || self.check_kw("GLOBALS") {
             return self.parse_global_decl();
         }
+        if self.check_kw("CLASS") {
+            return self.parse_class_decl();
+        }
         let span = self.peek().span;
         let lex = self.peek().lexeme.clone();
         Err(ParseError::new(
@@ -241,6 +253,281 @@ impl Parser {
                 .unwrap_or(kw.span.end),
         };
         Ok(Decl::Global(NamedBindingsDecl { bindings, span }))
+    }
+
+    /// `CLASS Name [EXTENDS Base] [MANAGED] $( ... $)`. The MANAGED
+    /// keyword can appear before or after EXTENDS; we accept either.
+    fn parse_class_decl(&mut self) -> Result<Decl, ParseError> {
+        let kw = self.eat();
+        let name = self.eat_identifier()?.lexeme;
+        let mut extends = None;
+        let mut managed = false;
+        loop {
+            if self.check_kw("EXTENDS") && extends.is_none() {
+                self.eat();
+                extends = Some(self.eat_identifier()?.lexeme);
+                continue;
+            }
+            if self.check_kw("MANAGED") && !managed {
+                self.eat();
+                managed = true;
+                continue;
+            }
+            break;
+        }
+        if !self.check_sym("$(") && !self.check_sym("{") {
+            let span = self.peek().span;
+            let lex = self.peek().lexeme.clone();
+            return Err(ParseError::new(
+                format!("expected `$(` or `{{` after CLASS header, got `{lex}`"),
+                span,
+            ));
+        }
+        let open = self.eat();
+        let close_lex = if open.lexeme == "$(" { "$)" } else { "}" };
+
+        let mut current_visibility = Visibility::Public;
+        let mut members: Vec<ClassMember> = Vec::new();
+        let mut end_span = open.span.end;
+
+        loop {
+            while self.check_sym(";") {
+                self.eat();
+            }
+            if self.is_at_end() {
+                return Err(ParseError::new(
+                    format!("unterminated CLASS body — expected `{close_lex}`"),
+                    open.span,
+                ));
+            }
+            if self.check_sym(close_lex) {
+                end_span = self.eat().span.end;
+                break;
+            }
+
+            // Visibility section header: `PUBLIC:`, `PRIVATE:`, `PROTECTED:`.
+            if (self.check_kw("PUBLIC")
+                || self.check_kw("PRIVATE")
+                || self.check_kw("PROTECTED"))
+                && self.lookahead_is_colon()
+            {
+                let kw = self.eat();
+                self.expect_sym(":")?;
+                current_visibility = match kw.lexeme.as_str() {
+                    "PUBLIC" => Visibility::Public,
+                    "PRIVATE" => Visibility::Private,
+                    "PROTECTED" => Visibility::Protected,
+                    _ => unreachable!(),
+                };
+                continue;
+            }
+
+            members.push(self.parse_class_member(current_visibility)?);
+        }
+
+        Ok(Decl::Class(ClassDecl {
+            name,
+            extends,
+            managed,
+            members,
+            span: SourceSpan {
+                start: kw.span.start,
+                end: end_span,
+            },
+        }))
+    }
+
+    /// True if the next non-current token is a `:` symbol (used to
+    /// detect `PUBLIC:` style section headers without consuming the
+    /// keyword).
+    fn lookahead_is_colon(&self) -> bool {
+        let next_pos = (self.pos + 1).min(self.tokens.len() - 1);
+        let t = &self.tokens[next_pos];
+        t.kind == TokenKind::Symbol && t.lexeme == ":"
+    }
+
+    fn parse_class_member(
+        &mut self,
+        visibility: Visibility,
+    ) -> Result<ClassMember, ParseError> {
+        // VIRTUAL and FINAL prefix method declarations.
+        let mut is_virtual = false;
+        let mut is_final = false;
+        loop {
+            if self.check_kw("VIRTUAL") && !is_virtual {
+                self.eat();
+                is_virtual = true;
+                continue;
+            }
+            if self.check_kw("FINAL") && !is_final {
+                self.eat();
+                is_final = true;
+                continue;
+            }
+            break;
+        }
+
+        if self.check_kw("ROUTINE") || self.check_kw("FUNCTION") {
+            return self.parse_class_method(visibility, is_virtual, is_final);
+        }
+        // VIRTUAL / FINAL with no method keyword is a parse error.
+        if is_virtual || is_final {
+            let span = self.peek().span;
+            let lex = self.peek().lexeme.clone();
+            return Err(ParseError::new(
+                format!(
+                    "expected ROUTINE or FUNCTION after VIRTUAL/FINAL in class, got `{lex}`"
+                ),
+                span,
+            ));
+        }
+
+        if self.check_kw("DECL") {
+            return self.parse_class_field(visibility);
+        }
+        if self.check_kw("LET") {
+            let start = self.peek().span.start;
+            let Decl::Let(let_decl) = self.parse_let_decl()? else {
+                unreachable!("LET parses to Decl::Let");
+            };
+            let span = SourceSpan {
+                start,
+                end: let_decl.span.end,
+            };
+            return Ok(ClassMember {
+                visibility,
+                kind: ClassMemberKind::Let(let_decl),
+                span,
+            });
+        }
+        if self.check_kw("FLET") {
+            return self.parse_class_flet_member(visibility);
+        }
+
+        let span = self.peek().span;
+        let lex = self.peek().lexeme.clone();
+        Err(ParseError::new(
+            format!("expected class member (DECL / LET / FLET / ROUTINE / FUNCTION), got `{lex}`"),
+            span,
+        ))
+    }
+
+    fn parse_class_field(&mut self, visibility: Visibility) -> Result<ClassMember, ParseError> {
+        let kw = self.eat(); // DECL
+        let mut names = vec![self.eat_identifier()?.lexeme];
+        while self.check_sym(",") {
+            self.eat();
+            names.push(self.eat_identifier()?.lexeme);
+        }
+        // Use the last identifier's span as a pragmatic end.
+        let span = SourceSpan {
+            start: kw.span.start,
+            end: self.tokens[self.pos.saturating_sub(1)].span.end,
+        };
+        Ok(ClassMember {
+            visibility,
+            kind: ClassMemberKind::Fields(names),
+            span,
+        })
+    }
+
+    fn parse_class_flet_member(
+        &mut self,
+        visibility: Visibility,
+    ) -> Result<ClassMember, ParseError> {
+        let kw = self.eat(); // FLET
+        let name_tok = self.eat_identifier()?;
+        // Two shapes inside a class:
+        //   FLET x        — uninitialised member
+        //   FLET x = e    — initialised member
+        let value = if self.check_sym("=") {
+            self.eat();
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        let end = value
+            .as_ref()
+            .map(|v| v.span().end)
+            .unwrap_or(name_tok.span.end);
+        let binding = NamedBinding {
+            name: name_tok.lexeme,
+            value,
+            span: SourceSpan {
+                start: name_tok.span.start,
+                end,
+            },
+        };
+        Ok(ClassMember {
+            visibility,
+            kind: ClassMemberKind::FLet(binding),
+            span: SourceSpan {
+                start: kw.span.start,
+                end,
+            },
+        })
+    }
+
+    fn parse_class_method(
+        &mut self,
+        visibility: Visibility,
+        is_virtual: bool,
+        is_final: bool,
+    ) -> Result<ClassMember, ParseError> {
+        let kw = self.eat(); // ROUTINE or FUNCTION
+        let is_function = kw.lexeme == "FUNCTION";
+        let name = self.eat_identifier()?.lexeme;
+        self.expect_sym("(")?;
+        let mut params = Vec::new();
+        if !self.check_sym(")") {
+            params.push(self.eat_identifier()?.lexeme);
+            while self.check_sym(",") {
+                self.eat();
+                params.push(self.eat_identifier()?.lexeme);
+            }
+        }
+        self.expect_sym(")")?;
+
+        let body = if is_function {
+            // FUNCTION foo(p) = expr
+            self.expect_sym("=")?;
+            let body = self.parse_expr()?;
+            ClassMethodBody::Function(body)
+        } else {
+            // ROUTINE foo(p) BE stmt
+            if !self.check_kw("BE") {
+                let span = self.peek().span;
+                let lex = self.peek().lexeme.clone();
+                return Err(ParseError::new(
+                    format!("expected `BE` after ROUTINE parameters, got `{lex}`"),
+                    span,
+                ));
+            }
+            self.eat();
+            let body = self.parse_stmt()?;
+            ClassMethodBody::Routine(Box::new(body))
+        };
+
+        let end = match &body {
+            ClassMethodBody::Function(e) => e.span().end,
+            ClassMethodBody::Routine(s) => s.span().end,
+        };
+        let span = SourceSpan {
+            start: kw.span.start,
+            end,
+        };
+        Ok(ClassMember {
+            visibility,
+            kind: ClassMemberKind::Method(ClassMethod {
+                name,
+                params,
+                is_virtual,
+                is_final,
+                body,
+                span,
+            }),
+            span,
+        })
     }
 
     /// Parse a `$( … $)` or `{ … }` block of named bindings used by
@@ -1030,8 +1317,10 @@ impl Parser {
             (TokenKind::Symbol, "&") => Some((BinaryOp::BitAnd, 3)),
             (TokenKind::Keyword, "AND") => Some((BinaryOp::BitAnd, 3)),
             // Bitwise / logical OR + EQV / NEQV (precedence 2). `OR`
-            // is the word-form synonym for `|`.
-            (TokenKind::Symbol, "|") => Some((BinaryOp::BitOr, 2)),
+            // is the word-form synonym for `|`. Inside a `.|…|` lane
+            // bracket, the `|` is the closing delimiter, not an
+            // operator — see `lane_depth`.
+            (TokenKind::Symbol, "|") if self.lane_depth == 0 => Some((BinaryOp::BitOr, 2)),
             (TokenKind::Keyword, "OR") => Some((BinaryOp::BitOr, 2)),
             (TokenKind::Keyword, "EQV") => Some((BinaryOp::Eqv, 2)),
             (TokenKind::Keyword, "NEQV") => Some((BinaryOp::Neqv, 2)),
@@ -1196,9 +1485,30 @@ impl Parser {
                 continue;
             }
 
-            // Member access: `obj.field` — RHS must be an identifier.
+            // `obj.field` (member access) or `pair.|n|` (SIMD lane).
+            // The disambiguation is the token that follows the dot.
             if self.check_sym(".") {
                 self.eat();
+                if self.check_sym("|") {
+                    // SIMD lane access: `expr . | index | …`
+                    self.eat(); // opening |
+                    self.lane_depth += 1;
+                    let idx_result = self.parse_expr();
+                    self.lane_depth -= 1;
+                    let idx = idx_result?;
+                    let close = self.expect_sym("|")?;
+                    let span = SourceSpan {
+                        start: expr.span().start,
+                        end: close.span.end,
+                    };
+                    expr = Expr::Binary {
+                        op: BinaryOp::LaneAccess,
+                        lhs: Box::new(expr),
+                        rhs: Box::new(idx),
+                        span,
+                    };
+                    continue;
+                }
                 let field = self.eat_identifier()?;
                 let rhs = Expr::Ident {
                     name: field.lexeme,
@@ -1391,6 +1701,47 @@ impl Parser {
                 Ok(Expr::Ident {
                     name: tok.lexeme,
                     span: tok.span,
+                })
+            }
+            // SELF and SUPER — surface as identifier-shaped expressions
+            // so member access (`SELF.x`, `SUPER.method(...)`) parses
+            // through the existing postfix `.` handling. Sema gives
+            // them their object-receiver semantics.
+            TokenKind::Keyword if matches!(tok.lexeme.as_str(), "SELF" | "SUPER") => {
+                self.pos += 1;
+                Ok(Expr::Ident {
+                    name: tok.lexeme,
+                    span: tok.span,
+                })
+            }
+            // `NEW Class` or `NEW Class(args)` — heap object construction.
+            TokenKind::Keyword if tok.lexeme == "NEW" => {
+                self.pos += 1;
+                let class_tok = self.eat_identifier()?;
+                let mut args = Vec::new();
+                let mut end = class_tok.span.end;
+                if self.check_sym("(") {
+                    self.eat();
+                    if !self.check_sym(")") {
+                        args.push(self.parse_expr()?);
+                        while self.check_sym(",") {
+                            self.eat();
+                            if self.check_sym(")") {
+                                break;
+                            }
+                            args.push(self.parse_expr()?);
+                        }
+                    }
+                    let close = self.expect_sym(")")?;
+                    end = close.span.end;
+                }
+                Ok(Expr::New {
+                    class_name: class_tok.lexeme,
+                    args,
+                    span: SourceSpan {
+                        start: tok.span.start,
+                        end,
+                    },
                 })
             }
             TokenKind::Symbol if tok.lexeme == "?" => {

@@ -10,8 +10,9 @@ use std::fmt::Write;
 use std::path::Path;
 
 pub use ast::{
-    BinaryOp, Block, Decl, Expr, FunctionDecl, GetDirective, LetDecl, NamedBinding,
-    NamedBindingsDecl, Program, RoutineDecl, Span, Stmt, SwitchCase, TypeConstructorKind, UnaryOp,
+    BinaryOp, Block, ClassDecl, ClassMember, ClassMemberKind, ClassMethod, ClassMethodBody, Decl,
+    Expr, FunctionDecl, GetDirective, LetDecl, NamedBinding, NamedBindingsDecl, Program,
+    RoutineDecl, Span, Stmt, SwitchCase, TypeConstructorKind, UnaryOp, Visibility,
 };
 pub use parser::{ParseError, parse_source};
 
@@ -98,6 +99,77 @@ fn pretty_print_decl(decl: &Decl, level: usize, out: &mut String) {
             writeln!(out, "global ({} bindings)", g.bindings.len()).unwrap();
             for b in &g.bindings {
                 pretty_print_named_binding(b, level + 1, out);
+            }
+        }
+        Decl::Class(c) => {
+            write!(out, "class {}", c.name).unwrap();
+            if let Some(base) = &c.extends {
+                write!(out, " extends {base}").unwrap();
+            }
+            if c.managed {
+                write!(out, " MANAGED").unwrap();
+            }
+            writeln!(out, " ({} members)", c.members.len()).unwrap();
+            for m in &c.members {
+                pretty_print_class_member(m, level + 1, out);
+            }
+        }
+    }
+}
+
+fn pretty_print_class_member(m: &ClassMember, level: usize, out: &mut String) {
+    indent(level, out);
+    let vis = match m.visibility {
+        Visibility::Public => "public",
+        Visibility::Private => "private",
+        Visibility::Protected => "protected",
+    };
+    match &m.kind {
+        ClassMemberKind::Fields(names) => {
+            writeln!(out, "{vis} decl {}", names.join(", ")).unwrap();
+        }
+        ClassMemberKind::Let(let_decl) => {
+            writeln!(out, "{vis} let ({} bindings)", let_decl.bindings.len()).unwrap();
+            for (name, expr) in &let_decl.bindings {
+                indent(level + 1, out);
+                writeln!(out, "{name} =").unwrap();
+                pretty_print_expr(expr, level + 2, out);
+            }
+        }
+        ClassMemberKind::FLet(b) => match &b.value {
+            Some(value) => {
+                writeln!(out, "{vis} flet {} =", b.name).unwrap();
+                pretty_print_expr(value, level + 1, out);
+            }
+            None => {
+                writeln!(out, "{vis} flet {} (uninitialised)", b.name).unwrap();
+            }
+        },
+        ClassMemberKind::Method(m) => {
+            let kw = if matches!(m.body, ClassMethodBody::Function(_)) {
+                "function"
+            } else {
+                "routine"
+            };
+            let mut prefix = String::new();
+            if m.is_virtual {
+                prefix.push_str("virtual ");
+            }
+            if m.is_final {
+                prefix.push_str("final ");
+            }
+            writeln!(
+                out,
+                "{vis} {prefix}{kw} {} ({})",
+                m.name,
+                m.params.join(", ")
+            )
+            .unwrap();
+            indent(level + 1, out);
+            writeln!(out, "body:").unwrap();
+            match &m.body {
+                ClassMethodBody::Routine(s) => pretty_print_stmt(s, level + 2, out),
+                ClassMethodBody::Function(e) => pretty_print_expr(e, level + 2, out),
             }
         }
     }
@@ -394,6 +466,14 @@ fn pretty_print_expr(expr: &Expr, level: usize, out: &mut String) {
         }
         Expr::TypedConstruct { kind, args, .. } => {
             writeln!(out, "construct {} ({} args)", kind.as_str(), args.len()).unwrap();
+            for arg in args {
+                pretty_print_expr(arg, level + 1, out);
+            }
+        }
+        Expr::New {
+            class_name, args, ..
+        } => {
+            writeln!(out, "new {class_name} ({} args)", args.len()).unwrap();
             for arg in args {
                 pretty_print_expr(arg, level + 1, out);
             }
@@ -1469,6 +1549,185 @@ mod tests {
             panic!();
         };
         assert!(matches!(b.stmts[0], Stmt::For { .. }));
+    }
+
+    // ─── classes ────────────────────────────────────────────────
+
+    #[test]
+    fn parses_simple_class() {
+        let p = parse_ok(
+            "CLASS Point $(\n  DECL x, y\n  ROUTINE CREATE(initialX, initialY) BE $( x := initialX\n y := initialY $)\n  FUNCTION getX() = x\n$)",
+        );
+        let Decl::Class(c) = &p.items[0] else {
+            panic!();
+        };
+        assert_eq!(c.name, "Point");
+        assert!(c.extends.is_none());
+        assert!(!c.managed);
+        assert_eq!(c.members.len(), 3);
+        // 0: DECL x, y
+        assert!(matches!(c.members[0].kind, ClassMemberKind::Fields(_)));
+        // 1: ROUTINE CREATE
+        assert!(matches!(c.members[1].kind, ClassMemberKind::Method(_)));
+        // 2: FUNCTION getX
+        assert!(matches!(c.members[2].kind, ClassMemberKind::Method(_)));
+    }
+
+    #[test]
+    fn parses_class_with_extends() {
+        let p = parse_ok(
+            "CLASS ColorPoint EXTENDS Point $(\n  DECL color\n  ROUTINE CREATE(x, y, c) BE $( SELF.x := x $)\n$)",
+        );
+        let Decl::Class(c) = &p.items[0] else {
+            panic!();
+        };
+        assert_eq!(c.extends, Some("Point".to_string()));
+    }
+
+    #[test]
+    fn parses_managed_class() {
+        let p = parse_ok(
+            "CLASS Window MANAGED $(\n  DECL handle\n  ROUTINE RELEASE() BE $( WRITES(\"closing*N\") $)\n$)",
+        );
+        let Decl::Class(c) = &p.items[0] else {
+            panic!();
+        };
+        assert!(c.managed);
+    }
+
+    #[test]
+    fn parses_virtual_method() {
+        let p = parse_ok(
+            "CLASS Animal $(\n  VIRTUAL ROUTINE makeSound() BE $( WRITES(\"...*N\") $)\n$)",
+        );
+        let Decl::Class(c) = &p.items[0] else {
+            panic!();
+        };
+        let ClassMemberKind::Method(m) = &c.members[0].kind else {
+            panic!();
+        };
+        assert!(m.is_virtual);
+        assert!(!m.is_final);
+    }
+
+    #[test]
+    fn parses_visibility_sections() {
+        let p = parse_ok(
+            "CLASS BankAccount $(\n  PUBLIC:\n    FUNCTION getBalance() = balance\n  PRIVATE:\n    DECL balance\n$)",
+        );
+        let Decl::Class(c) = &p.items[0] else {
+            panic!();
+        };
+        assert_eq!(c.members.len(), 2);
+        assert_eq!(c.members[0].visibility, Visibility::Public);
+        assert_eq!(c.members[1].visibility, Visibility::Private);
+    }
+
+    #[test]
+    fn parses_flet_uninitialised_member() {
+        let p = parse_ok("CLASS Point $(\n  FLET x\n  FLET y = 0.0\n$)");
+        let Decl::Class(c) = &p.items[0] else {
+            panic!();
+        };
+        let ClassMemberKind::FLet(b0) = &c.members[0].kind else {
+            panic!();
+        };
+        let ClassMemberKind::FLet(b1) = &c.members[1].kind else {
+            panic!();
+        };
+        assert_eq!(b0.name, "x");
+        assert!(b0.value.is_none());
+        assert_eq!(b1.name, "y");
+        assert!(b1.value.is_some());
+    }
+
+    #[test]
+    fn parses_new_expression() {
+        let p = parse_ok("LET p = NEW Point(50, 75)");
+        let Decl::Let(l) = &p.items[0] else {
+            panic!();
+        };
+        let Expr::New { class_name, args, .. } = &l.bindings[0].1 else {
+            panic!();
+        };
+        assert_eq!(class_name, "Point");
+        assert_eq!(args.len(), 2);
+    }
+
+    #[test]
+    fn parses_new_no_args() {
+        let p = parse_ok("LET p = NEW Shape");
+        let Decl::Let(l) = &p.items[0] else {
+            panic!();
+        };
+        let Expr::New { class_name, args, .. } = &l.bindings[0].1 else {
+            panic!();
+        };
+        assert_eq!(class_name, "Shape");
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn parses_self_super() {
+        let p = parse_ok("LET S() BE { SELF.x := 1\n SUPER.move(0, 0) }");
+        let Decl::Routine(r) = &p.items[0] else {
+            panic!();
+        };
+        let Stmt::Block(b) = r.body.as_ref() else {
+            panic!();
+        };
+        // First stmt: SELF.x := 1 → assignment with target Binary{Dot, SELF, x}
+        let Stmt::Assign { targets, .. } = &b.stmts[0] else {
+            panic!();
+        };
+        let Expr::Binary {
+            op: BinaryOp::Dot,
+            lhs,
+            ..
+        } = &targets[0]
+        else {
+            panic!();
+        };
+        assert!(matches!(
+            lhs.as_ref(),
+            Expr::Ident { name, .. } if name == "SELF"
+        ));
+        // Second stmt: SUPER.move(0, 0) → call on Binary{Dot, SUPER, move}
+        let Stmt::Expr(Expr::Call { callee, args, .. }) = &b.stmts[1] else {
+            panic!();
+        };
+        let Expr::Binary {
+            op: BinaryOp::Dot,
+            lhs,
+            ..
+        } = callee.as_ref()
+        else {
+            panic!();
+        };
+        assert!(matches!(
+            lhs.as_ref(),
+            Expr::Ident { name, .. } if name == "SUPER"
+        ));
+        assert_eq!(args.len(), 2);
+    }
+
+    #[test]
+    fn parses_lane_access() {
+        let p = parse_ok("LET x = fpair.|0|");
+        let Decl::Let(l) = &p.items[0] else {
+            panic!();
+        };
+        let Expr::Binary {
+            op: BinaryOp::LaneAccess,
+            lhs,
+            rhs,
+            ..
+        } = &l.bindings[0].1
+        else {
+            panic!();
+        };
+        assert!(matches!(lhs.as_ref(), Expr::Ident { .. }));
+        assert!(matches!(rhs.as_ref(), Expr::IntLit { value: 0, .. }));
     }
 
     #[test]

@@ -32,6 +32,68 @@ pub enum Decl {
     /// land here. The distinction (offset vs initialiser) is sema's
     /// concern; the parser just records each binding's optional value.
     Global(NamedBindingsDecl),
+    /// `CLASS Name [EXTENDS Base] [MANAGED] $( … $)` — see manifesto §5.
+    Class(ClassDecl),
+}
+
+#[derive(Debug, Clone)]
+pub struct ClassDecl {
+    pub name: String,
+    pub extends: Option<String>,
+    /// `MANAGED` keyword — opts the class into linear / RAII semantics.
+    pub managed: bool,
+    pub members: Vec<ClassMember>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClassMember {
+    pub visibility: Visibility,
+    pub kind: ClassMemberKind,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Visibility {
+    /// Default; everything is PUBLIC unless a `PRIVATE:` /
+    /// `PROTECTED:` modifier overrides.
+    Public,
+    Private,
+    Protected,
+}
+
+#[derive(Debug, Clone)]
+pub enum ClassMemberKind {
+    /// `DECL x, y, z` — uninitialised member variables.
+    Fields(Vec<String>),
+    /// `LET name = expr` — initialised member variable.
+    Let(LetDecl),
+    /// `FLET name` — uninitialised float member; `FLET name = expr`
+    /// — initialised float member. Re-uses `LetDecl` shape with the
+    /// value either present or absent (recorded as `NamedBinding`).
+    FLet(NamedBinding),
+    /// A method — function-form (`= expr`) or routine-form (`BE stmt`).
+    Method(ClassMethod),
+}
+
+#[derive(Debug, Clone)]
+pub struct ClassMethod {
+    pub name: String,
+    pub params: Vec<String>,
+    /// `VIRTUAL ROUTINE` / `VIRTUAL FUNCTION`.
+    pub is_virtual: bool,
+    /// `FINAL ROUTINE` / `FINAL FUNCTION`.
+    pub is_final: bool,
+    pub body: ClassMethodBody,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub enum ClassMethodBody {
+    /// `BE stmt`.
+    Routine(Box<Stmt>),
+    /// `= expr`.
+    Function(Expr),
 }
 
 #[derive(Debug, Clone)]
@@ -234,6 +296,13 @@ pub enum Expr {
         args: Vec<Expr>,
         span: Span,
     },
+    /// `NEW Class(args)` — heap-allocate an object and call its
+    /// `CREATE`. The argument list is empty for `NEW Class`.
+    New {
+        class_name: String,
+        args: Vec<Expr>,
+        span: Span,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -358,6 +427,8 @@ pub enum BinaryOp {
     Dot,
     /// `obj OF field` — classic BCPL field access (kept for compatibility).
     Of,
+    /// `pair.|n|` — SIMD lane access. The RHS is the lane index.
+    LaneAccess,
 }
 
 impl Expr {
@@ -375,7 +446,8 @@ impl Expr {
             | Expr::Binary { span, .. }
             | Expr::Conditional { span, .. }
             | Expr::Valof { span, .. }
-            | Expr::TypedConstruct { span, .. } => *span,
+            | Expr::TypedConstruct { span, .. }
+            | Expr::New { span, .. } => *span,
         }
     }
 }
@@ -417,6 +489,7 @@ impl Decl {
             Decl::Manifest(m) => m.span,
             Decl::Static(s) => s.span,
             Decl::Global(g) => g.span,
+            Decl::Class(c) => c.span,
         }
     }
 }
@@ -475,6 +548,7 @@ impl BinaryOp {
             BinaryOp::FloatSubscript => ".%",
             BinaryOp::Dot => ".",
             BinaryOp::Of => "OF",
+            BinaryOp::LaneAccess => ".|",
         }
     }
 }
