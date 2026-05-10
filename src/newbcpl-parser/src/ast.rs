@@ -225,6 +225,21 @@ pub enum Stmt {
     Break(Span),
     Loop(Span),
     Endcase(Span),
+    /// `BRK` — debugger breakpoint statement (no operand).
+    Brk(Span),
+    /// `GOTO label` — unconditional jump. Target is a label name.
+    Goto { label: String, span: Span },
+    /// `name:` — label declaration. The labelled statement that
+    /// follows lives as a separate `Stmt` in the surrounding block.
+    Label { name: String, span: Span },
+    /// `RETAIN x` (mark existing) or `RETAIN x = expr` (declare and
+    /// mark). Tells the GC / SAMM that this binding outlives its
+    /// natural scope.
+    Retain {
+        name: String,
+        value: Option<Expr>,
+        span: Span,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -474,7 +489,11 @@ impl Stmt {
             | Stmt::Finish(s)
             | Stmt::Break(s)
             | Stmt::Loop(s)
-            | Stmt::Endcase(s) => *s,
+            | Stmt::Endcase(s)
+            | Stmt::Brk(s) => *s,
+            Stmt::Goto { span, .. }
+            | Stmt::Label { span, .. }
+            | Stmt::Retain { span, .. } => *span,
         }
     }
 }

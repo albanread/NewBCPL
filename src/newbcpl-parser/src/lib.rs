@@ -394,6 +394,24 @@ fn pretty_print_stmt(stmt: &Stmt, level: usize, out: &mut String) {
         Stmt::Endcase(_) => {
             writeln!(out, "endcase").unwrap();
         }
+        Stmt::Brk(_) => {
+            writeln!(out, "brk").unwrap();
+        }
+        Stmt::Goto { label, .. } => {
+            writeln!(out, "goto {label}").unwrap();
+        }
+        Stmt::Label { name, .. } => {
+            writeln!(out, "label {name}:").unwrap();
+        }
+        Stmt::Retain { name, value, .. } => match value {
+            Some(expr) => {
+                writeln!(out, "retain {name} =").unwrap();
+                pretty_print_expr(expr, level + 1, out);
+            }
+            None => {
+                writeln!(out, "retain {name}").unwrap();
+            }
+        },
     }
 }
 
@@ -1728,6 +1746,194 @@ mod tests {
         };
         assert!(matches!(lhs.as_ref(), Expr::Ident { .. }));
         assert!(matches!(rhs.as_ref(), Expr::IntLit { value: 0, .. }));
+    }
+
+    // ─── mop-up: GOTO / labels / RETAIN / BRK / TYPE / AS ───────
+
+    #[test]
+    fn parses_goto_and_label() {
+        let src = "LET S() BE $(
+            IF x > 0 THEN GOTO positive
+            GOTO negative
+            positive:
+                f()
+            negative:
+                g()
+        $)";
+        let p = parse_ok(src);
+        let Decl::Routine(r) = &p.items[0] else {
+            panic!();
+        };
+        let Stmt::Block(b) = r.body.as_ref() else {
+            panic!();
+        };
+        let labels: Vec<_> = b
+            .stmts
+            .iter()
+            .filter_map(|s| match s {
+                Stmt::Label { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(labels, vec!["positive".to_string(), "negative".to_string()]);
+        let gotos: Vec<_> = b
+            .stmts
+            .iter()
+            .filter_map(|s| match s {
+                Stmt::Goto { label, .. } => Some(label.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(gotos, vec!["negative".to_string()]);
+    }
+
+    #[test]
+    fn label_does_not_break_assignment() {
+        // `x := 0` must parse as Assign, NOT as label `x` + stray `=` + 0.
+        let p = parse_ok("LET S() BE { x := 0 }");
+        let Decl::Routine(r) = &p.items[0] else {
+            panic!();
+        };
+        let Stmt::Block(b) = r.body.as_ref() else {
+            panic!();
+        };
+        assert!(matches!(b.stmts[0], Stmt::Assign { .. }));
+    }
+
+    #[test]
+    fn parses_retain_bare_and_init() {
+        let p = parse_ok(
+            "LET S() BE { RETAIN counter\n RETAIN p3 = NEW MyClass() }",
+        );
+        let Decl::Routine(r) = &p.items[0] else {
+            panic!();
+        };
+        let Stmt::Block(b) = r.body.as_ref() else {
+            panic!();
+        };
+        let Stmt::Retain {
+            name: n0, value: v0, ..
+        } = &b.stmts[0]
+        else {
+            panic!();
+        };
+        assert_eq!(n0, "counter");
+        assert!(v0.is_none());
+        let Stmt::Retain {
+            name: n1, value: v1, ..
+        } = &b.stmts[1]
+        else {
+            panic!();
+        };
+        assert_eq!(n1, "p3");
+        assert!(matches!(v1, Some(Expr::New { .. })));
+    }
+
+    #[test]
+    fn parses_brk() {
+        let p = parse_ok("LET S() BE { BRK }");
+        let Decl::Routine(r) = &p.items[0] else {
+            panic!();
+        };
+        let Stmt::Block(b) = r.body.as_ref() else {
+            panic!();
+        };
+        assert!(matches!(b.stmts[0], Stmt::Brk(_)));
+    }
+
+    #[test]
+    fn parses_type_macro() {
+        let p = parse_ok("LET t = TYPE(x)");
+        let Decl::Let(l) = &p.items[0] else {
+            panic!();
+        };
+        let Expr::Call { callee, args, .. } = &l.bindings[0].1 else {
+            panic!();
+        };
+        assert!(matches!(callee.as_ref(), Expr::Ident { name, .. } if name == "TYPE"));
+        assert_eq!(args.len(), 1);
+    }
+
+    #[test]
+    fn parses_let_with_as_annotation() {
+        // The AS annotation is parsed and discarded for now.
+        let p = parse_ok("LET x AS INTEGER = 42");
+        let Decl::Let(l) = &p.items[0] else {
+            panic!();
+        };
+        assert_eq!(l.bindings[0].0, "x");
+        assert!(matches!(l.bindings[0].1, Expr::IntLit { value: 42, .. }));
+    }
+
+    #[test]
+    fn parses_let_multi_with_as_annotations() {
+        let p = parse_ok("LET a AS INTEGER, b AS FLOAT = 1, 2.0");
+        let Decl::Let(l) = &p.items[0] else {
+            panic!();
+        };
+        assert_eq!(l.bindings.len(), 2);
+        assert_eq!(l.bindings[0].0, "a");
+        assert_eq!(l.bindings[1].0, "b");
+    }
+
+    // ─── small forms: VEC[…] inline-init, %% (start, width) ─────
+
+    #[test]
+    fn parses_vec_inline_init() {
+        let p = parse_ok("LET w = VEC [10, 20, 30]");
+        let Decl::Let(l) = &p.items[0] else {
+            panic!();
+        };
+        let Expr::TypedConstruct {
+            kind: TypeConstructorKind::Vec,
+            args,
+            ..
+        } = &l.bindings[0].1
+        else {
+            panic!();
+        };
+        assert_eq!(args.len(), 3);
+    }
+
+    #[test]
+    fn parses_bitfield_access() {
+        let p = parse_ok("LET S() BE { x := m %% (0, 8) }");
+        let Decl::Routine(r) = &p.items[0] else {
+            panic!();
+        };
+        let Stmt::Block(b) = r.body.as_ref() else {
+            panic!();
+        };
+        let Stmt::Assign { values, .. } = &b.stmts[0] else {
+            panic!();
+        };
+        // values[0] = m %% (0, 8)
+        let Expr::Binary {
+            op: BinaryOp::Bitfield,
+            ..
+        } = &values[0]
+        else {
+            panic!("expected Bitfield");
+        };
+    }
+
+    #[test]
+    fn parses_bitfield_assignment_target() {
+        // The bits.bcl pattern: m %% (0, 8) := 212
+        let p = parse_ok("LET S() BE { m %% (0, 8) := 212 }");
+        let Decl::Routine(r) = &p.items[0] else {
+            panic!();
+        };
+        let Stmt::Block(b) = r.body.as_ref() else {
+            panic!();
+        };
+        let Stmt::Assign { targets, .. } = &b.stmts[0] else {
+            panic!();
+        };
+        assert!(matches!(
+            targets[0],
+            Expr::Binary { op: BinaryOp::Bitfield, .. }
+        ));
     }
 
     #[test]

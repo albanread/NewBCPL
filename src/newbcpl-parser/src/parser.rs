@@ -346,6 +346,29 @@ impl Parser {
         t.kind == TokenKind::Symbol && t.lexeme == ":"
     }
 
+    /// Like `lookahead_is_colon`, but true only if the colon is `:`,
+    /// NOT `:=`. The lexer emits `:=` as a single token, so this is
+    /// just `lookahead_is_colon` written explicitly for clarity at
+    /// the label-vs-assignment call site.
+    fn lookahead_is_colon_not_assign(&self) -> bool {
+        self.lookahead_is_colon()
+    }
+
+    /// If the next token is `AS`, consume `AS TypeIdent` and discard
+    /// it. Used at LET binding sites; sema wires the annotation back
+    /// in when type-annotation handling lands.
+    fn skip_optional_as_annotation(&mut self) {
+        if self.check_kw("AS") {
+            self.eat();
+            // The full type grammar (POINTER TO X, OF X, …) is more
+            // involved; for now accept a single identifier or keyword
+            // (e.g. INTEGER, FLOAT, WORD, POINTER) that names the type.
+            if matches!(self.peek().kind, TokenKind::Identifier | TokenKind::Keyword) {
+                self.pos += 1;
+            }
+        }
+    }
+
     fn parse_class_member(
         &mut self,
         visibility: Visibility,
@@ -572,8 +595,10 @@ impl Parser {
                 self.eat();
                 return Ok(bindings);
             }
-            // GLOBALS lets users write `LET name = expr` — strip the LET.
-            if self.check_kw("LET") {
+            // GLOBALS lets users write `LET name = expr` (or `FLET …`)
+            // — strip the leading binder keyword. Sema later picks up
+            // FLET vs LET for the float-typing hint.
+            if self.check_kw("LET") || self.check_kw("FLET") {
                 self.eat();
             }
             let name_tok = self.eat_identifier()?;
@@ -655,10 +680,15 @@ impl Parser {
         }
 
         // Plain binding: LET n1, n2, ... = e1, e2, ...
+        // Each name may carry an optional `AS TypeIdent` annotation;
+        // sema reads annotations when they're wired in. The parser
+        // accepts and discards them for now.
+        self.skip_optional_as_annotation();
         let mut names = vec![first_name];
         while self.check_sym(",") {
             self.eat();
             names.push(self.eat_identifier()?.lexeme);
+            self.skip_optional_as_annotation();
         }
         self.expect_sym("=")?;
         let mut exprs = vec![self.parse_expr()?];
@@ -734,6 +764,22 @@ impl Parser {
     }
 
     fn parse_basic_stmt(&mut self) -> Result<Stmt, ParseError> {
+        // Label declaration: `name:` where the next token is a single
+        // colon (NOT `:=`). We commit to label-shape only if the
+        // lookahead matches, so this never disturbs an `ident := …`.
+        if self.peek().kind == TokenKind::Identifier
+            && self.lookahead_is_colon_not_assign()
+        {
+            let name_tok = self.eat();
+            let colon = self.eat();
+            return Ok(Stmt::Label {
+                name: name_tok.lexeme,
+                span: SourceSpan {
+                    start: name_tok.span.start,
+                    end: colon.span.end,
+                },
+            });
+        }
         if self.check_sym("$(") || self.check_sym("{") {
             return self.parse_block();
         }
@@ -794,6 +840,43 @@ impl Parser {
         }
         if self.check_kw("ENDCASE") {
             return Ok(Stmt::Endcase(self.eat().span));
+        }
+        if self.check_kw("BRK") {
+            return Ok(Stmt::Brk(self.eat().span));
+        }
+        if self.check_kw("GOTO") {
+            let kw = self.eat();
+            let label_tok = self.eat_identifier()?;
+            return Ok(Stmt::Goto {
+                label: label_tok.lexeme,
+                span: SourceSpan {
+                    start: kw.span.start,
+                    end: label_tok.span.end,
+                },
+            });
+        }
+        if self.check_kw("RETAIN") {
+            let kw = self.eat();
+            let name_tok = self.eat_identifier()?;
+            // Optional `= expr` makes RETAIN both declare and mark.
+            let value = if self.check_sym("=") {
+                self.eat();
+                Some(self.parse_expr()?)
+            } else {
+                None
+            };
+            let end = value
+                .as_ref()
+                .map(|e| e.span().end)
+                .unwrap_or(name_tok.span.end);
+            return Ok(Stmt::Retain {
+                name: name_tok.lexeme,
+                value,
+                span: SourceSpan {
+                    start: kw.span.start,
+                    end,
+                },
+            });
         }
 
         // Expression-or-assignment fall-through.
@@ -1454,14 +1537,73 @@ impl Parser {
                 continue;
             }
 
+            // `%%` (bitfield access) is special: the RHS is a paren'd
+            // `(start, width)` pair, e.g. `m %% (0, 8)`. Handle it
+            // before the regular subscript family so the comma is
+            // consumed correctly.
+            if self.check_sym("%%") {
+                self.eat();
+                self.expect_sym("(")?;
+                let start_arg = self.parse_expr()?;
+                let width_arg = if self.check_sym(",") {
+                    self.eat();
+                    Some(self.parse_expr()?)
+                } else {
+                    None
+                };
+                let close = self.expect_sym(")")?;
+                let span = SourceSpan {
+                    start: expr.span().start,
+                    end: close.span.end,
+                };
+                // Pack both args into the existing TypedConstruct shape:
+                // `expr %% (start, width)` becomes a Call-shaped node
+                // whose callee is a Binary { Bitfield, target, start }
+                // and arg is `width`. Cleaner: new Expr variant. For
+                // now reuse Binary by encoding (start, width) as a
+                // Conditional-style triple — but that's hacky. Instead
+                // synthesise a Call where the callee is the bitfield
+                // expr and the args are the indices.
+                //
+                // Simplest correct shape that doesn't require a new
+                // AST variant: nest the width into the rhs as a
+                // Binary { Bitfield, start, width } — i.e. record
+                // `target %% (start, width)` as
+                //   Binary { Bitfield, target, Binary { Bitfield, start, width } }
+                // when width is given, and
+                //   Binary { Bitfield, target, start }
+                // when it isn't. Sema unwraps. Documenting this in
+                // the AST when sema lands.
+                let rhs = match width_arg {
+                    Some(w) => {
+                        let inner_span = SourceSpan {
+                            start: start_arg.span().start,
+                            end: w.span().end,
+                        };
+                        Expr::Binary {
+                            op: BinaryOp::Bitfield,
+                            lhs: Box::new(start_arg),
+                            rhs: Box::new(w),
+                            span: inner_span,
+                        }
+                    }
+                    None => start_arg,
+                };
+                expr = Expr::Binary {
+                    op: BinaryOp::Bitfield,
+                    lhs: Box::new(expr),
+                    rhs: Box::new(rhs),
+                    span,
+                };
+                continue;
+            }
+
             // Subscript family — all are infix and have one expression
             // on the right. Note: the RHS uses `parse_unary` rather than
             // a full precedence-climb, so that `v!i + 1` parses as
             // `(v!i) + 1` (subscript binds tighter than `+`).
             let infix_subscript = if self.check_sym("!") {
                 Some(BinaryOp::Subscript)
-            } else if self.check_sym("%%") {
-                Some(BinaryOp::Bitfield)
             } else if self.check_sym("%") {
                 Some(BinaryOp::CharSubscript)
             } else if self.check_sym(".%") {
@@ -1626,13 +1768,40 @@ impl Parser {
             TokenKind::Keyword
                 if matches!(tok.lexeme.as_str(), "VEC" | "FVEC") =>
             {
-                // `VEC k` / `FVEC k` — single size argument, no parens.
+                // Two shapes:
+                //   `VEC k`         — single size; allocates a vector
+                //                     of `k+1` words.
+                //   `VEC [e1, e2, …]` — inline initialiser; the size
+                //                       comes from the element count.
                 self.pos += 1;
                 let kind = if tok.lexeme == "VEC" {
                     TypeConstructorKind::Vec
                 } else {
                     TypeConstructorKind::FVec
                 };
+                if self.check_sym("[") {
+                    self.eat();
+                    let mut args = Vec::new();
+                    if !self.check_sym("]") {
+                        args.push(self.parse_expr()?);
+                        while self.check_sym(",") {
+                            self.eat();
+                            if self.check_sym("]") {
+                                break;
+                            }
+                            args.push(self.parse_expr()?);
+                        }
+                    }
+                    let close = self.expect_sym("]")?;
+                    return Ok(Expr::TypedConstruct {
+                        kind,
+                        args,
+                        span: SourceSpan {
+                            start: tok.span.start,
+                            end: close.span.end,
+                        },
+                    });
+                }
                 let size = self.parse_unary()?;
                 let span = SourceSpan {
                     start: tok.span.start,
@@ -1694,7 +1863,7 @@ impl Parser {
             TokenKind::Keyword
                 if matches!(
                     tok.lexeme.as_str(),
-                    "FLOAT" | "TRUNC" | "FIX" | "FSQRT" | "ENTIER"
+                    "FLOAT" | "TRUNC" | "FIX" | "FSQRT" | "ENTIER" | "TYPE" | "TYPEOF"
                 ) =>
             {
                 self.pos += 1;
