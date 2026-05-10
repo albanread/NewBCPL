@@ -184,6 +184,57 @@ pub enum Expr {
     },
     /// `VALOF stmt` — yields the value passed to `RESULTIS`.
     Valof { body: Box<Stmt>, span: Span },
+    /// Typed constructor — covers heap allocation (`VEC k`, `FVEC k`),
+    /// SIMD primitives (`PAIR`/`FPAIR`/`QUAD`/`FQUAD`/`OCT`/`FOCT`),
+    /// and table literals (`TABLE`/`FTABLE`). All expressed as a kind
+    /// plus a list of arguments so a single AST node and a single
+    /// codegen path lower them.
+    TypedConstruct {
+        kind: TypeConstructorKind,
+        args: Vec<Expr>,
+        span: Span,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypeConstructorKind {
+    /// `VEC k` — heap-allocated word vector with `k+1` elements.
+    Vec,
+    /// `FVEC k` — heap-allocated float vector with `k+1` elements.
+    FVec,
+    /// `TABLE(e1, e2, ...)` — static integer table.
+    Table,
+    /// `FTABLE(e1, e2, ...)` — static float table.
+    FTable,
+    /// `PAIR(a, b)` — V-register-resident integer pair (`<2 x i64>`).
+    Pair,
+    /// `FPAIR(a, b)` — V-register-resident float pair (`<2 x double>`).
+    FPair,
+    /// `QUAD(a, b, c, d)` — `<4 x i64>`.
+    Quad,
+    /// `FQUAD(a, b, c, d)` — `<4 x double>`.
+    FQuad,
+    /// `OCT(a..h)` — `<8 x i64>` (SVE-targeted).
+    Oct,
+    /// `FOCT(a..h)` — `<8 x double>`.
+    FOct,
+}
+
+impl TypeConstructorKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TypeConstructorKind::Vec => "VEC",
+            TypeConstructorKind::FVec => "FVEC",
+            TypeConstructorKind::Table => "TABLE",
+            TypeConstructorKind::FTable => "FTABLE",
+            TypeConstructorKind::Pair => "PAIR",
+            TypeConstructorKind::FPair => "FPAIR",
+            TypeConstructorKind::Quad => "QUAD",
+            TypeConstructorKind::FQuad => "FQUAD",
+            TypeConstructorKind::Oct => "OCT",
+            TypeConstructorKind::FOct => "FOCT",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -264,7 +315,8 @@ impl Expr {
             | Expr::Unary { span, .. }
             | Expr::Binary { span, .. }
             | Expr::Conditional { span, .. }
-            | Expr::Valof { span, .. } => *span,
+            | Expr::Valof { span, .. }
+            | Expr::TypedConstruct { span, .. } => *span,
         }
     }
 }

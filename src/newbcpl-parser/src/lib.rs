@@ -11,7 +11,7 @@ use std::path::Path;
 
 pub use ast::{
     BinaryOp, Block, Decl, Expr, FunctionDecl, GetDirective, LetDecl, NamedBinding,
-    NamedBindingsDecl, Program, RoutineDecl, Span, Stmt, UnaryOp,
+    NamedBindingsDecl, Program, RoutineDecl, Span, Stmt, TypeConstructorKind, UnaryOp,
 };
 pub use parser::{ParseError, parse_source};
 
@@ -312,6 +312,12 @@ fn pretty_print_expr(expr: &Expr, level: usize, out: &mut String) {
         Expr::Valof { body, .. } => {
             writeln!(out, "valof").unwrap();
             pretty_print_stmt(body, level + 1, out);
+        }
+        Expr::TypedConstruct { kind, args, .. } => {
+            writeln!(out, "construct {} ({} args)", kind.as_str(), args.len()).unwrap();
+            for arg in args {
+                pretty_print_expr(arg, level + 1, out);
+            }
         }
     }
 }
@@ -976,6 +982,141 @@ mod tests {
             "got: {}",
             err.message
         );
+    }
+
+    // ─── type constructors ──────────────────────────────────────
+
+    #[test]
+    fn parses_vec_allocation() {
+        let p = parse_ok("LET v = VEC 100");
+        let Decl::Let(l) = &p.items[0] else {
+            panic!();
+        };
+        let Expr::TypedConstruct {
+            kind: TypeConstructorKind::Vec,
+            args,
+            ..
+        } = &l.bindings[0].1
+        else {
+            panic!();
+        };
+        assert_eq!(args.len(), 1);
+        assert!(matches!(args[0], Expr::IntLit { value: 100, .. }));
+    }
+
+    #[test]
+    fn parses_pair_construction() {
+        let p = parse_ok("LET p = PAIR(1, 2)");
+        let Decl::Let(l) = &p.items[0] else {
+            panic!();
+        };
+        let Expr::TypedConstruct {
+            kind: TypeConstructorKind::Pair,
+            args,
+            ..
+        } = &l.bindings[0].1
+        else {
+            panic!();
+        };
+        assert_eq!(args.len(), 2);
+    }
+
+    #[test]
+    fn parses_fpair_with_floats() {
+        let p = parse_ok("LET f = FPAIR(1.0, 2.0)");
+        let Decl::Let(l) = &p.items[0] else {
+            panic!();
+        };
+        let Expr::TypedConstruct {
+            kind: TypeConstructorKind::FPair,
+            args,
+            ..
+        } = &l.bindings[0].1
+        else {
+            panic!();
+        };
+        assert!(matches!(args[0], Expr::FloatLit { .. }));
+    }
+
+    #[test]
+    fn parses_quad_and_oct() {
+        let p = parse_ok(
+            "LET q = QUAD(1, 2, 3, 4)\nLET o = OCT(1, 2, 3, 4, 5, 6, 7, 8)",
+        );
+        let Decl::Let(l0) = &p.items[0] else { panic!() };
+        let Decl::Let(l1) = &p.items[1] else { panic!() };
+        let Expr::TypedConstruct {
+            kind: TypeConstructorKind::Quad,
+            args: a0,
+            ..
+        } = &l0.bindings[0].1
+        else {
+            panic!();
+        };
+        let Expr::TypedConstruct {
+            kind: TypeConstructorKind::Oct,
+            args: a1,
+            ..
+        } = &l1.bindings[0].1
+        else {
+            panic!();
+        };
+        assert_eq!(a0.len(), 4);
+        assert_eq!(a1.len(), 8);
+    }
+
+    #[test]
+    fn parses_table() {
+        let p = parse_ok("LET t = TABLE(10, 20, 30, 40, 50)");
+        let Decl::Let(l) = &p.items[0] else {
+            panic!();
+        };
+        let Expr::TypedConstruct {
+            kind: TypeConstructorKind::Table,
+            args,
+            ..
+        } = &l.bindings[0].1
+        else {
+            panic!();
+        };
+        assert_eq!(args.len(), 5);
+    }
+
+    #[test]
+    fn pair_with_negative_arg() {
+        // Make sure unary `-` inside the call works.
+        let p = parse_ok("LET p = PAIR(10, -10)");
+        let Decl::Let(l) = &p.items[0] else {
+            panic!();
+        };
+        let Expr::TypedConstruct {
+            kind: TypeConstructorKind::Pair,
+            args,
+            ..
+        } = &l.bindings[0].1
+        else {
+            panic!();
+        };
+        assert!(matches!(
+            args[1],
+            Expr::Unary { op: UnaryOp::Neg, .. }
+        ));
+    }
+
+    #[test]
+    fn flet_parses_like_let() {
+        let p = parse_ok("FLET pi = 3.14159");
+        let Decl::Let(l) = &p.items[0] else {
+            panic!("FLET should produce Decl::Let — sema applies the float hint");
+        };
+        assert_eq!(l.bindings[0].0, "pi");
+        assert!(matches!(l.bindings[0].1, Expr::FloatLit { .. }));
+    }
+
+    #[test]
+    fn flet_function_form() {
+        let p = parse_ok("FLET SimpleFloatFunc(x) = x + 1.0");
+        assert!(matches!(p.items[0], Decl::Function(_)));
     }
 
     #[test]

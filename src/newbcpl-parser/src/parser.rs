@@ -138,7 +138,12 @@ impl Parser {
     }
 
     fn parse_decl(&mut self) -> Result<Decl, ParseError> {
-        if self.check_kw("LET") {
+        if self.check_kw("LET") || self.check_kw("FLET") {
+            // FLET is the float-typed LET. The parser treats it
+            // identically; sema marks the resulting binding(s) as FLOAT
+            // hint. Inside class bodies, FLET also serves as an
+            // uninitialised member declaration (`FLET x`); that form is
+            // handled when class parsing lands in the next chunk.
             return self.parse_let_decl();
         }
         if self.check_kw("GET") {
@@ -446,6 +451,7 @@ impl Parser {
             return self.parse_block();
         }
         if self.check_kw("LET")
+            || self.check_kw("FLET")
             || self.check_kw("GET")
             || self.check_kw("MANIFEST")
             || self.check_kw("STATIC")
@@ -1064,7 +1070,7 @@ impl Parser {
                     span: tok.span,
                 })
             }
-            TokenKind::Keyword if tok.lexeme == "VALOF" => {
+            TokenKind::Keyword if tok.lexeme == "VALOF" || tok.lexeme == "FVALOF" => {
                 self.pos += 1;
                 let body = self.parse_stmt()?;
                 let span = SourceSpan {
@@ -1075,6 +1081,67 @@ impl Parser {
                     body: Box::new(body),
                     span,
                 })
+            }
+            TokenKind::Keyword
+                if matches!(tok.lexeme.as_str(), "VEC" | "FVEC") =>
+            {
+                // `VEC k` / `FVEC k` — single size argument, no parens.
+                self.pos += 1;
+                let kind = if tok.lexeme == "VEC" {
+                    TypeConstructorKind::Vec
+                } else {
+                    TypeConstructorKind::FVec
+                };
+                let size = self.parse_unary()?;
+                let span = SourceSpan {
+                    start: tok.span.start,
+                    end: size.span().end,
+                };
+                Ok(Expr::TypedConstruct {
+                    kind,
+                    args: vec![size],
+                    span,
+                })
+            }
+            TokenKind::Keyword
+                if matches!(
+                    tok.lexeme.as_str(),
+                    "PAIR" | "FPAIR" | "QUAD" | "FQUAD" | "OCT" | "FOCT" | "TABLE" | "FTABLE"
+                ) =>
+            {
+                // `PAIR(a, b)` and friends — paren'd, comma-separated args.
+                self.pos += 1;
+                let kind = match tok.lexeme.as_str() {
+                    "PAIR" => TypeConstructorKind::Pair,
+                    "FPAIR" => TypeConstructorKind::FPair,
+                    "QUAD" => TypeConstructorKind::Quad,
+                    "FQUAD" => TypeConstructorKind::FQuad,
+                    "OCT" => TypeConstructorKind::Oct,
+                    "FOCT" => TypeConstructorKind::FOct,
+                    "TABLE" => TypeConstructorKind::Table,
+                    "FTABLE" => TypeConstructorKind::FTable,
+                    _ => unreachable!(),
+                };
+                self.expect_sym("(")?;
+                let mut args = Vec::new();
+                if !self.check_sym(")") {
+                    args.push(self.parse_expr()?);
+                    while self.check_sym(",") {
+                        self.eat();
+                        // Allow a trailing comma:
+                        // `LIST(1, 2, 3,)` is valid in the dialect.
+                        if self.check_sym(")") {
+                            break;
+                        }
+                        args.push(self.parse_expr()?);
+                    }
+                }
+                let close = self.expect_sym(")")?;
+                let span = SourceSpan {
+                    start: tok.span.start,
+                    end: close.span.end,
+                };
+                Ok(Expr::TypedConstruct { kind, args, span })
             }
             TokenKind::Symbol if tok.lexeme == "?" => {
                 self.pos += 1;
