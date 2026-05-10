@@ -240,6 +240,15 @@ pub struct RoutineDecl {
 #[derive(Debug, Clone)]
 pub struct LetDecl {
     pub bindings: Vec<(String, Expr)>,
+    /// Per-binding `AS` type annotation, parallel to `bindings`
+    /// (same length, indexes line up). `None` for un-annotated
+    /// bindings — the common case. The string is the
+    /// canonicalised form of the type expression, e.g.
+    /// `"INTEGER"`, `"^STRING"`, `"^LIST OF INTEGER"`. Sema
+    /// reads this in `type_hint_from_annotation` to seed the
+    /// binding's hint instead of inferring from the initialiser
+    /// alone — manifesto §2 ("looks untyped, secretly typed").
+    pub annotations: Vec<Option<String>>,
     pub span: Span,
     /// Which binder keyword was used. `LET` is the default; `FLET`
     /// signals to sema that the right-hand sides should be inferred

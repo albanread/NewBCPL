@@ -360,15 +360,124 @@ impl Parser {
     /// If the next token is `AS`, consume `AS TypeIdent` and discard
     /// it. Used at LET binding sites; sema wires the annotation back
     /// in when type-annotation handling lands.
+    /// Old API kept for callers that don't capture the annotation
+    /// (FOREACH, VALOF) — same behaviour, return value discarded.
     fn skip_optional_as_annotation(&mut self) {
-        if self.check_kw("AS") {
-            self.eat();
-            // The full type grammar (POINTER TO X, OF X, …) is more
-            // involved; for now accept a single identifier or keyword
-            // (e.g. INTEGER, FLOAT, WORD, POINTER) that names the type.
-            if matches!(self.peek().kind, TokenKind::Identifier | TokenKind::Keyword) {
-                self.pos += 1;
+        let _ = self.parse_optional_as_annotation();
+    }
+
+    /// Parse an optional `AS Type` annotation and return its
+    /// canonical string form (e.g. `"INTEGER"`, `"^STRING"`,
+    /// `"^LIST OF INTEGER"`). Returns `None` when the next token
+    /// isn't `AS`. Sema turns the string into a `TypeHint` via
+    /// `type_hint_from_annotation`.
+    ///
+    /// Grammar (matching reference / corpus usage):
+    ///   `AS` ty
+    ///   ty   ::= '^' ty               -- pointer-to (also `POINTER TO`)
+    ///          | base ('OF' ty)?      -- base + optional element chain
+    ///   base ::= IDENT or any type keyword
+    fn parse_optional_as_annotation(&mut self) -> Option<String> {
+        if !self.check_kw("AS") {
+            return None;
+        }
+        self.eat(); // AS
+        let mut out = String::new();
+        self.consume_type_annotation(&mut out);
+        if out.is_empty() {
+            None
+        } else {
+            Some(out)
+        }
+    }
+
+    /// Body of an `AS` clause. Appends a canonical rendering of
+    /// the type expression to `out`. Bails out at the first
+    /// non-type token so the caller sees `=` / `,` / `IN` / `DO`
+    /// / `BE` where it expects them.
+    fn consume_type_annotation(&mut self, out: &mut String) {
+        // Leading pointer markers — any number of `^` symbols or
+        // `POINTER TO` keyword pairs, normalised to `^` in the
+        // canonical string so sema only has to recognise one
+        // form. Sema reads each leading `^` as one POINTER-TO
+        // level.
+        loop {
+            if self.check_sym("^") {
+                self.eat();
+                out.push('^');
+                continue;
             }
+            if self.check_kw("POINTER") {
+                self.eat();
+                if self.check_kw("TO") {
+                    self.eat();
+                }
+                out.push('^');
+                continue;
+            }
+            break;
+        }
+        if !self.consume_type_base(out) {
+            return;
+        }
+        while self.check_kw("OF") {
+            self.eat();
+            out.push_str(" OF ");
+            loop {
+                if self.check_sym("^") {
+                    self.eat();
+                    out.push('^');
+                    continue;
+                }
+                if self.check_kw("POINTER") {
+                    self.eat();
+                    if self.check_kw("TO") {
+                        self.eat();
+                    }
+                    out.push('^');
+                    continue;
+                }
+                break;
+            }
+            if !self.consume_type_base(out) {
+                return;
+            }
+        }
+    }
+
+    /// Consume one base type-name (identifier or recognised
+    /// type keyword) and append its lexeme to `out`. Returns
+    /// whether anything was consumed.
+    fn consume_type_base(&mut self, out: &mut String) -> bool {
+        let t = self.peek();
+        match (t.kind, t.lexeme.as_str()) {
+            (TokenKind::Identifier, _) => {
+                out.push_str(&t.lexeme);
+                self.pos += 1;
+                true
+            }
+            (TokenKind::Keyword, "INTEGER")
+            | (TokenKind::Keyword, "INT")
+            | (TokenKind::Keyword, "FLOAT")
+            | (TokenKind::Keyword, "WORD")
+            | (TokenKind::Keyword, "STRING")
+            | (TokenKind::Keyword, "ANY")
+            | (TokenKind::Keyword, "LIST")
+            | (TokenKind::Keyword, "VECTOR")
+            | (TokenKind::Keyword, "OBJECT")
+            | (TokenKind::Keyword, "PAIR")
+            | (TokenKind::Keyword, "FPAIR")
+            | (TokenKind::Keyword, "QUAD")
+            | (TokenKind::Keyword, "FQUAD")
+            | (TokenKind::Keyword, "OCT")
+            | (TokenKind::Keyword, "FOCT")
+            | (TokenKind::Keyword, "CHAR")
+            | (TokenKind::Keyword, "BYTE") => {
+                out.push_str(&t.lexeme);
+                self.pos += 1;
+                true
+            }
+            _ => false,
         }
     }
 
@@ -688,15 +797,16 @@ impl Parser {
         }
 
         // Plain binding: LET n1, n2, ... = e1, e2, ...
-        // Each name may carry an optional `AS TypeIdent` annotation;
-        // sema reads annotations when they're wired in. The parser
-        // accepts and discards them for now.
-        self.skip_optional_as_annotation();
+        // Each name may carry an optional `AS TypeIdent` annotation
+        // which sema reads as a hint (manifesto §2). The parser
+        // captures the type-expression's canonical string form so
+        // sema can map it to a `TypeHint` without re-parsing.
         let mut names = vec![first_name];
+        let mut annotations: Vec<Option<String>> = vec![self.parse_optional_as_annotation()];
         while self.check_sym(",") {
             self.eat();
             names.push(self.eat_identifier()?.lexeme);
-            self.skip_optional_as_annotation();
+            annotations.push(self.parse_optional_as_annotation());
         }
         self.expect_sym("=")?;
         let mut exprs = vec![self.parse_expr()?];
@@ -722,6 +832,7 @@ impl Parser {
             .unwrap_or(let_token.span.end);
         Ok(Decl::Let(LetDecl {
             bindings,
+            annotations,
             span: SourceSpan { start, end },
             kind,
         }))
@@ -1854,6 +1965,14 @@ impl Parser {
             }
             TokenKind::Keyword if tok.lexeme == "VALOF" || tok.lexeme == "FVALOF" => {
                 self.pos += 1;
+                // `VALOF AS Type $(...)` — optional return-type
+                // annotation. Sema uses the hint to seed the
+                // enclosing function's result type when the
+                // RESULTIS expressions are otherwise inscrutable.
+                // We just skip past it for now; richer wiring
+                // (annotation → Expr::Valof.hint) lands when sema
+                // grows a `valof_annotation` reader.
+                self.skip_optional_as_annotation();
                 let body = self.parse_stmt()?;
                 let span = SourceSpan {
                     start: tok.span.start,

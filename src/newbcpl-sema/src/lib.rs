@@ -676,7 +676,7 @@ impl Sema {
     }
 
     fn analyze_let(&mut self, l: &LetDecl) {
-        for (name, expr) in &l.bindings {
+        for (i, (name, expr)) in l.bindings.iter().enumerate() {
             let mut hint = self.type_of(expr);
             // FLET overrides scalar inference to FLOAT when the literal
             // evidence is otherwise neutral (manifesto §1).
@@ -684,6 +684,15 @@ impl Sema {
                 && matches!(hint, TypeHint::Int | TypeHint::Word | TypeHint::Unknown)
             {
                 hint = TypeHint::Float;
+            }
+            // Manifesto §2 ("looks untyped, secretly typed"):
+            // an explicit `AS Type` annotation overrides the
+            // inferred hint. The parser stores annotations
+            // parallel to bindings in `l.annotations`.
+            if let Some(Some(ann)) = l.annotations.get(i) {
+                if let Some(annotated) = type_hint_from_annotation(ann) {
+                    hint = annotated;
+                }
             }
             let class_name = self.class_name_of(expr);
             // Manifesto §5: a MANAGED instance cannot be aliased.
@@ -1386,6 +1395,38 @@ fn map_annotation_to_hint(annotation: &str) -> Option<TypeHint> {
         "FVEC" => TypeHint::FVec,
         _ => return None,
     })
+}
+
+/// Resolve a canonicalised `AS Type` annotation string from the
+/// parser into a `TypeHint`. Handles the richer shapes the corpus
+/// uses:
+///
+///   - `INTEGER`, `FLOAT`, ...           → matched by the base.
+///   - `^STRING`, `^LIST OF INTEGER` ... → each leading `^` is a
+///     POINTER-TO marker. We strip them all and map the base.
+///     This is correct for our heap-shape model where lists,
+///     vectors, strings, and objects are already pointer-shaped
+///     at the value level — extra pointer levels collapse to
+///     the base type's hint.
+///   - `LIST OF INTEGER`                 → element-type info
+///     after ` OF ` is recorded by the parser but ignored here;
+///     when richer typing lands sema will descend into it.
+///
+/// Returns `None` when the base isn't a type sema recognises,
+/// in which case the inferred hint stays as-is.
+pub(crate) fn type_hint_from_annotation(annotation: &str) -> Option<TypeHint> {
+    // Strip leading pointer-to markers.
+    let mut s = annotation;
+    while let Some(rest) = s.strip_prefix('^') {
+        s = rest;
+    }
+    // Peel off the `OF tail` if present — only the base interests
+    // us today.
+    let base = match s.split_once(" OF ") {
+        Some((head, _tail)) => head.trim(),
+        None => s.trim(),
+    };
+    map_annotation_to_hint(base)
 }
 
 #[cfg(test)]
