@@ -49,8 +49,13 @@ pub struct BindingInfo {
     pub name: String,
     pub hint: TypeHint,
     /// For `Object` bindings, the class name they were created from
-    /// (best effort — `NEW Foo()` produces `Some("Foo")`).
+    /// (best effort — `NEW Foo()` produces `Some("Foo")`; `LET b = a`
+    /// propagates `a`'s class).
     pub class_name: Option<String>,
+    /// True when `class_name` resolves to a class declared `MANAGED`.
+    /// Manifesto §5 — these instances are linear, cannot be aliased
+    /// or stored in containers; sema emits warnings on violations.
+    pub is_managed: bool,
     pub span: Span,
 }
 
@@ -314,15 +319,43 @@ impl Sema {
     }
 
     fn declare(&mut self, name: &str, hint: TypeHint, class_name: Option<String>, span: Span) {
+        let is_managed = class_name
+            .as_deref()
+            .map(|c| self.class_is_managed(c))
+            .unwrap_or(false);
         let info = BindingInfo {
             name: name.to_string(),
             hint,
             class_name: class_name.clone(),
+            is_managed,
             span,
         };
         self.binding_log.push(info.clone());
         if let Some(top) = self.scopes.last_mut() {
             top.insert(name.to_string(), info);
+        }
+    }
+
+    fn class_is_managed(&self, class: &str) -> bool {
+        self.classes.get(class).map(|c| c.managed).unwrap_or(false)
+    }
+
+    /// Best-effort: return true when an expression evaluates to a
+    /// MANAGED-class instance. Used by the manifesto §5 alias /
+    /// container-storage checks.
+    fn expr_is_managed(&self, e: &Expr) -> bool {
+        match e {
+            Expr::Ident { name, .. } => self
+                .lookup(name)
+                .map(|info| info.is_managed)
+                .unwrap_or(false),
+            Expr::New { class_name, .. } => self.class_is_managed(class_name),
+            // Method calls returning MANAGED, lane access, etc. could
+            // also be tracked once sema records method-return classes.
+            // For now they fall through to false — false negatives
+            // are preferable to false positives in a soft-warning
+            // pass.
+            _ => false,
         }
     }
 
@@ -545,16 +578,25 @@ impl Sema {
         for (name, expr) in &l.bindings {
             let mut hint = self.type_of(expr);
             // FLET overrides scalar inference to FLOAT when the literal
-            // evidence is otherwise neutral (manifesto §1). It does
-            // *not* override SIMD / list / object hints — `FLET p =
-            // PAIR(...)` would be unusual but the PAIR construction
-            // wins because the value really does live in a V-register.
+            // evidence is otherwise neutral (manifesto §1).
             if matches!(l.kind, LetKind::FLet)
                 && matches!(hint, TypeHint::Int | TypeHint::Word | TypeHint::Unknown)
             {
                 hint = TypeHint::Float;
             }
             let class_name = self.class_name_of(expr);
+            // Manifesto §5: a MANAGED instance cannot be aliased.
+            // A bare `NEW Foo()` is the original construction and is
+            // fine; anything else that resolves to a MANAGED value
+            // (an Ident referring to an existing MANAGED binding, a
+            // method call returning MANAGED, …) creates a second
+            // binding with shared ownership and is flagged.
+            if !matches!(expr, Expr::New { .. }) && self.expr_is_managed(expr) {
+                self.warn(
+                    "MANAGED instance cannot be aliased — this binding shares ownership with the source (manifesto §5)",
+                    expr.span(),
+                );
+            }
             self.declare(name, hint, class_name, l.span);
         }
     }
@@ -562,6 +604,12 @@ impl Sema {
     fn class_name_of(&self, expr: &Expr) -> Option<String> {
         match expr {
             Expr::New { class_name, .. } => Some(class_name.clone()),
+            // Propagate through identifiers so `LET b = a` carries
+            // `a`'s class — keeps the MANAGED-aliasing chain visible
+            // to the manifesto §5 checks below.
+            Expr::Ident { name, .. } => {
+                self.lookup(name).and_then(|info| info.class_name.clone())
+            }
             _ => None,
         }
     }
@@ -854,6 +902,16 @@ impl Sema {
             let target_hint = self.type_of(t);
             let value_hint = self.type_of(v);
             self.check_coercion(target_hint, value_hint, v.span());
+            // Manifesto §5: MANAGED instance assignment-aliasing.
+            // A fresh NEW is fine (transfer of ownership into the
+            // target slot). An existing MANAGED binding being copied
+            // to another binding is the alias case we want to catch.
+            if !matches!(v, Expr::New { .. }) && self.expr_is_managed(v) {
+                self.warn(
+                    "MANAGED instance cannot be aliased via assignment — RHS would share ownership with the source (manifesto §5)",
+                    v.span(),
+                );
+            }
         }
     }
 
@@ -1055,6 +1113,19 @@ impl Sema {
             Expr::TypedConstruct { kind, args, .. } => {
                 for a in args {
                     let _ = self.type_of(a);
+                    // Manifesto §5: MANAGED instances cannot be
+                    // stored in a container — their lifetime would
+                    // escape the original scope and the deterministic
+                    // RELEASE on scope-exit guarantee would be lost.
+                    if self.expr_is_managed(a) {
+                        self.warn(
+                            format!(
+                                "MANAGED instance stored in {} — ownership would escape the original scope (manifesto §5)",
+                                kind.as_str()
+                            ),
+                            a.span(),
+                        );
+                    }
                 }
                 match kind {
                     TypeConstructorKind::Vec => TypeHint::Vec,
@@ -1755,6 +1826,99 @@ mod tests {
         };
         // Callee is the ident `f`; sema looks up its binding → FUNCTION.
         assert_eq!(callee.hint(), TypeHint::Function);
+    }
+
+    // ─── MANAGED linear-type checks (manifesto §5) ─────────────
+
+    #[test]
+    fn fresh_new_managed_is_fine() {
+        let out = analyze_str(
+            "CLASS Window MANAGED $( DECL h $)\nLET S() BE { LET w = NEW Window }",
+        );
+        assert_eq!(warning_count_matching(&out, "MANAGED"), 0);
+    }
+
+    #[test]
+    fn aliasing_managed_via_let_warns() {
+        let out = analyze_str(
+            "CLASS Window MANAGED $( DECL h $)\nLET S() BE {\n LET a = NEW Window\n LET b = a\n}",
+        );
+        assert_eq!(warning_count_matching(&out, "cannot be aliased"), 1);
+    }
+
+    #[test]
+    fn aliasing_managed_via_assign_warns() {
+        let out = analyze_str(
+            "CLASS Window MANAGED $( DECL h $)\nLET S() BE {\n LET a = NEW Window\n LET b = ?\n b := a\n}",
+        );
+        assert_eq!(
+            warning_count_matching(&out, "aliased via assignment"),
+            1,
+            "expected aliased-via-assignment warning, got: {:?}",
+            out.warnings
+        );
+    }
+
+    #[test]
+    fn chained_alias_propagates_through_idents() {
+        // `c = b` should also warn — b carries the managed class
+        // through `class_name_of`'s Ident propagation.
+        let out = analyze_str(
+            "CLASS Window MANAGED $( DECL h $)\nLET S() BE {\n LET a = NEW Window\n LET b = a\n LET c = b\n}",
+        );
+        // Two LETs that copy, two warnings.
+        assert_eq!(warning_count_matching(&out, "cannot be aliased"), 2);
+    }
+
+    #[test]
+    fn managed_in_list_warns() {
+        let out = analyze_str(
+            "CLASS Window MANAGED $( DECL h $)\nLET S() BE {\n LET a = NEW Window\n LET xs = LIST(a)\n}",
+        );
+        assert_eq!(
+            warning_count_matching(&out, "stored in LIST"),
+            1,
+            "expected LIST-storage warning, got: {:?}",
+            out.warnings
+        );
+    }
+
+    #[test]
+    fn managed_in_pair_warns() {
+        let out = analyze_str(
+            "CLASS Window MANAGED $( DECL h $)\nLET S() BE {\n LET a = NEW Window\n LET p = PAIR(a, a)\n}",
+        );
+        // Two args, both aliased uses of `a` — two storage warnings,
+        // plus PAIR's intrinsic check stamps two warnings.
+        assert!(
+            warning_count_matching(&out, "stored in PAIR") >= 1,
+            "expected PAIR-storage warning, got: {:?}",
+            out.warnings
+        );
+    }
+
+    #[test]
+    fn ordinary_class_not_flagged_in_container() {
+        // Plain (non-MANAGED) classes can be stored anywhere — the
+        // GC handles their lifetime.
+        let out = analyze_str(
+            "CLASS Point $( DECL x $)\nLET S() BE {\n LET p = NEW Point\n LET xs = LIST(p)\n}",
+        );
+        assert_eq!(warning_count_matching(&out, "MANAGED"), 0);
+    }
+
+    #[test]
+    fn binding_info_records_is_managed_flag() {
+        let out = analyze_str(
+            "CLASS Window MANAGED $( DECL h $)\nLET w = NEW Window",
+        );
+        let w = out
+            .bindings
+            .iter()
+            .find(|b| b.name == "w")
+            .expect("missing w binding");
+        assert!(w.is_managed);
+        assert_eq!(w.class_name.as_deref(), Some("Window"));
     }
 
     #[test]
