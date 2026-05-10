@@ -1119,6 +1119,143 @@ mod tests {
         assert!(matches!(p.items[0], Decl::Function(_)));
     }
 
+    // ─── lists, list ops, conversion intrinsics ─────────────────
+
+    #[test]
+    fn parses_list_constructor() {
+        let p = parse_ok("LET xs = LIST(1, 2, 3)");
+        let Decl::Let(l) = &p.items[0] else {
+            panic!();
+        };
+        let Expr::TypedConstruct {
+            kind: TypeConstructorKind::List,
+            args,
+            ..
+        } = &l.bindings[0].1
+        else {
+            panic!();
+        };
+        assert_eq!(args.len(), 3);
+    }
+
+    #[test]
+    fn parses_manifestlist() {
+        let p = parse_ok("LET xs = MANIFESTLIST(1, 2, 3)");
+        let Decl::Let(l) = &p.items[0] else {
+            panic!();
+        };
+        assert!(matches!(
+            l.bindings[0].1,
+            Expr::TypedConstruct {
+                kind: TypeConstructorKind::ManifestList,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_heterogeneous_list() {
+        // Manifesto §5: lists may mix types.
+        let p = parse_ok("LET xs = LIST(1, \"two\", 3.0, ?)");
+        let Decl::Let(l) = &p.items[0] else {
+            panic!();
+        };
+        let Expr::TypedConstruct { args, .. } = &l.bindings[0].1 else {
+            panic!();
+        };
+        assert_eq!(args.len(), 4);
+        assert!(matches!(args[0], Expr::IntLit { .. }));
+        assert!(matches!(args[1], Expr::StringLit { .. }));
+        assert!(matches!(args[2], Expr::FloatLit { .. }));
+        assert!(matches!(args[3], Expr::Null { .. }));
+    }
+
+    #[test]
+    fn parses_hd_tl_rest_len() {
+        let p = parse_ok(
+            "LET h = HD xs\nLET t = TL xs\nLET r = REST xs\nLET n = LEN xs",
+        );
+        let ops: Vec<UnaryOp> = p
+            .items
+            .iter()
+            .map(|d| {
+                let Decl::Let(l) = d else { panic!() };
+                let Expr::Unary { op, .. } = l.bindings[0].1 else {
+                    panic!()
+                };
+                op
+            })
+            .collect();
+        assert_eq!(
+            ops,
+            vec![UnaryOp::Hd, UnaryOp::Tl, UnaryOp::Rest, UnaryOp::Len]
+        );
+    }
+
+    #[test]
+    fn parses_freevec_freelist() {
+        let p = parse_ok("LET S() BE { FREEVEC v\n FREELIST xs }");
+        let Decl::Routine(r) = &p.items[0] else {
+            panic!();
+        };
+        let Stmt::Block(b) = r.body.as_ref() else {
+            panic!();
+        };
+        let Stmt::Expr(Expr::Unary { op: o0, .. }) = &b.stmts[0] else {
+            panic!();
+        };
+        let Stmt::Expr(Expr::Unary { op: o1, .. }) = &b.stmts[1] else {
+            panic!();
+        };
+        assert_eq!(*o0, UnaryOp::FreeVec);
+        assert_eq!(*o1, UnaryOp::FreeList);
+    }
+
+    #[test]
+    fn parses_float_trunc_intrinsics() {
+        let p = parse_ok("LET a = FLOAT(42)\nLET b = TRUNC(3.14)");
+        // These parse as Call expressions whose callee is an Ident.
+        let Decl::Let(l0) = &p.items[0] else { panic!() };
+        let Decl::Let(l1) = &p.items[1] else { panic!() };
+        let Expr::Call {
+            callee: c0, args: a0, ..
+        } = &l0.bindings[0].1
+        else {
+            panic!();
+        };
+        let Expr::Call {
+            callee: c1, args: a1, ..
+        } = &l1.bindings[0].1
+        else {
+            panic!();
+        };
+        assert!(matches!(c0.as_ref(), Expr::Ident { name, .. } if name == "FLOAT"));
+        assert!(matches!(c1.as_ref(), Expr::Ident { name, .. } if name == "TRUNC"));
+        assert_eq!(a0.len(), 1);
+        assert_eq!(a1.len(), 1);
+    }
+
+    #[test]
+    fn hd_binds_tighter_than_arith() {
+        // HD xs + 1 parses as (HD xs) + 1
+        let p = parse_ok("LET x = HD xs + 1");
+        let Decl::Let(l) = &p.items[0] else {
+            panic!();
+        };
+        let Expr::Binary {
+            op: BinaryOp::Add,
+            lhs,
+            ..
+        } = &l.bindings[0].1
+        else {
+            panic!();
+        };
+        assert!(matches!(
+            lhs.as_ref(),
+            Expr::Unary { op: UnaryOp::Hd, .. }
+        ));
+    }
+
     #[test]
     fn dump_ast_smoke() {
         let p = parse_ok("LET START() BE { IF x > 0 THEN WRITES(\"pos*N\") }");

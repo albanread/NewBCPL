@@ -864,6 +864,33 @@ impl Parser {
                 span,
             });
         }
+
+        // Word-form unary operators: HD x, TL x, REST x, LEN x,
+        // FREEVEC x, FREELIST x. All take a single operand and bind
+        // tighter than any binary op, in line with the BCPL convention.
+        let unary_kw = match self.peek().lexeme.as_str() {
+            _ if self.peek().kind != TokenKind::Keyword => None,
+            "HD" => Some(UnaryOp::Hd),
+            "TL" => Some(UnaryOp::Tl),
+            "REST" => Some(UnaryOp::Rest),
+            "LEN" => Some(UnaryOp::Len),
+            "FREEVEC" => Some(UnaryOp::FreeVec),
+            "FREELIST" => Some(UnaryOp::FreeList),
+            _ => None,
+        };
+        if let Some(op) = unary_kw {
+            let kw = self.eat();
+            let operand = self.parse_unary()?;
+            let span = SourceSpan {
+                start: kw.span.start,
+                end: operand.span().end,
+            };
+            return Ok(Expr::Unary {
+                op,
+                operand: Box::new(operand),
+                span,
+            });
+        }
         if self.check_sym("!") {
             let kw = self.eat();
             let operand = self.parse_unary()?;
@@ -1106,10 +1133,11 @@ impl Parser {
             TokenKind::Keyword
                 if matches!(
                     tok.lexeme.as_str(),
-                    "PAIR" | "FPAIR" | "QUAD" | "FQUAD" | "OCT" | "FOCT" | "TABLE" | "FTABLE"
+                    "PAIR" | "FPAIR" | "QUAD" | "FQUAD" | "OCT" | "FOCT"
+                    | "TABLE" | "FTABLE" | "LIST" | "MANIFESTLIST"
                 ) =>
             {
-                // `PAIR(a, b)` and friends — paren'd, comma-separated args.
+                // `PAIR(a, b)`, `LIST(a, b, c)`, etc. — paren'd args.
                 self.pos += 1;
                 let kind = match tok.lexeme.as_str() {
                     "PAIR" => TypeConstructorKind::Pair,
@@ -1120,6 +1148,8 @@ impl Parser {
                     "FOCT" => TypeConstructorKind::FOct,
                     "TABLE" => TypeConstructorKind::Table,
                     "FTABLE" => TypeConstructorKind::FTable,
+                    "LIST" => TypeConstructorKind::List,
+                    "MANIFESTLIST" => TypeConstructorKind::ManifestList,
                     _ => unreachable!(),
                 };
                 self.expect_sym("(")?;
@@ -1142,6 +1172,22 @@ impl Parser {
                     end: close.span.end,
                 };
                 Ok(Expr::TypedConstruct { kind, args, span })
+            }
+            // Intrinsic conversion functions written as keywords:
+            // FLOAT(n), TRUNC(f), FIX(f), FSQRT(f), ENTIER(f). Treat
+            // them as if the keyword were an identifier so the postfix
+            // call handling parses `(args)` naturally.
+            TokenKind::Keyword
+                if matches!(
+                    tok.lexeme.as_str(),
+                    "FLOAT" | "TRUNC" | "FIX" | "FSQRT" | "ENTIER"
+                ) =>
+            {
+                self.pos += 1;
+                Ok(Expr::Ident {
+                    name: tok.lexeme,
+                    span: tok.span,
+                })
             }
             TokenKind::Symbol if tok.lexeme == "?" => {
                 self.pos += 1;

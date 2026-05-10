@@ -218,6 +218,11 @@ pub enum TypeConstructorKind {
     Oct,
     /// `FOCT(a..h)` — `<8 x double>`.
     FOct,
+    /// `LIST(e1, e2, …)` — heap-allocated, GC-managed sequence; can mix
+    /// types (heterogeneous via per-atom tags) per `docs/manifesto.md`.
+    List,
+    /// `MANIFESTLIST(e1, e2, …)` — read-only literal-list constant.
+    ManifestList,
 }
 
 impl TypeConstructorKind {
@@ -233,6 +238,8 @@ impl TypeConstructorKind {
             TypeConstructorKind::FQuad => "FQUAD",
             TypeConstructorKind::Oct => "OCT",
             TypeConstructorKind::FOct => "FOCT",
+            TypeConstructorKind::List => "LIST",
+            TypeConstructorKind::ManifestList => "MANIFESTLIST",
         }
     }
 }
@@ -249,6 +256,18 @@ pub enum UnaryOp {
     AddressOf,
     /// `%x` — character-pointer dereference (load the byte at address x).
     CharIndirection,
+    /// `HD x` — first element / head of a list.
+    Hd,
+    /// `TL x` — destructive tail of a list.
+    Tl,
+    /// `REST x` — non-destructive tail of a list.
+    Rest,
+    /// `LEN x` — number of elements in a list / vector / string.
+    Len,
+    /// `FREEVEC x` — free a heap-allocated vector.
+    FreeVec,
+    /// `FREELIST x` — free a list.
+    FreeList,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -367,6 +386,12 @@ impl UnaryOp {
             UnaryOp::Indirection => "!",
             UnaryOp::AddressOf => "@",
             UnaryOp::CharIndirection => "%",
+            UnaryOp::Hd => "HD",
+            UnaryOp::Tl => "TL",
+            UnaryOp::Rest => "REST",
+            UnaryOp::Len => "LEN",
+            UnaryOp::FreeVec => "FREEVEC",
+            UnaryOp::FreeList => "FREELIST",
         }
     }
 }
