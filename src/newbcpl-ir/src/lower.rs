@@ -15,7 +15,8 @@
 use std::collections::HashMap;
 
 use newbcpl_parser::{
-    BinaryOp, Block, Decl, Expr, FunctionDecl, LetDecl, Program, RoutineDecl, Stmt, UnaryOp,
+    BinaryOp, Block, Decl, Expr, FunctionDecl, LetDecl, Program, RoutineDecl, Stmt,
+    TypeConstructorKind, UnaryOp,
 };
 use newbcpl_sema::{ClassLayout, SemaOutput, TypeHint};
 
@@ -768,11 +769,31 @@ impl<'a> Lowerer<'a> {
             Expr::New {
                 class_name, args, ..
             } => self.lower_new(class_name, args),
+            Expr::TypedConstruct {
+                kind, args, ..
+            } => self.lower_typed_construct(*kind, args, e.hint()),
             // Forms not yet lowered — return a typed null/zero so
             // downstream uses don't crash. Sema warnings already
             // fired for whatever real handling these need.
             _ => Value::Const(Const::Null),
         }
+    }
+
+    fn lower_typed_construct(
+        &mut self,
+        kind: TypeConstructorKind,
+        args: &[Expr],
+        hint: TypeHint,
+    ) -> Value {
+        let arg_values: Vec<Value> = args.iter().map(|a| self.lower_expr(a)).collect();
+        let dst = self.b().alloc_value();
+        self.b().emit(Instr::TypedConstruct {
+            dst,
+            kind: typed_kind(kind),
+            args: arg_values,
+            hint,
+        });
+        Value::Local(dst)
     }
 
     fn lower_new(&mut self, class_name: &str, args: &[Expr]) -> Value {
@@ -799,6 +820,19 @@ impl<'a> Lowerer<'a> {
     }
 
     fn lower_binary(&mut self, op: BinaryOp, lhs: &Expr, rhs: &Expr, hint: TypeHint) -> Value {
+        // SIMD lane access `pair.|n|`.
+        if matches!(op, BinaryOp::LaneAccess) {
+            let vector = self.lower_expr(lhs);
+            let lane = self.lower_expr(rhs);
+            let dst = self.b().alloc_value();
+            self.b().emit(Instr::LaneExtract {
+                dst,
+                vector,
+                lane,
+                hint,
+            });
+            return Value::Local(dst);
+        }
         // Subscript family: `v ! i` / `v % i` / `v .% i` lower to
         // GEP + IndirectLoad. The element stride and result hint
         // depend on the subscript variant.
@@ -1131,6 +1165,24 @@ fn binop_to_ir(op: BinaryOp, lhs: TypeHint, rhs: TypeHint) -> Option<IrBinOp> {
             return None;
         }
     })
+}
+
+fn typed_kind(k: TypeConstructorKind) -> crate::ir::TypedKind {
+    use crate::ir::TypedKind;
+    match k {
+        TypeConstructorKind::Vec => TypedKind::Vec,
+        TypeConstructorKind::FVec => TypedKind::FVec,
+        TypeConstructorKind::Table => TypedKind::Table,
+        TypeConstructorKind::FTable => TypedKind::FTable,
+        TypeConstructorKind::Pair => TypedKind::Pair,
+        TypeConstructorKind::FPair => TypedKind::FPair,
+        TypeConstructorKind::Quad => TypedKind::Quad,
+        TypeConstructorKind::FQuad => TypedKind::FQuad,
+        TypeConstructorKind::Oct => TypedKind::Oct,
+        TypeConstructorKind::FOct => TypedKind::FOct,
+        TypeConstructorKind::List => TypedKind::List,
+        TypeConstructorKind::ManifestList => TypedKind::ManifestList,
+    }
 }
 
 /// Map a subscript-family `BinaryOp` to its `(element_bytes, load_hint)`

@@ -613,6 +613,117 @@ mod tests {
         assert!(has_istore, "expected IndirectStore for vec[i] := value");
     }
 
+    // ─── typed constructors (VEC / SIMD / LIST) ─────────────────
+
+    use ir::TypedKind;
+
+    #[test]
+    fn vec_lowers_to_typed_construct() {
+        let m = lower_source("LET S() BE { LET v = VEC 100 }");
+        let s = function(&m, "S");
+        let entry = &s.blocks[0];
+        let has_construct = entry.instrs.iter().any(|i| {
+            matches!(
+                i,
+                Instr::TypedConstruct {
+                    kind: TypedKind::Vec,
+                    ..
+                }
+            )
+        });
+        assert!(has_construct, "expected TypedConstruct VEC");
+    }
+
+    #[test]
+    fn pair_lowers_with_two_args() {
+        let m = lower_source("LET S() BE { LET p = PAIR(1, 2) }");
+        let s = function(&m, "S");
+        let entry = &s.blocks[0];
+        let has_pair = entry.instrs.iter().any(|i| {
+            matches!(
+                i,
+                Instr::TypedConstruct {
+                    kind: TypedKind::Pair,
+                    args,
+                    ..
+                } if args.len() == 2
+            )
+        });
+        assert!(has_pair, "expected TypedConstruct PAIR with 2 args");
+    }
+
+    #[test]
+    fn fpair_carries_float_hint() {
+        let m = lower_source("LET S() BE { LET p = FPAIR(1.0, 2.0) }");
+        let s = function(&m, "S");
+        let entry = &s.blocks[0];
+        let has_fpair = entry.instrs.iter().any(|i| {
+            matches!(
+                i,
+                Instr::TypedConstruct {
+                    kind: TypedKind::FPair,
+                    hint: TypeHint::FPair,
+                    ..
+                }
+            )
+        });
+        assert!(has_fpair, "expected FPAIR with FPair hint");
+    }
+
+    #[test]
+    fn list_constructor_lowers() {
+        let m = lower_source("LET S() BE { LET xs = LIST(1, 2, 3) }");
+        let s = function(&m, "S");
+        let entry = &s.blocks[0];
+        let has_list = entry.instrs.iter().any(|i| {
+            matches!(
+                i,
+                Instr::TypedConstruct {
+                    kind: TypedKind::List,
+                    args,
+                    ..
+                } if args.len() == 3
+            )
+        });
+        assert!(has_list, "expected TypedConstruct LIST with 3 args");
+    }
+
+    #[test]
+    fn quad_oct_lower_correctly() {
+        let m = lower_source(
+            "LET S() BE {\n LET q = QUAD(1, 2, 3, 4)\n LET o = OCT(1, 2, 3, 4, 5, 6, 7, 8)\n}",
+        );
+        let s = function(&m, "S");
+        let entry = &s.blocks[0];
+        let has_quad = entry
+            .instrs
+            .iter()
+            .any(|i| matches!(i, Instr::TypedConstruct { kind: TypedKind::Quad, .. }));
+        let has_oct = entry
+            .instrs
+            .iter()
+            .any(|i| matches!(i, Instr::TypedConstruct { kind: TypedKind::Oct, .. }));
+        assert!(has_quad, "expected QUAD construct");
+        assert!(has_oct, "expected OCT construct");
+    }
+
+    #[test]
+    fn lane_access_lowers_to_lane_extract() {
+        let m = lower_source("LET S() BE { LET p = FPAIR(1.0, 2.0)\n LET x = p.|0| }");
+        let s = function(&m, "S");
+        let entry = &s.blocks[0];
+        let has_lane = entry.instrs.iter().any(|i| {
+            matches!(
+                i,
+                Instr::LaneExtract {
+                    hint: TypeHint::Float,
+                    ..
+                }
+            )
+        });
+        assert!(has_lane, "expected LaneExtract with FLOAT hint");
+    }
+
     #[test]
     fn dump_smoke() {
         let m = lower_source("LET S() BE { LET y = 1 + 2 }");

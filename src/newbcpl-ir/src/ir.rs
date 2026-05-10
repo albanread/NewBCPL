@@ -180,6 +180,64 @@ pub enum Instr {
         index: Value,
         element_bytes: usize,
     },
+    /// Typed constructor — `VEC k`, `FVEC k`, `LIST(a, b, c)`,
+    /// `PAIR(a, b)`, `TABLE(...)`, etc. Codegen specialises on
+    /// `kind`: scalar SIMD types stay in V-registers, vectors and
+    /// lists call into the runtime to allocate. The IR keeps the
+    /// abstract shape — kind + args — so the same node lowers to
+    /// the right runtime call.
+    TypedConstruct {
+        dst: ValueId,
+        kind: TypedKind,
+        args: Vec<Value>,
+        hint: TypeHint,
+    },
+    /// `pair.|n|` — extract a single lane from a SIMD vector. The
+    /// lane index is a runtime value (codegen will emit
+    /// `extractelement` directly when it's a constant).
+    LaneExtract {
+        dst: ValueId,
+        vector: Value,
+        lane: Value,
+        hint: TypeHint,
+    },
+}
+
+/// IR-level constructor kinds, mirroring the parser's
+/// `TypeConstructorKind` 1:1 so codegen sees the same vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypedKind {
+    Vec,
+    FVec,
+    Table,
+    FTable,
+    Pair,
+    FPair,
+    Quad,
+    FQuad,
+    Oct,
+    FOct,
+    List,
+    ManifestList,
+}
+
+impl TypedKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TypedKind::Vec => "VEC",
+            TypedKind::FVec => "FVEC",
+            TypedKind::Table => "TABLE",
+            TypedKind::FTable => "FTABLE",
+            TypedKind::Pair => "PAIR",
+            TypedKind::FPair => "FPAIR",
+            TypedKind::Quad => "QUAD",
+            TypedKind::FQuad => "FQUAD",
+            TypedKind::Oct => "OCT",
+            TypedKind::FOct => "FOCT",
+            TypedKind::List => "LIST",
+            TypedKind::ManifestList => "MANIFESTLIST",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

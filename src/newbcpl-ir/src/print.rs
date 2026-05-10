@@ -180,6 +180,37 @@ fn render_instr(i: &Instr) -> String {
             render_value(index),
             element_bytes
         ),
+        Instr::TypedConstruct {
+            dst,
+            kind,
+            args,
+            hint,
+        } => {
+            let args_str = args
+                .iter()
+                .map(render_value)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "%{} = construct {} ({}) : {}",
+                dst.0,
+                kind.as_str(),
+                args_str,
+                hint.as_str()
+            )
+        }
+        Instr::LaneExtract {
+            dst,
+            vector,
+            lane,
+            hint,
+        } => format!(
+            "%{} = lane {}[{}] : {}",
+            dst.0,
+            render_value(vector),
+            render_value(lane),
+            hint.as_str()
+        ),
         Instr::MethodCall {
             dst,
             receiver,
