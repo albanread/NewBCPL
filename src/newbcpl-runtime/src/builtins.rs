@@ -787,3 +787,257 @@ pub fn builtin_addresses() -> &'static [Builtin] {
 pub fn is_builtin(name: &str) -> bool {
     builtin_addresses().iter().any(|b| b.name == name)
 }
+
+// ─── heap-manager exercise tests ─────────────────────────────────
+//
+// Ported in spirit from `reference/tests/cpp_tests/test_heap_manager.cpp`.
+// The reference uses a singleton C++ `HeapManager` with typed allocators
+// (`allocVec`, `allocString`, `allocObject`); ours is a precise
+// mark-sweep GC with `TypeDesc`-tagged blocks. We exercise the same
+// invariants: allocations are non-null, aligned, zero-initialised,
+// hold their payload across read/write, and the heap counters advance.
+#[cfg(test)]
+mod heap_tests {
+    use super::*;
+    use crate::gc;
+
+    /// Build a `TypeDesc` for a `size`-byte data block. Allocated
+    /// once via `Box::leak` so its address is stable across the
+    /// test (the GC stamps every block's tag with this pointer).
+    /// We include the `ptroffs` sentinel (-1) so the GC's pointer
+    /// iterator stops immediately — these test blocks contain no
+    /// traced fields.
+    fn leak_typedesc(size: isize) -> *const gc::TypeDesc {
+        // Layout: TypeDesc fields + one i64 sentinel.
+        #[repr(C)]
+        struct TypeDescPlusSentinel {
+            size: isize,
+            module: *const u8,
+            finalizer: *const u8,
+            base: *const u8,
+            vtable: *const u8,
+            vtable_len: u64,
+            name: *const u32,
+            ptroffs_sentinel: isize,
+        }
+        let boxed = Box::new(TypeDescPlusSentinel {
+            size,
+            module: std::ptr::null(),
+            finalizer: std::ptr::null(),
+            base: std::ptr::null(),
+            vtable: std::ptr::null(),
+            vtable_len: 0,
+            name: std::ptr::null(),
+            ptroffs_sentinel: -1,
+        });
+        Box::leak(boxed) as *const _ as *const gc::TypeDesc
+    }
+
+    #[test]
+    fn vector_allocation_writes_and_reads_back() {
+        // Mirrors `test_vector_allocation` — allocate 10 words,
+        // fill with a pattern, verify integrity. Our convention
+        // puts the length one word *before* the data pointer, so
+        // we also confirm `__newbcpl_len` returns the right value.
+        let n: i64 = 10;
+        let v = unsafe { GETVEC(n) };
+        assert!(!v.is_null(), "GETVEC must not return null");
+        assert_eq!(
+            v as usize % std::mem::align_of::<i64>(),
+            0,
+            "data pointer must be 8-byte aligned"
+        );
+        for i in 0..n {
+            unsafe { *v.offset(i as isize) = i * 2 };
+        }
+        for i in 0..n {
+            assert_eq!(
+                unsafe { *v.offset(i as isize) },
+                i * 2,
+                "write/read mismatch at slot {i}"
+            );
+        }
+        assert_eq!(
+            unsafe { __newbcpl_len(v) },
+            n,
+            "length header must match the requested word count"
+        );
+    }
+
+    #[test]
+    fn object_allocation_is_zero_initialised_and_holds_data() {
+        // Mirrors `test_object_allocation`: a fresh GC block of
+        // 64 bytes should arrive zeroed, accept arbitrary writes,
+        // and return them unchanged.
+        let td = leak_typedesc(64);
+        let raw = unsafe { gc::__newbcpl_new_rec(td) };
+        assert!(!raw.is_null(), "__newbcpl_new_rec must not return null");
+        let bytes = unsafe { std::slice::from_raw_parts(raw, 64) };
+        assert!(
+            bytes.iter().all(|&b| b == 0),
+            "GC block must arrive zero-initialised"
+        );
+        let words = raw as *mut u64;
+        unsafe {
+            *words.add(0) = 0xDEAD_BEEF_CAFE_BABE;
+            *words.add(1) = 42;
+        }
+        assert_eq!(
+            unsafe { *words.add(0) },
+            0xDEAD_BEEF_CAFE_BABE,
+            "wide write must persist"
+        );
+        assert_eq!(
+            unsafe { *words.add(1) },
+            42,
+            "second-slot write must persist"
+        );
+    }
+
+    #[test]
+    fn many_allocations_advance_heap_counters() {
+        // Mirrors the throughput-style tests: allocating N blocks
+        // moves the global block counter forward by at least N
+        // (the counter is monotonic over the process lifetime;
+        // other tests may add to it concurrently, so we only
+        // assert ≥).
+        let before = gc::snapshot();
+        let baseline_blocks = before
+            .mutators
+            .iter()
+            .map(|m| m.alloc_blocks_lifetime)
+            .sum::<u64>();
+        let baseline_bytes = before
+            .mutators
+            .iter()
+            .map(|m| m.alloc_bytes_lifetime)
+            .sum::<u64>();
+        let td = leak_typedesc(48);
+        const N: u64 = 64;
+        for _ in 0..N {
+            let p = unsafe { gc::__newbcpl_new_rec(td) };
+            assert!(!p.is_null(), "out-of-memory in test harness");
+            // Touch the block so a no-op optimiser can't elide it.
+            unsafe { *(p as *mut u64) = 1 };
+        }
+        let after = gc::snapshot();
+        let now_blocks = after
+            .mutators
+            .iter()
+            .map(|m| m.alloc_blocks_lifetime)
+            .sum::<u64>();
+        let now_bytes = after
+            .mutators
+            .iter()
+            .map(|m| m.alloc_bytes_lifetime)
+            .sum::<u64>();
+        assert!(
+            now_blocks >= baseline_blocks + N,
+            "heap block counter did not advance: {baseline_blocks} → {now_blocks}"
+        );
+        assert!(
+            now_bytes > baseline_bytes,
+            "heap byte counter did not advance: {baseline_bytes} → {now_bytes}"
+        );
+    }
+
+    #[test]
+    fn list_append_grows_length_and_preserves_value() {
+        // Spirit of the reference's list-data tests: a fresh
+        // `ListHeader` starts empty; each `APND` bumps the
+        // length by 1 and links a new `ATOM_INT` atom; `HD`
+        // returns the first appended value.
+        let hdr = unsafe { __newbcpl_list_new_empty() };
+        assert!(!hdr.is_null());
+        assert_eq!(unsafe { __newbcpl_list_len(hdr) }, 0);
+        unsafe {
+            APND(hdr, 10);
+            APND(hdr, 20);
+            APND(hdr, 30);
+        }
+        assert_eq!(unsafe { __newbcpl_list_len(hdr) }, 3);
+        assert_eq!(unsafe { __newbcpl_list_hd(hdr) }, 10);
+        // Walk the chain by hand to confirm node ordering.
+        let mut cur = unsafe { (*hdr).head };
+        let expected = [10i64, 20, 30];
+        for want in &expected {
+            assert!(!cur.is_null(), "chain ended too soon");
+            assert_eq!(unsafe { (*cur).value }, *want);
+            assert_eq!(unsafe { (*cur).type_tag }, ATOM_INT);
+            cur = unsafe { (*cur).next };
+        }
+        assert!(cur.is_null(), "chain longer than appended count");
+    }
+
+    #[test]
+    fn list_tl_shares_tail_nodes() {
+        // `TL` returns a new header that re-uses the existing
+        // atom chain — sharing is intentional and O(1). After
+        // `TL`, `HD` of the result is the original list's second
+        // element.
+        let hdr = unsafe { __newbcpl_list_new_empty() };
+        unsafe {
+            APND(hdr, 100);
+            APND(hdr, 200);
+            APND(hdr, 300);
+        }
+        let tail = unsafe { __newbcpl_list_tl(hdr) };
+        assert!(!tail.is_null());
+        assert_eq!(unsafe { __newbcpl_list_len(tail) }, 2);
+        assert_eq!(unsafe { __newbcpl_list_hd(tail) }, 200);
+        // Original is unmodified.
+        assert_eq!(unsafe { __newbcpl_list_len(hdr) }, 3);
+        assert_eq!(unsafe { __newbcpl_list_hd(hdr) }, 100);
+    }
+
+    #[test]
+    fn list_concat_produces_combined_chain() {
+        // `CONCAT` makes a fresh header whose atoms copy from
+        // `a` and then `b`. Both inputs survive unchanged.
+        let a = unsafe { __newbcpl_list_new_empty() };
+        unsafe {
+            APND(a, 1);
+            APND(a, 2);
+        }
+        let b = unsafe { __newbcpl_list_new_empty() };
+        unsafe {
+            APND(b, 3);
+            APND(b, 4);
+            APND(b, 5);
+        }
+        let c = unsafe { CONCAT(a, b) };
+        assert_eq!(unsafe { __newbcpl_list_len(c) }, 5);
+        let mut cur = unsafe { (*c).head };
+        for want in 1..=5i64 {
+            assert_eq!(unsafe { (*cur).value }, want);
+            cur = unsafe { (*cur).next };
+        }
+        assert_eq!(unsafe { __newbcpl_list_len(a) }, 2);
+        assert_eq!(unsafe { __newbcpl_list_len(b) }, 3);
+    }
+
+    #[test]
+    fn float_appends_round_trip_through_atom_value() {
+        // `APND_FLOAT` reinterprets the double's bits into the
+        // atom's `i64` value slot. Reading them back as `f64`
+        // bits must restore the original number — confirms the
+        // bit-cast direction and atom-tag bookkeeping.
+        let hdr = unsafe { __newbcpl_list_new_empty() };
+        unsafe {
+            APND_FLOAT(hdr, 3.5);
+            APND_FLOAT(hdr, -2.25);
+        }
+        let head = unsafe { (*hdr).head };
+        let second = unsafe { (*head).next };
+        assert_eq!(unsafe { (*head).type_tag }, ATOM_FLOAT);
+        assert_eq!(unsafe { (*second).type_tag }, ATOM_FLOAT);
+        assert_eq!(
+            f64::from_bits(unsafe { (*head).value } as u64),
+            3.5,
+        );
+        assert_eq!(
+            f64::from_bits(unsafe { (*second).value } as u64),
+            -2.25,
+        );
+    }
+}
