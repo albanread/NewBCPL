@@ -28,21 +28,24 @@ use newbcpl_ir::{
     BasicBlock as IrBlock, BlockId, Const, Function as IrFunction, Instr, IrBinOp, IrUnOp,
     Module as IrModule, Param, Terminator, TypedKind, Value, ValueId,
 };
-use newbcpl_sema::TypeHint;
+use newbcpl_sema::{ClassLayout, TypeHint};
 
 /// Top-level entry: produce a finalised LLVM module from our typed
 /// IR. The caller owns the `Context`; the returned `LlvmModule`
 /// borrows from it.
 pub fn emit<'ctx>(context: &'ctx Context, ir: &IrModule) -> LlvmModule<'ctx> {
-    let mut emitter = Emitter::new(context, &ir.name);
+    let mut emitter = Emitter::new(context, &ir.name, &ir.layouts);
     emitter.emit_module(ir);
     emitter.module
 }
 
-struct Emitter<'ctx> {
+struct Emitter<'ctx, 'l> {
     context: &'ctx Context,
     module: LlvmModule<'ctx>,
     builder: Builder<'ctx>,
+    /// Class layouts from sema. Indexed by class name when emitting
+    /// New / FieldLoad / FieldStore / MethodCall.
+    layouts: &'l [ClassLayout],
 
     /// Each IR ValueId maps to a concrete LLVM value. For an Alloca
     /// it's a `PointerValue`; for arithmetic results it's an
@@ -62,19 +65,24 @@ struct Emitter<'ctx> {
     string_counter: u32,
 }
 
-impl<'ctx> Emitter<'ctx> {
-    fn new(context: &'ctx Context, name: &str) -> Self {
+impl<'ctx, 'l> Emitter<'ctx, 'l> {
+    fn new(context: &'ctx Context, name: &str, layouts: &'l [ClassLayout]) -> Self {
         let module = context.create_module(name);
         Self {
             context,
             module,
             builder: context.create_builder(),
+            layouts,
             value_map: HashMap::new(),
             block_map: HashMap::new(),
             by_name: HashMap::new(),
             string_pool: HashMap::new(),
             string_counter: 0,
         }
+    }
+
+    fn lookup_layout(&self, class_name: &str) -> Option<&'l ClassLayout> {
+        self.layouts.iter().find(|l| l.class_name == class_name)
     }
 
     fn emit_module(&mut self, ir: &IrModule) {
@@ -351,12 +359,153 @@ impl<'ctx> Emitter<'ctx> {
                 let result = self.emit_typed_construct(*kind, args);
                 self.value_map.insert(*dst, result);
             }
-            // Class-instance forms — New, FieldLoad, FieldStore,
-            // MethodCall — need TypeDesc plumbing and are tracked
-            // separately. Emitting nothing here means uses of the
-            // result land at panic time via `value_map.lookup`, which
-            // is OK for current tests since none exercise classes.
-            _ => {}
+            Instr::New {
+                dst,
+                class_name,
+                args,
+            } => {
+                let instance = self.emit_new(class_name, args);
+                self.value_map.insert(*dst, instance);
+            }
+            Instr::FieldLoad {
+                dst,
+                base,
+                byte_offset,
+                hint,
+            } => {
+                let base_v = self.lower_value(base);
+                let base_ptr = self.as_pointer(base_v);
+                let off = self
+                    .context
+                    .i64_type()
+                    .const_int(*byte_offset as u64, false);
+                let i8_t = self.context.i8_type();
+                let field_ptr = unsafe {
+                    self.builder
+                        .build_gep(i8_t, base_ptr, &[off], "field.addr")
+                        .expect("gep field")
+                };
+                let ty = self.basic_type_for(*hint);
+                let loaded = self
+                    .builder
+                    .build_load(ty, field_ptr, "field.load")
+                    .expect("load field");
+                self.value_map.insert(*dst, loaded);
+            }
+            Instr::FieldStore {
+                base,
+                byte_offset,
+                value,
+            } => {
+                let base_v = self.lower_value(base);
+                let base_ptr = self.as_pointer(base_v);
+                let off = self
+                    .context
+                    .i64_type()
+                    .const_int(*byte_offset as u64, false);
+                let i8_t = self.context.i8_type();
+                let field_ptr = unsafe {
+                    self.builder
+                        .build_gep(i8_t, base_ptr, &[off], "field.addr")
+                        .expect("gep field")
+                };
+                let v = self.lower_value(value);
+                self.builder
+                    .build_store(field_ptr, v)
+                    .expect("store field");
+            }
+            // MethodCall is deferred until we wire vtable emission
+            // (each class needs its vtable global emitted with
+            // pointers to its methods, and indirect calls through
+            // the vtable slot). Falls through to no-op for now.
+            Instr::MethodCall { .. } => {}
+        }
+    }
+
+    /// `NEW Class(args)` lowers to a stack-allocated `[size x i8]`
+    /// instance plus, when present, an explicit call to the class's
+    /// `CREATE` method with the receiver as the first argument.
+    ///
+    /// This is a temporary shape — the GC-aware implementation will
+    /// route through `__newbcpl_new_rec(typedesc)` once TypeDesc
+    /// emission is in. Stack-allocating an instance lets field
+    /// load / store work today against the same byte offsets sema's
+    /// layout pass produced.
+    fn emit_new(&mut self, class_name: &str, args: &[Value]) -> BasicValueEnum<'ctx> {
+        let size = self
+            .lookup_layout(class_name)
+            .map(|l| l.instance_size)
+            .unwrap_or(8);
+        let i8_t = self.context.i8_type();
+        let arr_t = i8_t.array_type(size as u32);
+        let alloca = self
+            .builder
+            .build_alloca(arr_t, &format!("obj.{class_name}"))
+            .expect("alloca obj");
+        // Zero the whole instance so default fields are reproducible.
+        self.zero_memory(alloca, size);
+
+        // If the class declares a CREATE method, emit a call to it
+        // with the receiver as the implicit first arg. The method
+        // is referenced by its undecorated name; the linker /
+        // intra-module call will resolve to the right function.
+        // (Multiple classes with a CREATE will collide at the
+        // symbol level — full method-name mangling lands with the
+        // vtable / TypeDesc work.)
+        let creates_called = self
+            .lookup_layout(class_name)
+            .and_then(|l| {
+                l.vtable
+                    .iter()
+                    .find(|v| v.method_name == "CREATE" && v.defining_class.is_some())
+            })
+            .is_some();
+        if creates_called {
+            let create_fn = self.declare_extern("CREATE", args.len() + 1);
+            let mut call_args: Vec<BasicMetadataValueEnum> =
+                Vec::with_capacity(args.len() + 1);
+            call_args.push(alloca.into());
+            for a in args {
+                call_args.push(self.lower_value(a).into());
+            }
+            self.builder
+                .build_call(create_fn, &call_args, "create")
+                .expect("call CREATE");
+        }
+        alloca.into()
+    }
+
+    fn zero_memory(&self, ptr: PointerValue<'ctx>, bytes: usize) {
+        // Fill with zero via a memset intrinsic. We declare it on
+        // demand to avoid hard-coding the symbol.
+        let i8_t = self.context.i8_type();
+        let i64_t = self.context.i64_type();
+        let ptr_t = self.context.ptr_type(AddressSpace::default());
+        let memset = self.module.get_function("llvm.memset.p0.i64").or_else(|| {
+            let bool_t = self.context.bool_type();
+            let fn_type = self.context.void_type().fn_type(
+                &[ptr_t.into(), i8_t.into(), i64_t.into(), bool_t.into()],
+                false,
+            );
+            Some(
+                self.module
+                    .add_function("llvm.memset.p0.i64", fn_type, None),
+            )
+        });
+        if let Some(memset_fn) = memset {
+            let zero_byte = i8_t.const_zero();
+            let len = i64_t.const_int(bytes as u64, false);
+            let is_volatile = self.context.bool_type().const_zero();
+            let _ = self.builder.build_call(
+                memset_fn,
+                &[
+                    ptr.into(),
+                    zero_byte.into(),
+                    len.into(),
+                    is_volatile.into(),
+                ],
+                "memset",
+            );
         }
     }
 

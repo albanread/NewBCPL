@@ -269,6 +269,52 @@ mod tests {
         assert!(text.contains("store i64 42"));
     }
 
+    // ─── classes: NEW + field load/store ────────────────────────
+
+    #[test]
+    fn new_class_allocates_instance() {
+        let text = emit_text(
+            "CLASS Point $( DECL x, y $)\nLET S() BE { LET p = NEW Point }",
+        );
+        // Stack-alloca placeholder: [size x i8] for the instance.
+        // Class Point has size 24 (vtable header + 2 word fields).
+        assert!(text.contains("alloca [24 x i8]"));
+    }
+
+    #[test]
+    fn field_load_uses_byte_offset_from_layout() {
+        let text = emit_text(
+            "CLASS Point $( DECL x, y $)\nLET S() BE { LET p = NEW Point\n LET v = p.y }",
+        );
+        // Field y is at offset 16 (vtable header + 8 for x).
+        assert!(text.contains("getelementptr"));
+        assert!(text.contains("i64 16"));
+        assert!(text.contains("load i64"));
+    }
+
+    #[test]
+    fn field_store_emits_gep_plus_store() {
+        let text = emit_text(
+            "CLASS Point $( DECL x, y $)\nLET S() BE { LET p = NEW Point\n p.x := 99 }",
+        );
+        assert!(text.contains("getelementptr"));
+        // x is the first field at offset 8.
+        assert!(text.contains("i64 8"));
+        assert!(text.contains("store i64 99"));
+    }
+
+    #[test]
+    fn class_with_create_emits_call() {
+        let text = emit_text(
+            "CLASS Foo $(\n  DECL x\n  ROUTINE CREATE(ix) BE $( SELF.x := ix $)\n$)\nLET S() BE { LET f = NEW Foo(42) }",
+        );
+        // The CREATE method is called with the new instance as the
+        // first argument and 42 as the second.
+        assert!(text.contains("call i64 @CREATE"));
+        // Receiver pointer is passed.
+        assert!(text.contains("i64 42"));
+    }
+
     #[test]
     fn dump_llvm_smoke() {
         // End-to-end: write a tiny program to a temp file, run
