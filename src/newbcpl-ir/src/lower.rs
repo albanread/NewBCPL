@@ -76,6 +76,18 @@ struct Builder {
     /// declaration site just terminates the current block with a
     /// branch to it and switches in.
     labels: HashMap<String, BlockId>,
+    /// Stack of currently-open VALOF expressions. Each frame
+    /// records the slot RESULTIS stores into and the block it
+    /// branches to on exit. `RESULTIS expr` inside a VALOF stores
+    /// to the innermost frame and branches; outside, it returns
+    /// from the function (legacy fallback — sema already warns).
+    valofs: Vec<ValofFrame>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ValofFrame {
+    result_slot: ValueId,
+    exit_block: BlockId,
 }
 
 #[derive(Debug, Clone)]
@@ -123,6 +135,7 @@ impl Builder {
             scopes: vec![HashMap::new()],
             frames: Vec::new(),
             labels: HashMap::new(),
+            valofs: Vec::new(),
         }
     }
 
@@ -354,7 +367,23 @@ impl<'a> Lowerer<'a> {
             }
             Stmt::Resultis(expr, _) => {
                 let value = self.lower_expr(expr);
-                self.b().terminate(Terminator::Return(Some(value)));
+                if let Some(frame) = self.b().valofs.last().copied() {
+                    // RESULTIS inside a VALOF: stash the value in
+                    // the result slot and branch to the VALOF's
+                    // exit block. Subsequent statements lower into
+                    // a fresh dead block.
+                    self.b().emit(Instr::Store {
+                        slot: frame.result_slot,
+                        value,
+                    });
+                    self.b()
+                        .terminate(Terminator::Branch(frame.exit_block));
+                } else {
+                    // Fallback: outside any VALOF, treat RESULTIS
+                    // like a function-return. Sema has already
+                    // warned about this shape.
+                    self.b().terminate(Terminator::Return(Some(value)));
+                }
                 let dead = self.b().alloc_block("after.resultis");
                 self.b().switch_to(dead);
             }
@@ -921,10 +950,7 @@ impl<'a> Lowerer<'a> {
             Expr::TypedConstruct {
                 kind, args, ..
             } => self.lower_typed_construct(*kind, args, e.hint()),
-            // Forms not yet lowered — return a typed null/zero so
-            // downstream uses don't crash. Sema warnings already
-            // fired for whatever real handling these need.
-            _ => Value::Const(Const::Null),
+            Expr::Valof { body, .. } => self.lower_valof(body, e.hint()),
         }
     }
 
@@ -940,6 +966,35 @@ impl<'a> Lowerer<'a> {
             dst,
             kind: typed_kind(kind),
             args: arg_values,
+            hint,
+        });
+        Value::Local(dst)
+    }
+
+    /// `VALOF stmt` — lowers to a slot + exit-block pair. RESULTIS
+    /// inside the body stores into the slot and branches to exit;
+    /// the VALOF expression's value is the slot's contents read at
+    /// the exit block.
+    fn lower_valof(&mut self, body: &Stmt, hint: TypeHint) -> Value {
+        let result_slot = self.b().alloca("valof.result", hint);
+        let exit_block = self.b().alloc_block("valof.end");
+        self.b().valofs.push(ValofFrame {
+            result_slot,
+            exit_block,
+        });
+        self.lower_stmt(body);
+        // If the body falls through without a RESULTIS, the slot is
+        // never written — match BCPL's "undefined result" by leaving
+        // the slot's zero-init in place and branching to exit.
+        if self.b().current_open() {
+            self.b().terminate(Terminator::Branch(exit_block));
+        }
+        self.b().valofs.pop();
+        self.b().switch_to(exit_block);
+        let dst = self.b().alloc_value();
+        self.b().emit(Instr::Load {
+            dst,
+            slot: result_slot,
             hint,
         });
         Value::Local(dst)

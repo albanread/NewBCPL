@@ -192,6 +192,83 @@ mod tests {
         assert!(text.contains("zext i1"));
     }
 
+    // ─── loops, switchon, GEP, lane extract ─────────────────────
+
+    #[test]
+    fn while_loop_emits_loop_blocks() {
+        let text = emit_text("LET S(n) BE { WHILE n < 10 DO n := n + 1 }");
+        assert!(text.contains("while.header"));
+        assert!(text.contains("while.body"));
+        assert!(text.contains("while.end"));
+        assert!(text.contains("br i1"));
+    }
+
+    #[test]
+    fn for_loop_emits_canonical_cfg() {
+        let text = emit_text("LET S() BE { FOR i = 1 TO 10 DO f() }");
+        assert!(text.contains("for.header"));
+        assert!(text.contains("for.body"));
+        assert!(text.contains("for.incr"));
+        assert!(text.contains("for.end"));
+    }
+
+    #[test]
+    fn valof_with_resultis_threads_through() {
+        let text = emit_text(
+            "LET sum(n) = VALOF $(\n LET acc = 0\n FOR i = 1 TO n DO acc := acc + i\n RESULTIS acc\n$)",
+        );
+        // The function returns the loaded VALOF result.
+        assert!(text.contains("valof.result"));
+        assert!(text.contains("valof.end"));
+        assert!(text.contains("ret i64"));
+        // FOR loop bodies are present too.
+        assert!(text.contains("for.header"));
+    }
+
+    #[test]
+    fn switchon_emits_llvm_switch() {
+        let text = emit_text(
+            "LET S(x) BE { SWITCHON x INTO $( CASE 1: f()\n CASE 2: g()\n DEFAULT: h() $) }",
+        );
+        assert!(text.contains("switch i64"));
+        assert!(text.contains("switch.case0"));
+        assert!(text.contains("switch.case1"));
+        assert!(text.contains("switch.default"));
+    }
+
+    #[test]
+    fn vec_subscript_emits_gep_plus_load() {
+        let text = emit_text("LET S() BE { LET v = VEC 10\n LET a = v!3 }");
+        // GEP with i8 element type carries the byte offset.
+        assert!(text.contains("getelementptr"));
+        assert!(text.contains("load i64"));
+    }
+
+    #[test]
+    fn vec_subscript_assign_emits_gep_plus_store() {
+        let text = emit_text("LET S() BE { LET v = VEC 10\n v!3 := 42 }");
+        assert!(text.contains("getelementptr"));
+        assert!(text.contains("store i64 42"));
+    }
+
+    #[test]
+    fn float_subscript_loads_double() {
+        let text = emit_text("LET S() BE { LET fv = FVEC 10\n LET a = fv.%3 }");
+        assert!(text.contains("load double"));
+    }
+
+    #[test]
+    fn prefix_indirection_emits_load_of_word() {
+        let text = emit_text("LET S(p) BE { LET a = !p }");
+        assert!(text.contains("load i64"));
+    }
+
+    #[test]
+    fn prefix_indirection_assignment_emits_store() {
+        let text = emit_text("LET S(p) BE { !p := 42 }");
+        assert!(text.contains("store i64 42"));
+    }
+
     #[test]
     fn dump_llvm_smoke() {
         // End-to-end: write a tiny program to a temp file, run

@@ -26,7 +26,7 @@ use inkwell::values::{BasicMetadataValueEnum, BasicValueEnum, FunctionValue, Poi
 
 use newbcpl_ir::{
     BasicBlock as IrBlock, BlockId, Const, Function as IrFunction, Instr, IrBinOp, IrUnOp,
-    Module as IrModule, Param, Terminator, Value, ValueId,
+    Module as IrModule, Param, Terminator, TypedKind, Value, ValueId,
 };
 use newbcpl_sema::TypeHint;
 
@@ -273,12 +273,208 @@ impl<'ctx> Emitter<'ctx> {
                     }
                 }
             }
-            // Forms not yet emitted — tracked separately so subsequent
-            // commits can switch them on incrementally. Emitting nothing
-            // means uses of the result land at `Value::Const(Const::Null)`
-            // in our IR (sema's WORD-fallback also covers most cases).
+            Instr::Gep {
+                dst,
+                base,
+                index,
+                element_bytes,
+            } => {
+                // `base + index * element_bytes` as a pointer.
+                // Stride 1 means char vectors, 8 means word / float
+                // vectors. We GEP an `i8` element type and hand
+                // the scaled byte offset directly so codegen can
+                // use any stride uniformly.
+                let base_v = self.lower_value(base);
+                let base_ptr = self.as_pointer(base_v);
+                let index_val = self.lower_value(index).into_int_value();
+                let stride = self
+                    .context
+                    .i64_type()
+                    .const_int(*element_bytes as u64, false);
+                let scaled = self
+                    .builder
+                    .build_int_mul(index_val, stride, "scaled")
+                    .expect("imul stride");
+                let i8_t = self.context.i8_type();
+                let addr = unsafe {
+                    self.builder
+                        .build_gep(i8_t, base_ptr, &[scaled], "gep")
+                        .expect("gep")
+                };
+                self.value_map.insert(*dst, addr.into());
+            }
+            Instr::IndirectLoad { dst, addr, hint } => {
+                // `!ptr` and the back-end of `v!i` / `v.%i`. The
+                // load type is determined by the IR's hint.
+                //
+                // KNOWN GAP: `%ptr` (char indirection) currently emits
+                // `load i64` because the hint is INT, but BCPL char
+                // semantics want `load i8 + zext`. Will be fixed
+                // when the IR carries an explicit byte-width.
+                let addr_v = self.lower_value(addr);
+                let addr_ptr = self.as_pointer(addr_v);
+                let ty = self.basic_type_for(*hint);
+                let loaded = self
+                    .builder
+                    .build_load(ty, addr_ptr, "iload")
+                    .expect("indirect load");
+                self.value_map.insert(*dst, loaded);
+            }
+            Instr::IndirectStore { addr, value } => {
+                let addr_v = self.lower_value(addr);
+                let addr_ptr = self.as_pointer(addr_v);
+                let v = self.lower_value(value);
+                self.builder
+                    .build_store(addr_ptr, v)
+                    .expect("indirect store");
+            }
+            Instr::LaneExtract {
+                dst,
+                vector,
+                lane,
+                hint: _,
+            } => {
+                let vec = self.lower_value(vector).into_vector_value();
+                let lane_val = self.lower_value(lane).into_int_value();
+                let elem = self
+                    .builder
+                    .build_extract_element(vec, lane_val, "lane")
+                    .expect("extract");
+                self.value_map.insert(*dst, elem);
+            }
+            Instr::TypedConstruct {
+                dst,
+                kind,
+                args,
+                hint: _,
+            } => {
+                let result = self.emit_typed_construct(*kind, args);
+                self.value_map.insert(*dst, result);
+            }
+            // Class-instance forms — New, FieldLoad, FieldStore,
+            // MethodCall — need TypeDesc plumbing and are tracked
+            // separately. Emitting nothing here means uses of the
+            // result land at panic time via `value_map.lookup`, which
+            // is OK for current tests since none exercise classes.
             _ => {}
         }
+    }
+
+    /// Lower a typed constructor — VEC / FVEC / SIMD primitives /
+    /// table / list. Stack-allocated forms (VEC, FVEC, TABLE,
+    /// FTABLE inline-init, the SIMD primitives) are handled here;
+    /// LIST and MANIFESTLIST need runtime support and are deferred.
+    fn emit_typed_construct(
+        &mut self,
+        kind: TypedKind,
+        args: &[Value],
+    ) -> BasicValueEnum<'ctx> {
+        match kind {
+            TypedKind::Vec | TypedKind::Table => self.emit_vec_construct(args, false),
+            TypedKind::FVec | TypedKind::FTable => self.emit_vec_construct(args, true),
+            TypedKind::Pair => self.build_simd_vector(args, /* float = */ false),
+            TypedKind::FPair => self.build_simd_vector(args, /* float = */ true),
+            TypedKind::Quad => self.build_simd_vector(args, false),
+            TypedKind::FQuad => self.build_simd_vector(args, true),
+            TypedKind::Oct => self.build_simd_vector(args, false),
+            TypedKind::FOct => self.build_simd_vector(args, true),
+            // LIST / MANIFESTLIST need the runtime allocator —
+            // emit a null pointer so subsequent code at least
+            // compiles. Real lowering arrives with the runtime
+            // wiring chunk.
+            TypedKind::List | TypedKind::ManifestList => self
+                .context
+                .ptr_type(AddressSpace::default())
+                .const_null()
+                .into(),
+        }
+    }
+
+    /// VEC k with `k` a constant size produces `alloca [k+1 x i64]`
+    /// (BCPL's "size k declares a vector of k+1 cells"). VEC [e1,
+    /// e2, …] with explicit initialisers allocates `[N x i64]`
+    /// where N is the arg count and stores each element.
+    fn emit_vec_construct(&mut self, args: &[Value], float: bool) -> BasicValueEnum<'ctx> {
+        let elem_t: BasicTypeEnum<'ctx> = if float {
+            self.context.f64_type().into()
+        } else {
+            self.context.i64_type().into()
+        };
+        // Heuristic: a single Int constant arg means "size k", so
+        // allocate k+1 cells. Anything else is treated as an init
+        // list (one cell per arg).
+        let single_const_size = if args.len() == 1 {
+            if let Value::Const(Const::Int(k)) = &args[0] {
+                Some(*k)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some(k) = single_const_size {
+            let count = (k as u64).saturating_add(1) as u32;
+            let arr_t = match elem_t {
+                BasicTypeEnum::IntType(t) => t.array_type(count),
+                BasicTypeEnum::FloatType(t) => t.array_type(count),
+                _ => unreachable!(),
+            };
+            let alloca = self.builder.build_alloca(arr_t, "vec").expect("vec");
+            return alloca.into();
+        }
+
+        // Init-list form: alloca [N x T], store each element.
+        let count = args.len() as u32;
+        let arr_t = match elem_t {
+            BasicTypeEnum::IntType(t) => t.array_type(count),
+            BasicTypeEnum::FloatType(t) => t.array_type(count),
+            _ => unreachable!(),
+        };
+        let alloca = self.builder.build_alloca(arr_t, "vec").expect("vec");
+        let i64_t = self.context.i64_type();
+        for (i, v) in args.iter().enumerate() {
+            let elem_v = self.lower_value(v);
+            let idx = i64_t.const_int(i as u64, false);
+            let zero = i64_t.const_zero();
+            let elem_ptr = unsafe {
+                self.builder
+                    .build_gep(arr_t, alloca, &[zero, idx], &format!("vec.elem.{i}"))
+                    .expect("gep init")
+            };
+            self.builder
+                .build_store(elem_ptr, elem_v)
+                .expect("store init");
+        }
+        alloca.into()
+    }
+
+    /// SIMD constructor: build a `<N x T>` register-resident vector
+    /// from N scalar args via insertelement. `float` selects the
+    /// element type (f64 vs i64).
+    fn build_simd_vector(&mut self, args: &[Value], float: bool) -> BasicValueEnum<'ctx> {
+        let n = args.len() as u32;
+        let i64_t = self.context.i64_type();
+        let mut current: BasicValueEnum<'ctx> = if float {
+            self.context.f64_type().vec_type(n).get_undef().into()
+        } else {
+            self.context.i64_type().vec_type(n).get_undef().into()
+        };
+        for (i, arg) in args.iter().enumerate() {
+            let scalar = self.lower_value(arg);
+            let idx = i64_t.const_int(i as u64, false);
+            current = self
+                .builder
+                .build_insert_element(
+                    current.into_vector_value(),
+                    scalar,
+                    idx,
+                    &format!("lane.{i}"),
+                )
+                .expect("insertelement")
+                .into();
+        }
+        current
     }
 
     fn emit_terminator(&mut self, t: &Terminator) {
@@ -319,12 +515,24 @@ impl<'ctx> Emitter<'ctx> {
             Terminator::Unreachable => {
                 self.builder.build_unreachable().expect("unreachable");
             }
-            // Switch terminator: deferred to the next emit chunk.
-            Terminator::Switch { default, .. } => {
-                let target = self.block_map[default];
+            Terminator::Switch {
+                value,
+                cases,
+                default,
+            } => {
+                let scrut = self.lower_value(value).into_int_value();
+                let default_bb = self.block_map[default];
+                let case_pairs: Vec<(inkwell::values::IntValue<'ctx>, LlvmBlock<'ctx>)> = cases
+                    .iter()
+                    .map(|(case_val, target)| {
+                        let cv = self.lower_value(case_val).into_int_value();
+                        let bb = self.block_map[target];
+                        (cv, bb)
+                    })
+                    .collect();
                 self.builder
-                    .build_unconditional_branch(target)
-                    .expect("switch placeholder");
+                    .build_switch(scrut, default_bb, &case_pairs)
+                    .expect("switch");
             }
         }
     }
@@ -368,6 +576,28 @@ impl<'ctx> Emitter<'ctx> {
                 let cooked = cook_bcpl_string(raw);
                 self.intern_string(&cooked).into()
             }
+        }
+    }
+
+    /// Coerce a value to a pointer for use as the base of a load /
+    /// store / GEP. BCPL is typeless at the source level —
+    /// addresses arrive as i64 (Word), and LLVM 15+ opaque pointers
+    /// are strict about the integer-vs-pointer distinction. This
+    /// inserts an `inttoptr` when the value is an integer; passes
+    /// through if it's already a pointer.
+    fn as_pointer(&self, v: BasicValueEnum<'ctx>) -> PointerValue<'ctx> {
+        match v {
+            BasicValueEnum::PointerValue(p) => p,
+            BasicValueEnum::IntValue(i) => {
+                let ptr_t = self.context.ptr_type(AddressSpace::default());
+                self.builder
+                    .build_int_to_ptr(i, ptr_t, "asptr")
+                    .expect("inttoptr")
+            }
+            other => panic!(
+                "cannot coerce {:?} to pointer",
+                other.get_type().print_to_string()
+            ),
         }
     }
 

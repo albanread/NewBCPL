@@ -16,7 +16,7 @@ use std::path::Path;
 
 pub use ir::{
     BasicBlock, BlockId, Const, Function, Instr, IrBinOp, IrUnOp, Module, Param, Terminator,
-    Value, ValueId,
+    TypedKind, Value, ValueId,
 };
 pub use lower::lower;
 
