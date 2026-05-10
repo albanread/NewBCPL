@@ -578,6 +578,7 @@ impl<'a> Lowerer<'a> {
         self.lower_stmt(body);
         self.b().frames.pop();
         if self.b().current_open() {
+            self.emit_safepoint();
             self.b().terminate(Terminator::Branch(header));
         }
         self.b().switch_to(exit);
@@ -597,6 +598,7 @@ impl<'a> Lowerer<'a> {
         self.lower_stmt(body);
         self.b().frames.pop();
         if self.b().current_open() {
+            self.emit_safepoint();
             self.b().terminate(Terminator::Branch(body_block));
         }
         self.b().switch_to(exit);
@@ -629,6 +631,11 @@ impl<'a> Lowerer<'a> {
         } else {
             (body_block, exit)
         };
+        // Poll a safepoint at the test block — every iteration of
+        // a do-while flows through here before deciding whether
+        // to take the back-edge to body_block. An extra poll on
+        // the loop-exit path is harmless.
+        self.emit_safepoint();
         self.b().terminate(Terminator::CondBranch {
             cond: cond_value,
             then_block,
@@ -727,6 +734,12 @@ impl<'a> Lowerer<'a> {
             slot: i_slot,
             value: Value::Local(i_next),
         });
+        // Cooperative GC poll on the FOR back-edge — see
+        // `emit_safepoint`. Without this, a tight pure-arithmetic
+        // FOR loop with no body allocations and no callees could
+        // run forever without parking, blocking any concurrent
+        // collect that needs to scan our stack.
+        self.emit_safepoint();
         self.b().terminate(Terminator::Branch(header));
 
         self.b().switch_to(exit);
@@ -897,6 +910,8 @@ impl<'a> Lowerer<'a> {
             slot: i_slot,
             value: Value::Local(i_next),
         });
+        // FOREACH-vec back-edge safepoint poll.
+        self.emit_safepoint();
         self.b().terminate(Terminator::Branch(header));
 
         self.b().switch_to(exit);
@@ -1060,6 +1075,8 @@ impl<'a> Lowerer<'a> {
             slot: cursor_slot,
             value: Value::Local(next),
         });
+        // FOREACH-list back-edge safepoint poll.
+        self.emit_safepoint();
         self.b().terminate(Terminator::Branch(header_block));
 
         self.b().switch_to(exit);
@@ -1528,6 +1545,20 @@ impl<'a> Lowerer<'a> {
         // Unknown name — assume it's a function reference that
         // will be resolved at link time.
         Value::Function(name.to_string())
+    }
+
+    /// Emit a `__newbcpl_safepoint()` call with no result. Inserted
+    /// at every loop back-edge so a long-running tight loop with
+    /// no allocations and no callees still parks for a concurrent
+    /// collector. Pairs with the function-entry poll emitted by
+    /// `newbcpl-llvm`'s `emit_safepoint_poll`.
+    fn emit_safepoint(&mut self) {
+        self.b().emit(Instr::Call {
+            dst: None,
+            callee: Value::Function("__newbcpl_safepoint".to_string()),
+            args: Vec::new(),
+            hint: TypeHint::Word,
+        });
     }
 
     /// Load the implicit `SELF` parameter as a Value. Only callable
