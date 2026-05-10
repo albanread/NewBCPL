@@ -814,6 +814,90 @@ mod tests {
         assert_eq!(switch_count, 1);
     }
 
+    // ─── list runtime helpers + GOTO / labels ───────────────────
+
+    #[test]
+    fn hd_lowers_to_runtime_call() {
+        let m = lower_source("LET S(xs) BE { LET h = HD xs }");
+        let s = function(&m, "S");
+        let entry = &s.blocks[0];
+        let has_call = entry.instrs.iter().any(|i| matches!(
+            i,
+            Instr::Call { callee: Value::Function(name), .. }
+                if name == "__newbcpl_list_hd"
+        ));
+        assert!(has_call, "expected runtime call to __newbcpl_list_hd");
+    }
+
+    #[test]
+    fn len_lowers_to_runtime_call() {
+        let m = lower_source("LET S(xs) BE { LET n = LEN xs }");
+        let s = function(&m, "S");
+        let entry = &s.blocks[0];
+        let has_call = entry.instrs.iter().any(|i| matches!(
+            i,
+            Instr::Call { callee: Value::Function(name), .. }
+                if name == "__newbcpl_len"
+        ));
+        assert!(has_call, "expected runtime call to __newbcpl_len");
+    }
+
+    #[test]
+    fn freevec_emits_void_call() {
+        let m = lower_source("LET S(v) BE { FREEVEC v }");
+        let s = function(&m, "S");
+        let entry = &s.blocks[0];
+        let has_freevec = entry.instrs.iter().any(|i| matches!(
+            i,
+            Instr::Call { dst: None, callee: Value::Function(name), .. }
+                if name == "__newbcpl_freevec"
+        ));
+        assert!(has_freevec, "expected void __newbcpl_freevec call");
+    }
+
+    #[test]
+    fn goto_emits_branch_to_label_block() {
+        let m = lower_source("LET S() BE { GOTO done\n done: f() }");
+        let s = function(&m, "S");
+        // GOTO terminates the entry block with a Branch; the label
+        // block is the target.
+        let entry = &s.blocks[0];
+        assert!(matches!(entry.terminator, Terminator::Branch(_)));
+    }
+
+    #[test]
+    fn forward_goto_resolves_to_later_label() {
+        // GOTO `end` references the block before the label is
+        // declared; `label_block` allocates on first mention.
+        let m = lower_source(
+            "LET S(x) BE { IF x = 0 THEN GOTO end\n f()\n end: g() }",
+        );
+        let s = function(&m, "S");
+        // Three label-style blocks plus the IF blocks; the program
+        // should not panic and should produce >= 5 blocks.
+        assert!(s.blocks.len() >= 5);
+    }
+
+    #[test]
+    fn label_block_is_reachable_from_branch() {
+        let m = lower_source(
+            "LET S() BE { GOTO target\n target: f() }",
+        );
+        let s = function(&m, "S");
+        // Find the label block (named "label.target") and check it
+        // contains the call to f.
+        let label_block = s
+            .blocks
+            .iter()
+            .find(|b| b.label == "label.target")
+            .expect("label.target block missing");
+        let has_call = label_block
+            .instrs
+            .iter()
+            .any(|i| matches!(i, Instr::Call { .. }));
+        assert!(has_call, "label block should contain call to f()");
+    }
+
     #[test]
     fn dump_smoke() {
         let m = lower_source("LET S() BE { LET y = 1 + 2 }");

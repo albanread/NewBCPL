@@ -70,6 +70,12 @@ struct Builder {
     /// BREAK / ENDCASE target; the innermost *loop* frame is the
     /// LOOP target.
     frames: Vec<Frame>,
+    /// Source-level labels — `name:` declarations and `GOTO name`
+    /// references — share blocks. Forward references work because
+    /// `label_block` creates the block on first mention; the
+    /// declaration site just terminates the current block with a
+    /// branch to it and switches in.
+    labels: HashMap<String, BlockId>,
 }
 
 #[derive(Debug, Clone)]
@@ -116,7 +122,20 @@ impl Builder {
             current_block: entry,
             scopes: vec![HashMap::new()],
             frames: Vec::new(),
+            labels: HashMap::new(),
         }
+    }
+
+    /// Look up or allocate the block for a source-level label.
+    /// Forward references work transparently — the block is reserved
+    /// the first time it's mentioned, by either declaration or GOTO.
+    fn label_block(&mut self, name: &str) -> BlockId {
+        if let Some(&id) = self.labels.get(name) {
+            return id;
+        }
+        let id = self.alloc_block(&format!("label.{name}"));
+        self.labels.insert(name.to_string(), id);
+        id
     }
 
     fn innermost_break(&self) -> Option<BlockId> {
@@ -392,6 +411,22 @@ impl<'a> Lowerer<'a> {
                 default,
                 ..
             } => self.lower_switchon(scrutinee, cases, default.as_deref()),
+            Stmt::Goto { label, .. } => {
+                let target = self.b().label_block(label);
+                self.b().terminate(Terminator::Branch(target));
+                let dead = self.b().alloc_block("after.goto");
+                self.b().switch_to(dead);
+            }
+            Stmt::Label { name, .. } => {
+                let target = self.b().label_block(name);
+                // Branch in from whatever the predecessor was, then
+                // switch into the label block so subsequent
+                // statements lower into it.
+                if self.b().current_open() {
+                    self.b().terminate(Terminator::Branch(target));
+                }
+                self.b().switch_to(target);
+            }
             // SWITCHON / FOREACH / labels / RETAIN etc. — subsequent
             // IR-grow chunks lower these.
             _ => {}
@@ -1002,6 +1037,29 @@ impl<'a> Lowerer<'a> {
     }
 
     fn lower_unary(&mut self, op: UnaryOp, operand: &Expr, hint: TypeHint) -> Value {
+        // BCPL list / vector keyword operators lower to runtime
+        // calls. The runtime helper names line up with NewCP's
+        // convention so the GC and ABI shapes match.
+        if let Some(runtime_name) = unary_runtime_helper(op) {
+            let arg = self.lower_expr(operand);
+            // FREEVEC / FREELIST don't produce a useful value — emit
+            // the call with no result slot.
+            let dst = if matches!(op, UnaryOp::FreeVec | UnaryOp::FreeList) {
+                None
+            } else {
+                Some(self.b().alloc_value())
+            };
+            self.b().emit(Instr::Call {
+                dst,
+                callee: Value::Function(runtime_name.to_string()),
+                args: vec![arg],
+                hint,
+            });
+            return match dst {
+                Some(d) => Value::Local(d),
+                None => Value::Unit,
+            };
+        }
         match op {
             UnaryOp::Indirection => {
                 // `!ptr` — load a word from address ptr.
@@ -1278,6 +1336,23 @@ fn binop_to_ir(op: BinaryOp, lhs: TypeHint, rhs: TypeHint) -> Option<IrBinOp> {
         Subscript | Bitfield | CharSubscript | FloatSubscript | Dot | Of | LaneAccess => {
             return None;
         }
+    })
+}
+
+/// Map a list / vector keyword operator to its runtime helper
+/// symbol name. Codegen emits an extern call to these from the
+/// `__newbcpl_*` runtime API; matches the NewCP-derived GC and
+/// list-data conventions described in
+/// `reference/runtime/ListDataTypes.h`.
+fn unary_runtime_helper(op: UnaryOp) -> Option<&'static str> {
+    Some(match op {
+        UnaryOp::Hd => "__newbcpl_list_hd",
+        UnaryOp::Tl => "__newbcpl_list_tl",
+        UnaryOp::Rest => "__newbcpl_list_rest",
+        UnaryOp::Len => "__newbcpl_len",
+        UnaryOp::FreeVec => "__newbcpl_freevec",
+        UnaryOp::FreeList => "__newbcpl_freelist",
+        _ => return None,
     })
 }
 
