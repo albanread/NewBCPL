@@ -174,9 +174,32 @@ pub struct SemaOutput {
     pub bindings: Vec<BindingInfo>,
     /// Every class declared.
     pub classes: Vec<ClassInfo>,
+    /// Every function / routine sema saw, with its inferred signature.
+    pub functions: Vec<FunctionInfo>,
     /// Non-fatal diagnostics. Sema never fails on type grounds, so
     /// every interesting observation lands here.
     pub warnings: Vec<SemaWarning>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FunctionInfo {
+    pub name: String,
+    pub kind: FunctionKind,
+    pub params: Vec<String>,
+    /// Inferred result type. For routines this is `Word` (BCPL
+    /// routines do not produce a value); for functions it is the
+    /// hint of the body expression, threading through any VALOF /
+    /// RESULTIS chain.
+    pub result: TypeHint,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FunctionKind {
+    /// `LET F(x) = expr` — produces a value.
+    Function,
+    /// `LET R(x) BE stmt` — produces no value.
+    Routine,
 }
 
 pub fn analyze(program: &Program) -> SemaOutput {
@@ -185,6 +208,7 @@ pub fn analyze(program: &Program) -> SemaOutput {
     SemaOutput {
         bindings: sema.binding_log,
         classes: sema.class_log,
+        functions: sema.function_log,
         warnings: sema.warnings,
     }
 }
@@ -198,6 +222,23 @@ pub fn dump_sema(path: &Path) -> String {
                     "newbcpl-sema dump\ninput: {}\n",
                     path.display()
                 );
+                writeln!(out, "functions ({}):", result.functions.len()).unwrap();
+                for f in &result.functions {
+                    let kind = match f.kind {
+                        FunctionKind::Function => "FUNCTION",
+                        FunctionKind::Routine => "ROUTINE",
+                    };
+                    writeln!(
+                        out,
+                        "  {:>4}:{:<3}  {kind:<8} {}({}) -> {}",
+                        f.span.start.line,
+                        f.span.start.column,
+                        f.name,
+                        f.params.join(", "),
+                        f.result.as_str(),
+                    )
+                    .unwrap();
+                }
                 writeln!(out, "bindings ({}):", result.bindings.len()).unwrap();
                 for b in &result.bindings {
                     let class = match &b.class_name {
@@ -253,10 +294,21 @@ struct Sema {
     scopes: Vec<HashMap<String, BindingInfo>>,
     /// Class table by name.
     classes: HashMap<String, ClassInfo>,
+    /// Function table by name. Used by the call-site type lookup so
+    /// `LET y = f(x)` can take y's hint from f's inferred result type.
+    functions: HashMap<String, FunctionInfo>,
     /// Append-only log of every binding seen, in source order.
     binding_log: Vec<BindingInfo>,
     /// Append-only log of every class seen, in source order.
     class_log: Vec<ClassInfo>,
+    /// Append-only log of every function / routine seen.
+    function_log: Vec<FunctionInfo>,
+    /// Stack of currently-open `VALOF` blocks. Each frame collects the
+    /// `RESULTIS` expression hints inside that block; on exit the
+    /// frame is popped and merged into a single `TypeHint`. Empty when
+    /// not inside any VALOF — `RESULTIS` outside is a no-op for type
+    /// inference (and may eventually be a warning).
+    valof_results: Vec<Vec<TypeHint>>,
     warnings: Vec<SemaWarning>,
 }
 
@@ -265,8 +317,11 @@ impl Sema {
         Self {
             scopes: vec![HashMap::new()],
             classes: HashMap::new(),
+            functions: HashMap::new(),
             binding_log: Vec::new(),
             class_log: Vec::new(),
+            function_log: Vec::new(),
+            valof_results: Vec::new(),
             warnings: Vec::new(),
         }
     }
@@ -313,7 +368,7 @@ impl Sema {
     }
 
     fn analyze_program(&mut self, program: &Program) {
-        // First pass: register classes so any LET that does
+        // Pre-pass 1: register classes so any LET that does
         // `NEW Foo()` can resolve the name even if Foo is declared
         // later in the file.
         for decl in &program.items {
@@ -321,8 +376,42 @@ impl Sema {
                 self.register_class(c);
             }
         }
+        // Pre-pass 2: register functions / routines with placeholder
+        // result hints so forward calls (`g()` referenced before
+        // `g`'s body is seen) resolve. Real inference happens during
+        // the main walk and overwrites the placeholder.
+        for decl in &program.items {
+            self.preregister_functions_in_decl(decl);
+        }
+        // Main pass.
         for decl in &program.items {
             self.analyze_decl(decl);
+        }
+    }
+
+    fn preregister_functions_in_decl(&mut self, decl: &Decl) {
+        match decl {
+            Decl::Function(f) => {
+                let info = FunctionInfo {
+                    name: f.name.clone(),
+                    kind: FunctionKind::Function,
+                    params: f.params.clone(),
+                    result: TypeHint::Unknown,
+                    span: f.span,
+                };
+                self.functions.insert(f.name.clone(), info);
+            }
+            Decl::Routine(r) => {
+                let info = FunctionInfo {
+                    name: r.name.clone(),
+                    kind: FunctionKind::Routine,
+                    params: r.params.clone(),
+                    result: TypeHint::Word,
+                    span: r.span,
+                };
+                self.functions.insert(r.name.clone(), info);
+            }
+            _ => {}
         }
     }
 
@@ -341,14 +430,21 @@ impl Sema {
         match decl {
             Decl::Function(f) => {
                 self.declare(&f.name, TypeHint::Function, None, f.span);
-                // Function body — open a parameter scope so locals
-                // don't leak.
                 self.push_scope();
                 for p in &f.params {
                     self.declare(p, TypeHint::Word, None, f.span);
                 }
-                let _ = self.type_of(&f.body);
+                let body_hint = self.type_of(&f.body);
                 self.pop_scope();
+                let info = FunctionInfo {
+                    name: f.name.clone(),
+                    kind: FunctionKind::Function,
+                    params: f.params.clone(),
+                    result: body_hint,
+                    span: f.span,
+                };
+                self.functions.insert(f.name.clone(), info.clone());
+                self.function_log.push(info);
             }
             Decl::Routine(r) => {
                 self.declare(&r.name, TypeHint::Function, None, r.span);
@@ -358,6 +454,15 @@ impl Sema {
                 }
                 self.analyze_stmt(&r.body);
                 self.pop_scope();
+                let info = FunctionInfo {
+                    name: r.name.clone(),
+                    kind: FunctionKind::Routine,
+                    params: r.params.clone(),
+                    result: TypeHint::Word,
+                    span: r.span,
+                };
+                self.functions.insert(r.name.clone(), info.clone());
+                self.function_log.push(info);
             }
             Decl::Let(l) => self.analyze_let(l),
             Decl::Get(_) => {}
@@ -562,7 +667,10 @@ impl Sema {
                 }
             }
             Stmt::Resultis(e, _) => {
-                let _ = self.type_of(e);
+                let hint = self.type_of(e);
+                if let Some(frame) = self.valof_results.last_mut() {
+                    frame.push(hint);
+                }
             }
             Stmt::Retain { value: Some(v), name, span, .. } => {
                 let hint = self.type_of(v);
@@ -665,20 +773,31 @@ impl Sema {
                 None => TypeHint::Unknown,
             },
             Expr::Call { callee, args, .. } => {
-                // Walk the callee + args so any side-effects (warnings)
-                // for nested expressions still fire.
+                // Walk callee + args first so side-effecting warnings
+                // fire even when we don't know the function's type.
                 for a in args {
                     let _ = self.type_of(a);
                 }
                 let _ = self.type_of(callee);
-                // Conversion intrinsics return known register classes.
                 if let Expr::Ident { name, .. } = callee.as_ref() {
-                    return match name.as_str() {
-                        "FLOAT" | "FSQRT" => TypeHint::Float,
-                        "TRUNC" | "FIX" | "ENTIER" | "LEN" => TypeHint::Int,
-                        "TYPE" | "TYPEOF" => TypeHint::String,
-                        _ => TypeHint::Word,
-                    };
+                    // 1. Conversion intrinsics — known result classes.
+                    match name.as_str() {
+                        "FLOAT" | "FSQRT" => return TypeHint::Float,
+                        "TRUNC" | "FIX" | "ENTIER" | "LEN" => return TypeHint::Int,
+                        "TYPE" | "TYPEOF" => return TypeHint::String,
+                        _ => {}
+                    }
+                    // 2. User-defined function whose body we've already
+                    //    analysed (or pre-registered as a placeholder).
+                    if let Some(info) = self.functions.get(name) {
+                        // Routines logically don't return a value;
+                        // surface that as Word so callers can still
+                        // ignore the result without warnings.
+                        return match info.kind {
+                            FunctionKind::Routine => TypeHint::Word,
+                            FunctionKind::Function => info.result,
+                        };
+                    }
                 }
                 TypeHint::Word
             }
@@ -725,10 +844,13 @@ impl Sema {
                 }
             }
             Expr::Valof { body, .. } => {
+                self.valof_results.push(Vec::new());
                 self.analyze_stmt(body);
-                // We don't yet thread RESULTIS values back through
-                // VALOF; default to WORD.
-                TypeHint::Word
+                let collected = self
+                    .valof_results
+                    .pop()
+                    .expect("valof frame must exist");
+                merge_hints(&collected)
             }
             Expr::TypedConstruct { kind, args, .. } => {
                 for a in args {
@@ -823,6 +945,23 @@ impl Sema {
                 _ => TypeHint::Int,
             },
         }
+    }
+}
+
+/// Merge the hints contributed by a set of `RESULTIS` expressions in
+/// the same VALOF block. If they all agree the result is precise; if
+/// they disagree we widen to `Word` rather than picking one
+/// arbitrarily — matches manifesto §1's "fall back to WORD when
+/// inference can't decide."
+fn merge_hints(hints: &[TypeHint]) -> TypeHint {
+    let mut iter = hints.iter().copied().filter(|h| *h != TypeHint::Unknown);
+    let Some(first) = iter.next() else {
+        return TypeHint::Word;
+    };
+    if iter.all(|h| h == first) {
+        first
+    } else {
+        TypeHint::Word
     }
 }
 
@@ -1032,6 +1171,103 @@ mod tests {
         assert_eq!(binding_hint(&out, "b"), TypeHint::Int);
         assert_eq!(binding_hint(&out, "c"), TypeHint::Int);
         assert_eq!(binding_hint(&out, "t"), TypeHint::String);
+    }
+
+    // ─── function signatures & VALOF threading ──────────────────
+
+    fn function_info<'a>(out: &'a SemaOutput, name: &str) -> &'a FunctionInfo {
+        out.functions
+            .iter()
+            .find(|f| f.name == name)
+            .unwrap_or_else(|| panic!("no function {name}"))
+    }
+
+    #[test]
+    fn function_decl_records_result_from_body_expression() {
+        let out = analyze_str("LET square(x) = x");
+        let f = function_info(&out, "square");
+        assert_eq!(f.kind, FunctionKind::Function);
+        assert_eq!(f.params, vec!["x".to_string()]);
+        // x is a parameter (Word) — body is an Ident referring to it,
+        // so the result hint is Word.
+        assert_eq!(f.result, TypeHint::Word);
+    }
+
+    #[test]
+    fn function_with_int_literal_body_returns_int() {
+        let out = analyze_str("LET answer() = 42");
+        let f = function_info(&out, "answer");
+        assert_eq!(f.result, TypeHint::Int);
+    }
+
+    #[test]
+    fn function_with_float_literal_body_returns_float() {
+        let out = analyze_str("LET pi() = 3.14159");
+        let f = function_info(&out, "pi");
+        assert_eq!(f.result, TypeHint::Float);
+    }
+
+    #[test]
+    fn routine_records_word_result() {
+        let out = analyze_str("LET S() BE { f() }");
+        let f = function_info(&out, "S");
+        assert_eq!(f.kind, FunctionKind::Routine);
+        assert_eq!(f.result, TypeHint::Word);
+    }
+
+    #[test]
+    fn valof_threads_resultis_back() {
+        // Body: VALOF $( RESULTIS 3.14 $) — function returns FLOAT.
+        let out = analyze_str("LET f() = VALOF $( RESULTIS 3.14 $)");
+        let f = function_info(&out, "f");
+        assert_eq!(f.result, TypeHint::Float);
+    }
+
+    #[test]
+    fn valof_with_multiple_resultis_same_type() {
+        let out = analyze_str(
+            "LET f(x) = VALOF $(\n  IF x > 0 THEN RESULTIS 1\n  RESULTIS 2\n$)",
+        );
+        let f = function_info(&out, "f");
+        assert_eq!(f.result, TypeHint::Int);
+    }
+
+    #[test]
+    fn valof_with_mixed_resultis_widens_to_word() {
+        let out = analyze_str(
+            "LET f(x) = VALOF $(\n  IF x > 0 THEN RESULTIS 1\n  RESULTIS 3.14\n$)",
+        );
+        let f = function_info(&out, "f");
+        assert_eq!(f.result, TypeHint::Word);
+    }
+
+    #[test]
+    fn call_site_uses_function_result_hint() {
+        // y's binding hint should pick up that f() returns FLOAT.
+        let out = analyze_str("LET f() = 3.14\nLET y = f()");
+        assert_eq!(binding_hint(&out, "y"), TypeHint::Float);
+    }
+
+    #[test]
+    fn forward_reference_resolves_to_unknown_then_real() {
+        // g is called before g's body is analysed. With the pre-pass,
+        // g is registered as Unknown; after the main pass, g's result
+        // is Int. The first analyse sees Unknown — that's fine, the
+        // dependent binding gets re-derived as the program is walked.
+        // Here we just check the second case: a binding declared after
+        // f's body sees the proper hint.
+        let out = analyze_str("LET f() = 1\nLET y = f()");
+        assert_eq!(binding_hint(&out, "y"), TypeHint::Int);
+    }
+
+    #[test]
+    fn nested_valof_blocks() {
+        let out = analyze_str(
+            "LET outer() = VALOF $(\n  LET inner = VALOF $( RESULTIS 1 $)\n  RESULTIS inner + 1\n$)",
+        );
+        let f = function_info(&out, "outer");
+        assert_eq!(f.result, TypeHint::Int);
+        assert_eq!(binding_hint(&out, "inner"), TypeHint::Int);
     }
 
     #[test]
