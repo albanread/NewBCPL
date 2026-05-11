@@ -22,6 +22,31 @@ use std::io::Read as _;
 use std::io::Write as _;
 use std::sync::Mutex;
 
+/// Optional callback installed by the GUI driver so console output
+/// can be redirected away from the host-process stdout. When set,
+/// every byte produced by WRITES / WRITEN / WRITEC / NEWLINE / WRITEF
+/// / FWRITE flows through this closure instead of `std::io::stdout`.
+/// The callback runs on whichever thread the writing builtin is
+/// called from — typically the JIT thread — so any cross-thread
+/// marshalling is the callback's job.
+type ConsoleCallback = Box<dyn Fn(&[u8]) + Send + Sync + 'static>;
+
+static CONSOLE_CALLBACK: Mutex<Option<ConsoleCallback>> = Mutex::new(None);
+
+/// Install a function that receives every byte the BCPL console
+/// builtins would otherwise write to stdout. Pass `None` to remove
+/// the callback and restore stdout-direct writes. Subsequent calls
+/// replace the previous callback.
+pub fn set_console_write_callback<F>(f: Option<F>)
+where
+    F: Fn(&[u8]) + Send + Sync + 'static,
+{
+    let mut slot = CONSOLE_CALLBACK
+        .lock()
+        .expect("CONSOLE_CALLBACK mutex poisoned");
+    *slot = f.map(|cb| -> ConsoleCallback { Box::new(cb) });
+}
+
 // ─── primitive I/O ────────────────────────────────────────────────
 
 /// `WRITES("foo*N")` — print a null-terminated UTF-8 string. The
@@ -41,10 +66,8 @@ pub unsafe extern "C" fn WRITES(s: *const u8) -> i64 {
 /// `WRITEN(n)` — print a signed integer in decimal.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn WRITEN(n: i64) -> i64 {
-    let stdout = std::io::stdout();
-    let mut handle = stdout.lock();
-    let _ = write!(handle, "{n}");
-    let _ = handle.flush();
+    let s = format!("{n}");
+    write_bytes(s.as_bytes());
     0
 }
 
@@ -67,10 +90,8 @@ pub unsafe extern "C" fn NEWLINE() -> i64 {
 /// Reference name is `FWRITE`; the corpus also uses it heavily.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn FWRITE(f: f64) -> i64 {
-    let stdout = std::io::stdout();
-    let mut handle = stdout.lock();
-    let _ = write!(handle, "{f}");
-    let _ = handle.flush();
+    let s = format!("{f}");
+    write_bytes(s.as_bytes());
     0
 }
 
@@ -198,8 +219,11 @@ fn writef_impl(format: *const u8, args: &[i64]) {
     }
     let cstr = unsafe { CStr::from_ptr(format as *const i8) };
     let bytes = cstr.to_bytes();
-    let stdout = std::io::stdout();
-    let mut h = stdout.lock();
+    // Build into an in-memory buffer so the whole formatted line
+    // reaches `write_bytes` as one chunk — that's important for the
+    // GUI callback's line-buffer flush logic, and harmless for the
+    // stdout path where we'd be locking once anyway.
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len() + args.len() * 8);
 
     let mut i = 0;
     let mut used = 0;
@@ -209,54 +233,54 @@ fn writef_impl(format: *const u8, args: &[i64]) {
             let spec = bytes[i + 1];
             i += 2;
             if spec == b'%' {
-                let _ = h.write_all(b"%");
+                out.push(b'%');
                 continue;
             }
             if used >= args.len() {
-                let _ = write!(h, "%{}", spec as char);
+                let _ = write!(out, "%{}", spec as char);
                 continue;
             }
             let a = args[used];
             used += 1;
             match spec {
                 b'd' | b'i' | b'N' => {
-                    let _ = write!(h, "{a}");
+                    let _ = write!(out, "{a}");
                 }
                 b'x' => {
-                    let _ = write!(h, "{:x}", a as u64);
+                    let _ = write!(out, "{:x}", a as u64);
                 }
                 b'X' => {
-                    let _ = write!(h, "{:016X}", a as u64);
+                    let _ = write!(out, "{:016X}", a as u64);
                 }
                 b'o' => {
-                    let _ = write!(h, "{:o}", a as u64);
+                    let _ = write!(out, "{:o}", a as u64);
                 }
                 b'c' => {
-                    let _ = h.write_all(&[(a & 0xff) as u8]);
+                    out.push((a & 0xff) as u8);
                 }
                 b's' => {
                     if a == 0 {
-                        let _ = h.write_all(b"(null)");
+                        out.extend_from_slice(b"(null)");
                     } else {
                         let s = unsafe { CStr::from_ptr(a as *const i8) };
-                        let _ = h.write_all(s.to_bytes());
+                        out.extend_from_slice(s.to_bytes());
                     }
                 }
                 b'f' | b'F' => {
                     let f = f64::from_bits(a as u64);
-                    let _ = write!(h, "{f}");
+                    let _ = write!(out, "{f}");
                 }
                 other => {
-                    let _ = write!(h, "%{}", other as char);
+                    let _ = write!(out, "%{}", other as char);
                     used -= 1; // unknown specifier doesn't consume the arg
                 }
             }
         } else {
-            let _ = h.write_all(&[b]);
+            out.push(b);
             i += 1;
         }
     }
-    let _ = h.flush();
+    write_bytes(&out);
 }
 
 #[unsafe(no_mangle)]
@@ -855,6 +879,18 @@ pub unsafe extern "C" fn SPLIT(_s: *const u8, _delim: *const u8) -> *mut i64 {
 // ─── helpers ─────────────────────────────────────────────────────
 
 fn write_bytes(bytes: &[u8]) {
+    // GUI mode installs a callback that routes bytes to a console
+    // window; in that case we skip the host stdout entirely so test
+    // captures don't see double output. Without a callback (the
+    // normal headless `run`), fall through to stdout.
+    let cb = CONSOLE_CALLBACK
+        .lock()
+        .expect("CONSOLE_CALLBACK mutex poisoned");
+    if let Some(cb) = cb.as_ref() {
+        cb(bytes);
+        return;
+    }
+    drop(cb);
     let stdout = std::io::stdout();
     let mut handle = stdout.lock();
     let _ = handle.write_all(bytes);
@@ -890,7 +926,8 @@ pub fn builtin_addresses() -> &'static [Builtin] {
     use std::sync::OnceLock;
     static TABLE: OnceLock<Vec<Builtin>> = OnceLock::new();
     TABLE.get_or_init(|| {
-        vec![
+        #[allow(unused_mut)]
+        let mut v = vec![
             builtin!(WRITES),
             builtin!(WRITEN),
             builtin!(WRITEC),
@@ -957,7 +994,64 @@ pub fn builtin_addresses() -> &'static [Builtin] {
             builtin!(GC),
             builtin!(HEAP_INFO),
             builtin!(__newbcpl_default_method),
-        ]
+        ];
+        #[cfg(windows)]
+        {
+            use crate::igui_builtins as g;
+            v.push(Builtin {
+                name: "iGui_OpenChild",
+                address: g::iGui_OpenChild as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "iGui_CloseChild",
+                address: g::iGui_CloseChild as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "iGui_SetTitle",
+                address: g::iGui_SetTitle as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "iGui_BeginBatch",
+                address: g::iGui_BeginBatch as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "iGui_SubmitBatch",
+                address: g::iGui_SubmitBatch as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "iGui_Clear",
+                address: g::iGui_Clear as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "iGui_FillRect",
+                address: g::iGui_FillRect as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "iGui_StrokeRect",
+                address: g::iGui_StrokeRect as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "iGui_FillCircle",
+                address: g::iGui_FillCircle as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "iGui_DrawLine",
+                address: g::iGui_DrawLine as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "iGui_DrawText",
+                address: g::iGui_DrawText as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "iGui_NextEvent",
+                address: g::iGui_NextEvent as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "iGui_Quit",
+                address: g::iGui_Quit as *const () as usize,
+            });
+        }
+        v
     })
 }
 

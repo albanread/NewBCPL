@@ -1471,20 +1471,18 @@ impl<'a> Lowerer<'a> {
 
     fn lower_unless(&mut self, cond: &Expr, then_stmt: &Stmt) {
         let cond_value = self.lower_expr(cond);
-        // Negate: !cond goes to the body; cond goes to merge.
-        let dst = self.b().alloc_value();
-        self.b().emit(Instr::UnaryOp {
-            dst,
-            op: IrUnOp::Not,
-            operand: cond_value,
-            hint: TypeHint::Int,
-        });
+        // UNLESS body runs only when `cond` is zero. We must NOT
+        // bitwise-NOT the value: classical BCPL truthiness treats any
+        // non-zero value as true, so `NOT 1` is `~1 == -2` which is
+        // also truthy — branching on that would always enter the body.
+        // Instead swap the branch arms so a truthy `cond` skips the
+        // body and a zero `cond` enters it.
         let body_block = self.b().alloc_block("unless.body");
         let merge = self.b().alloc_block("unless.end");
         self.b().terminate(Terminator::CondBranch {
-            cond: Value::Local(dst),
-            then_block: body_block,
-            else_block: merge,
+            cond: cond_value,
+            then_block: merge,
+            else_block: body_block,
         });
         self.b().switch_to(body_block);
         self.lower_stmt(then_stmt);
@@ -1711,6 +1709,44 @@ impl<'a> Lowerer<'a> {
         let rhs_v = self.lower_expr(rhs);
         let lhs_h = lhs.hint();
         let rhs_h = rhs.hint();
+        // Logical AND/OR/XOR: reduce each operand to 0/1 via `!= 0`,
+        // then combine bitwise. Yields a clean 0/1 even when the
+        // operands are large bit patterns (so `1 AND 2` ≠ 0 but
+        // both truthy → result 1; bitwise `1 BAND 2 = 0`).
+        if matches!(op, BinaryOp::LogAnd | BinaryOp::LogOr | BinaryOp::LogXor) {
+            let zero = Value::Const(Const::Int(0));
+            let lhs_bool = self.b().alloc_value();
+            self.b().emit(Instr::BinOp {
+                dst: lhs_bool,
+                op: IrBinOp::ICmpNe,
+                lhs: lhs_v,
+                rhs: zero.clone(),
+                hint: TypeHint::Int,
+            });
+            let rhs_bool = self.b().alloc_value();
+            self.b().emit(Instr::BinOp {
+                dst: rhs_bool,
+                op: IrBinOp::ICmpNe,
+                lhs: rhs_v,
+                rhs: zero,
+                hint: TypeHint::Int,
+            });
+            let ir_op = match op {
+                BinaryOp::LogAnd => IrBinOp::BitAnd,
+                BinaryOp::LogOr => IrBinOp::BitOr,
+                BinaryOp::LogXor => IrBinOp::BitXor,
+                _ => unreachable!(),
+            };
+            let dst = self.b().alloc_value();
+            self.b().emit(Instr::BinOp {
+                dst,
+                op: ir_op,
+                lhs: Value::Local(lhs_bool),
+                rhs: Value::Local(rhs_bool),
+                hint: TypeHint::Int,
+            });
+            return Value::Local(dst);
+        }
         let Some(ir_op) = binop_to_ir(op, lhs_h, rhs_h) else {
             // Subscript family, lane access — not yet IR-lowered.
             return Value::Const(Const::Null);
@@ -1798,6 +1834,24 @@ impl<'a> Lowerer<'a> {
                 self.b().emit(Instr::IndirectLoad {
                     dst,
                     addr,
+                    hint: TypeHint::Int,
+                });
+                Value::Local(dst)
+            }
+            UnaryOp::LogNot => {
+                // Logical NOT: `NOT x` returns 1 if x is 0, else 0.
+                // Lowered as `x == 0`, which produces a clean 0/1
+                // result. This is the truth-correct counterpart to
+                // `BNOT` / `~`, which flips every bit and is *not*
+                // suitable for boolean negation (`BNOT 1` is `-2`,
+                // still truthy in BCPL).
+                let v = self.lower_expr(operand);
+                let dst = self.b().alloc_value();
+                self.b().emit(Instr::BinOp {
+                    dst,
+                    op: IrBinOp::ICmpEq,
+                    lhs: v,
+                    rhs: Value::Const(Const::Int(0)),
                     hint: TypeHint::Int,
                 });
                 Value::Local(dst)
@@ -2027,8 +2081,13 @@ fn binop_to_ir(op: BinaryOp, lhs: TypeHint, rhs: TypeHint) -> Option<IrBinOp> {
         FGe => IrBinOp::FCmpGe,
         BitAnd => IrBinOp::BitAnd,
         BitOr => IrBinOp::BitOr,
+        BitXor => IrBinOp::BitXor,
         Eqv => IrBinOp::ICmpEq, // EQV is "is the same boolean" → equality
-        Neqv => IrBinOp::BitXor, // NEQV is XOR (parity-style)
+        Neqv => IrBinOp::BitXor, // NEQV is XOR (alias of BXOR)
+        // Logical ops are handled before binop_to_ir is called — see
+        // `lower_binary` — because they need to reduce each operand
+        // to a 0/1 boolean first. They never reach this point.
+        LogAnd | LogOr | LogXor => return None,
         Shl => IrBinOp::Shl,
         Shr => IrBinOp::Shr,
         // Subscript family + member access aren't lowered yet.
@@ -2144,6 +2203,10 @@ fn unop_to_ir(op: UnaryOp, operand: TypeHint) -> Option<IrUnOp> {
             }
         }
         UnaryOp::Not => IrUnOp::Not,
+        // LogNot is handled in `lower_unary` before this function is
+        // called, because it needs an `ICmpEq` rather than a unary
+        // IR op (single-operand → produce 0/1).
+        UnaryOp::LogNot => return None,
         // Indirection / AddressOf / CharIndirection / Hd / Tl / Rest /
         // Len / FreeVec / FreeList aren't lowered yet.
         _ => return None,

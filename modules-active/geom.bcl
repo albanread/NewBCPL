@@ -1,0 +1,13 @@
+// geom.bcl — depends on the maths module.
+//
+// Calls maths_sq directly. Whether this resolves at JIT time
+// depends on whether the loader feeds prior-loaded modules'
+// addresses into this module's execution engine before its code
+// is finalised. (See the v0 implementation in src/newbcpl-llvm
+// for the load order.)
+
+LET area_of_square(side) = maths_sq(side)
+
+LET area_of_rect(w, h) = w * h
+
+LET perimeter_of_rect(w, h) = 2 * (w + h)

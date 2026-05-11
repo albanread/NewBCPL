@@ -1,0 +1,86 @@
+// igui.bcl — BCPL convenience wrappers over the runtime's iGui surface.
+//
+// Loaded automatically by the driver when running in GUI mode. After
+// auto-prefix, the top-level routines become `igui_open`,
+// `igui_close`, `igui_clear`, `igui_fill_rect`, … — the names a BCPL
+// program calls.
+//
+// The wrappers hide three things from BCPL source:
+//   1. The `(ptr, len)` open-array string convention used by the
+//      underlying `iGui_*` builtins.
+//   2. The pass-by-VAR output pointer for `OpenChild`.
+//   3. The corner-radius / half-thickness arguments that the raw
+//      builtins carry for fidelity with the CP surface.
+//
+// Colours are floats in 0.0..=1.0; coordinates are floats in DIPs
+// (logical pixels). Pass float literals (`1.0`, not `1`) — the
+// builtin signatures use Win64's XMM-register float convention and
+// integer arguments would arrive in the wrong registers.
+
+// Open a new MDI child window with the given title; returns its
+// window id. Caller stores the id and passes it to subsequent draw
+// calls. Returns 0 on failure (rare — the GUI thread must be up).
+LET open(title) = VALOF $(
+    LET id = 0
+    iGui_OpenChild(title, @id)
+    RESULTIS id
+$)
+
+// Close a previously-opened window.
+LET close(id) BE iGui_CloseChild(id)
+
+// Update the title bar of an existing window.
+LET set_title(id, title) BE iGui_SetTitle(id, title)
+
+// Start a draw batch for `id`. Subsequent clear/fill/stroke/text
+// calls accumulate in this batch; call submit() to flush them.
+LET begin(id) BE iGui_BeginBatch(id)
+
+// Send the open batch to the GUI thread for execution against the
+// window's render target. Returns 1 on success.
+LET submit() = iGui_SubmitBatch()
+
+// Fill the entire window with `(r, g, b, a)`. Premultiplied alpha
+// is the renderer's convention but for opaque colours `a = 1.0` is
+// always right.
+LET clear(r, g, b, a) BE iGui_Clear(r, g, b, a)
+
+// Filled rectangle, axis-aligned corners (x0, y0) and (x1, y1).
+LET fill_rect(x0, y0, x1, y1, r, g, b, a)
+    BE iGui_FillRect(x0, y0, x1, y1, r, g, b, a)
+
+// Outlined rectangle of pen width `thickness`.
+LET stroke_rect(x0, y0, x1, y1, thickness, r, g, b, a)
+    BE iGui_StrokeRect(x0, y0, x1, y1, thickness, r, g, b, a)
+
+// Filled circle at `(cx, cy)` with the given radius.
+LET fill_circle(cx, cy, radius, r, g, b, a)
+    BE iGui_FillCircle(cx, cy, radius, r, g, b, a)
+
+// Straight line from (x0, y0) to (x1, y1) of pen width `thickness`.
+LET line(x0, y0, x1, y1, thickness, r, g, b, a)
+    BE iGui_DrawLine(x0, y0, x1, y1, thickness, r, g, b, a)
+
+// Draw `text` with a Segoe UI default font, baseline-anchored at
+// (x, y). `size` is the font size in DIPs.
+LET text(text_ptr, x, y, size, r, g, b, a)
+    BE iGui_DrawText(text_ptr, x, y, size, r, g, b, a)
+
+// Pull the next event from the iGui mailbox. The eight `@kind`,
+// `@child`, ... parameters receive the flattened event payload (see
+// the table in src/newbcpl-runtime/src/igui_builtins.rs for the
+// per-kind field semantics). `timeout_ms` < 0 blocks indefinitely.
+// Returns 1 if an event was delivered, 0 on timeout. After mangling
+// this is callable as `igui_next_event(...)`.
+LET next_event(out_kind, out_child, out_time,
+               out_p1, out_p2, out_p3, out_p4,
+               timeout_ms)
+    = iGui_NextEvent(out_kind, out_child, out_time,
+                     out_p1, out_p2, out_p3, out_p4,
+                     timeout_ms)
+
+// Programmatically close the iGui frame — posts WM_CLOSE on the GUI
+// thread. After this the JIT host's main thread will tear the
+// process down once it sees WM_QUIT, so the calling program should
+// return from START soon after.
+LET quit() BE iGui_Quit()

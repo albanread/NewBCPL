@@ -223,12 +223,27 @@ fn bit_shr_arithmetic() {
 }
 
 #[test]
-fn word_form_and_or() {
-    // `AND` and `OR` are word-form synonyms for `&` and `|`.
+fn word_form_band_bor() {
+    // Bitwise operators: `BAND` is the word form of `&`, `BOR` is the
+    // word form of `|`. The unprefixed `AND` / `OR` are *logical*
+    // and would return 1 / 1 here regardless of the operands' values,
+    // so this probe must use the B-prefixed forms.
     expect(
-        "word_form_and_or",
-        "LET START() BE $(\n  WRITEN(12 AND 10)\n  WRITES(\"*S\")\n  WRITEN(12 OR 10)\n$)\n",
+        "word_form_band_bor",
+        "LET START() BE $(\n  WRITEN(12 BAND 10)\n  WRITES(\"*S\")\n  WRITEN(12 BOR 10)\n$)\n",
         "8 14",
+    );
+}
+
+#[test]
+fn word_form_logical_and_or() {
+    // Logical `AND` / `OR`: reduce each operand to a 0/1 boolean by
+    // comparing to zero, then combine. Both operands non-zero ⇒ 1
+    // (regardless of bit pattern); either ⇒ 1 for OR.
+    expect(
+        "word_form_logical_and_or",
+        "LET START() BE $(\n  WRITEN(12 AND 10)\n  WRITES(\"*S\")\n  WRITEN(12 OR 0)\n  WRITES(\"*S\")\n  WRITEN(0 AND 5)\n$)\n",
+        "1 1 0",
     );
 }
 

@@ -1,0 +1,34 @@
+// maths.bcl — sample BCPL module.
+//
+// Loaded automatically by `newbcpl-driver run` from the active-modules
+// folder (./modules-active/ by default, $NEWBCPL_MODULES_ACTIVE to
+// override). Every top-level function below is renamed at JIT time
+// to `maths_<name>`, so a program calls `maths_sq(5)` and gets 25.
+//
+// v0 convention: no DECLARE MODULE keyword yet — module name comes
+// from the filename stem (`maths` here). No EXPORT qualifier yet —
+// every top-level function is exported. Internal helpers, when we
+// need them, will land alongside an EXPORT keyword in a follow-up.
+
+LET sq(x) = x * x
+
+LET cube(x) = x * x * x
+
+LET abs2(x) = x < 0 -> 0 - x, x
+
+LET max2(a, b) = a > b -> a, b
+
+LET min2(a, b) = a < b -> a, b
+
+LET clamp(x, lo, hi) = x < lo -> lo, x > hi -> hi, x
+
+LET sum_to(n) = VALOF $(
+    LET total = 0
+    FOR i = 1 TO n DO total := total + i
+    RESULTIS total
+$)
+
+// Backwards dependency: maths calls into geom (alphabetically
+// later module). Proves the link-based loader handles this just
+// fine — no order constraint on cross-module references.
+LET hypot_squared(a, b) = geom_area_of_square(a) + geom_area_of_square(b)

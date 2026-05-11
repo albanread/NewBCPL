@@ -121,14 +121,129 @@ pub fn dump_asm(path: &Path) -> String {
 /// Returns the value `START` produced — typically 0 by BCPL
 /// convention. Errors during compilation, linking, or execution
 /// surface as `Err(String)` so the driver can print them.
+///
+/// Equivalent to `run_with_active_folder(path, None)` — no modules
+/// are pre-loaded.
 pub fn run(path: &Path) -> Result<i64, String> {
-    let ir = build_ir(path)?;
-    let context = Context::create();
-    let module = emit::emit(&context, &ir);
+    run_with_active_folder(path, None)
+}
 
-    // MCJIT initialisation. `Default` optimisation runs mem2reg /
-    // simple folding — enough to make the loops we already emit
-    // look like the assembly we showed earlier.
+/// Same as `run`, but first scans `modules_dir` (if `Some`) for
+/// `.bcl` files and *links* each into the program's LLVM module
+/// before creating the JIT engine. Module top-level functions are
+/// renamed `<stem>_<name>` post-emit; after linking, every
+/// cross-module call (program→module, module→module, mutual-recursive)
+/// is just a normal LLVM call resolved by LLVM's linker. No
+/// address-threading, no MCJIT `add_global_mapping` for module
+/// functions — only for the host-process built-ins.
+///
+/// A missing or empty `modules_dir` is fine — no modules are loaded.
+/// A single module's compile or link failure aborts the whole run
+/// with a clear error.
+pub fn run_with_active_folder(
+    path: &Path,
+    modules_dir: Option<&Path>,
+) -> Result<i64, String> {
+    let ir = build_ir(path)?;
+    run_program_ir(&ir, modules_dir)
+}
+
+/// Same as [`run_with_active_folder`] but the program's source is
+/// passed in as a string instead of a file path. The active-modules
+/// folder is still scanned as files. Used by the GUI driver to JIT
+/// the current bedit buffer without round-tripping through disk —
+/// the user's unsaved edits run immediately on Ctrl+R / Program ▸ Run.
+///
+/// `module_name` is the name embedded in the IR (visible in dump-ir,
+/// dump-llvm output). The driver passes the launch-time file stem so
+/// the IR looks the same as a file-based run.
+pub fn run_source_with_active_folder(
+    source: &str,
+    module_name: &str,
+    modules_dir: Option<&Path>,
+) -> Result<i64, String> {
+    let ir = build_ir_from_source(source, module_name)?;
+    run_program_ir(&ir, modules_dir)
+}
+
+/// Heavy work shared by [`run_with_active_folder`] and
+/// [`run_source_with_active_folder`]: spin up an LLVM Context, emit
+/// the program IR, link every module file's IR into it, JIT, and
+/// invoke `START`.
+fn run_program_ir(ir: &IrModule, modules_dir: Option<&Path>) -> Result<i64, String> {
+    let context = Context::create();
+
+    // ─── Program emit (first, so we have the host module to link into) ─
+    let module = emit::emit(&context, ir);
+
+    // ─── Module phase ─────────────────────────────────────────────
+    // For every *.bcl in modules_dir (alphabetical), parse → sema →
+    // IR → LLVM emit into a fresh Module<'ctx>, rename top-level
+    // functions with the module prefix, then link into the program
+    // module. After linking, the program module contains every
+    // exported function as a real definition.
+    //
+    // Accumulate all the modules' IR layouts (class vtable
+    // descriptions) into `all_layouts` so the vtable-patch loop
+    // below can fix up vtables emitted by modules too. Modules in
+    // v0 are class-free in practice, but the wiring is here so the
+    // first class-shipping module doesn't break things silently.
+    let mut all_layouts = ir.layouts.clone();
+    if let Some(dir) = modules_dir {
+        if dir.is_dir() {
+            let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+                .map_err(|e| format!("io: read_dir {}: {e}", dir.display()))?
+                .filter_map(|r| r.ok())
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|x| x == "bcl"))
+                .collect();
+            paths.sort();
+            for mpath in &paths {
+                let stem = mpath
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .ok_or_else(|| {
+                        format!("module path has no stem: {}", mpath.display())
+                    })?;
+                let mod_ir = build_ir(mpath)?;
+                let mod_llvm = emit::emit(&context, &mod_ir);
+
+                // Rename top-level user functions in this module
+                // to `<stem>_<name>` before linking. LLVM updates
+                // intra-module call sites automatically (calls hold
+                // a FunctionValue reference, not a name string).
+                use inkwell::llvm_sys::core::LLVMSetValueName2;
+                use inkwell::values::AsValueRef;
+                for ir_fn in &mod_ir.functions {
+                    if let Some(fv) = mod_llvm.get_function(&ir_fn.name) {
+                        let new_name = format!("{}_{}", stem, ir_fn.name);
+                        unsafe {
+                            LLVMSetValueName2(
+                                fv.as_value_ref(),
+                                new_name.as_ptr() as *const i8,
+                                new_name.len(),
+                            );
+                        }
+                    }
+                }
+
+                // Link the module into the program. After this the
+                // mod_llvm is consumed; its functions live in the
+                // program module's symbol table.
+                module
+                    .link_in_module(mod_llvm)
+                    .map_err(|e| format!("link module {stem}: {}", e.to_string()))?;
+
+                all_layouts.extend(mod_ir.layouts.iter().cloned());
+                eprintln!(
+                    "[loader] module {stem}: {} functions linked",
+                    mod_ir.functions.len()
+                );
+            }
+        }
+    }
+
+    // ─── JIT setup ────────────────────────────────────────────────
     let exec_engine = module
         .create_jit_execution_engine(OptimizationLevel::Default)
         .map_err(|e| format!("create_jit_execution_engine: {}", e.to_string()))?;
@@ -147,7 +262,8 @@ pub fn run(path: &Path) -> Result<i64, String> {
     // module declares without a body (linkage = external, no entry
     // basic block) and that we did not just register a mapping for
     // would otherwise be called at address 0 and segfault. Surface
-    // it as a clean diagnostic instead.
+    // it as a clean diagnostic instead. With module linking,
+    // cross-module references now have bodies and pass the check.
     let mut missing: Vec<String> = Vec::new();
     let mut fopt = module.get_first_function();
     while let Some(f) = fopt {
@@ -185,7 +301,7 @@ pub fn run(path: &Path) -> Result<i64, String> {
     };
     use inkwell::values::AsValueRef;
     use std::ffi::CString;
-    for layout in &ir.layouts {
+    for layout in &all_layouts {
         if layout.vtable.is_empty() {
             continue;
         }
@@ -268,18 +384,23 @@ pub fn run(path: &Path) -> Result<i64, String> {
     };
     let _ = start_fn; // suppress unused; we used .get_function for the name lookup
     let result = unsafe { start.call() };
+
     Ok(result)
 }
 
 fn build_ir(path: &Path) -> Result<IrModule, String> {
     let source = std::fs::read_to_string(path).map_err(|e| format!("io: {e}"))?;
-    let program = newbcpl_parser::parse_source(&source)
-        .map_err(|e| format!("parse: {}", e.render()))?;
-    let sema = newbcpl_sema::analyze(&program);
     let module_name = path
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("module");
+    build_ir_from_source(&source, module_name)
+}
+
+fn build_ir_from_source(source: &str, module_name: &str) -> Result<IrModule, String> {
+    let program = newbcpl_parser::parse_source(source)
+        .map_err(|e| format!("parse: {}", e.render()))?;
+    let sema = newbcpl_sema::analyze(&program);
     Ok(newbcpl_ir::lower(&program, &sema, module_name))
 }
 

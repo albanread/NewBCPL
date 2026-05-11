@@ -1,0 +1,36 @@
+// use-maths.bcl — program demonstrating module loading.
+//
+// Run via `newbcpl-driver run examples/use-maths.bcl`. The driver
+// first scans ./modules-active/ and loads maths.bcl, then JITs and
+// runs this file. Each `maths_*` call resolves through the loader's
+// add_global_mapping into the maths module's JIT'd code.
+
+LET START() BE $(
+    WRITES("maths_sq(7)        = ")
+    WRITEN(maths_sq(7))
+    NEWLINE()
+
+    WRITES("maths_cube(4)      = ")
+    WRITEN(maths_cube(4))
+    NEWLINE()
+
+    WRITES("maths_abs2(-13)    = ")
+    WRITEN(maths_abs2(0 - 13))
+    NEWLINE()
+
+    WRITES("maths_max2(8, 19)  = ")
+    WRITEN(maths_max2(8, 19))
+    NEWLINE()
+
+    WRITES("maths_min2(8, 19)  = ")
+    WRITEN(maths_min2(8, 19))
+    NEWLINE()
+
+    WRITES("maths_clamp(50, 0, 10) = ")
+    WRITEN(maths_clamp(50, 0, 10))
+    NEWLINE()
+
+    WRITES("maths_sum_to(10)   = ")
+    WRITEN(maths_sum_to(10))
+    NEWLINE()
+$)

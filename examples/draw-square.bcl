@@ -1,0 +1,50 @@
+// draw-square.bcl — first BCPL program that opens a graphics window.
+//
+//   cargo run -p newbcpl-driver -- gui examples/draw-square.bcl
+//
+// Hits Ctrl+R / Program ▸ Run. Opens an MDI child titled "Shapes",
+// fills it with a light slate background, then draws a red square,
+// a blue stroke circle, a green line, and a text caption.
+//
+// Uses the `igui_*` convenience module from modules-active/igui.bcl
+// — those are thin BCPL wrappers around the `iGui_*` builtins that
+// the runtime registers (see src/newbcpl-runtime/src/igui_builtins.rs).
+//
+// Colour components are floats 0.0..=1.0. Coordinates are DIPs.
+
+LET START() BE $(
+    LET win = igui_open("Shapes")
+
+    WRITES("opened window id=")
+    WRITEN(win)
+    NEWLINE()
+
+    igui_begin(win)
+
+    // Background: dark slate.
+    igui_clear(0.12, 0.14, 0.18, 1.0)
+
+    // Filled red square, 100x100, top-left at (40, 40).
+    igui_fill_rect(40.0, 40.0, 140.0, 140.0,
+                   0.92, 0.30, 0.30, 1.0)
+
+    // Cyan circle stroke at (260, 90) radius 50, pen 3.
+    igui_stroke_rect(200.0, 40.0, 320.0, 140.0,
+                     3.0,
+                     0.30, 0.85, 0.95, 1.0)
+    igui_fill_circle(260.0, 90.0, 38.0,
+                     0.30, 0.85, 0.95, 1.0)
+
+    // Green diagonal line across the lower band.
+    igui_line(40.0, 200.0, 320.0, 280.0,
+              4.0,
+              0.40, 0.90, 0.40, 1.0)
+
+    // White caption.
+    igui_text("Hello from BCPL!", 40.0, 320.0, 22.0,
+              1.0, 1.0, 1.0, 1.0)
+
+    igui_submit()
+
+    WRITES("submitted batch; window will stay until you close it*N")
+$)

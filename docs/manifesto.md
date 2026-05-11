@@ -77,6 +77,24 @@ Classic BCPL had no automatic heap management — `getvec` / `freevec` by hand. 
 
 Reference counting was rejected: atomic refcount updates on every assignment hammer SIMD-heavy numerical code, and cycles need a tracing collector anyway. SAMM (the reference's scope-bound automatic free) was rejected: scope is the wrong granularity for ownership once aliasing exists, and the reference's bloom-filter double-free detector confirms it in practice.
 
+## 6. iGui is the runtime
+
+NewBCPL does not ship a compiler that hosts an optional GUI library. It ships a GUI that hosts a compiler. The same process edits source, JITs it, runs it, and renders its windows.
+
+- **UI thread is the main thread.** `igui::run` is the process entrypoint. It registers WndClasses, creates the MDI frame, and only then spawns a *language thread* via the worker closure it takes. Process lifetime equals frame lifetime; a hard fault in the language thread closes user windows but the frame, bedit, and the log view stay up so the user can edit, recheck, and reload.
+- **Two threads, narrow channels.** UI thread owns every HWND, runs the message pump, paints. Language thread runs sema, the JIT, and JIT-emitted code. They communicate only through `igui::channels` (typed events GUI → language) and through the per-child `batch` / `text_view` command queues (commands language → GUI). No shared HWNDs, no Win32 calls from the language thread.
+- **Sema is the checker.** `newbcpl-sema` runs on the UI thread when bedit asks for diagnostics — typing is cheap, sema is cheap, and the language thread may be busy in user code. The driver installs the closure with `igui::install_checker` at startup; bedit calls it on F7, on save, and on focus loss.
+- **Whole programs only.** BCPL has no snippet REPL. To run anything the user picks a program file in bedit; the runtime resolves its `GET` includes, sema-checks the bundle, JITs it as one unit, and invokes its entrypoint on the language thread. Replacing the loaded program tears down its JIT memory and any windows it opened — the frame and the shared modules stay.
+- **GLOBALS vector is the shared-module mechanism.** Classic BCPL's GLOBALS is a flat indirection table; here it is also the shared-module ABI. A separately-JITted compilation unit (a "GLOBAL module") registers its entrypoints into named GLOBALS slots. Modules form the BCPL runtime support library — `WRITES`, `WRITEF`, file I/O, heap inspection — all of which are Rust-resident modules registered at bootstrap under literal names. JIT-compiled BCPL modules auto-prefix their exports with the module name (`calc_add`, `colour_console_print`), turning the mangling convention into the namespace mechanism without any new syntax. The compiler resolves unbound names by querying the loader's live symbol table — `GET "header.h"` keeps its classical textual-include meaning but is no longer required for module-API access. Programs are not modules: they cannot install or unload modules, and they run one at a time. There is no automatic dependency resolution: the user curates the loaded set by dropping files into the active-modules folder or by writing a startup script. The CLI window is the gatekeeper for both module lifecycle (`/load`, `/unload`, `/reinit`, `/ensure`, `/install`, `/remove`) and program execution (`/run`, `/execute`); see [module_system.md](module_system.md) for the export-directory shape, the loader veneer over NewCP's `LoaderSession`, the active-modules folder, and the TRIPOS-flavoured CLI.
+
+This decision settles the window-ownership taxonomy that has been implicit since the iGui port:
+
+- **iGui-owned windows.** The MDI frame, `bedit`, the log view. Created by `igui::run`; the language thread cannot close them; they outlive any user program.
+- **Program-owned windows.** Opened by the currently-loaded user program via `iGui.OpenChild`. Closed automatically when the program is unloaded or replaced.
+- **GLOBAL-module-owned windows.** Opened by a module installed in the GLOBALS vector. Closed when that GLOBALS slot is replaced or cleared. A logger module that opens a docked panel keeps its panel as long as it remains registered.
+
+Reload semantics follow from the taxonomy: choosing a new program in bedit closes program-owned windows, releases the previous program's JIT memory, then loads + JITs + invokes the new program. The user sees the frame, bedit, the log view, and any GLOBAL-module panels stay put; the application area changes. This is why iGui exists at all — to provide a stable shell the user's program plugs into, not a window the user's program owns.
+
 ## What this is not
 
 - Not literal compatibility with the reference NBCPL compiler. The reference is the spec; its bugs are not.
@@ -90,13 +108,14 @@ Reference counting was rejected: atomic refcount updates on every assignment ham
 - Rust 2024 edition, Cargo workspace mirroring NewCP's shape.
 - LLVM 22 via Inkwell 0.9.
 - MCJIT today, ORC v2 later (alongside NewCP's migration).
-- Direct2D + DirectWrite for `iGui`, `x86_64-pc-windows-msvc` only.
+- Direct2D + DirectWrite for `iGui`, `x86_64-pc-windows-msvc` only — see section 6 for the iGui-as-runtime contract.
 - Mark-sweep GC adapted from NewCP's `gc.rs`.
 - Phase-visible compiler driver: `dump-tokens`, `dump-ast`, `dump-sema`, `dump-cfg`, `dump-ir`, `dump-llvm`, `dump-asm`, `dump-heap`.
 
 ## Open questions
 
 1. **Concurrency primitives.** The reference reserves `SEND` / `ACCEPT` / `REMANAGE` keywords. Their semantics are unclear and they are out of scope until single-threaded NewBCPL is solid.
+2. **GLOBAL-module ABI.** Section 6 names `igui_replace_global(name, fn_ptr)` as the runtime side; the manifest-driven path in [module_system.md](module_system.md) covers the common case (modules declare slots in the manifest, runtime installs them). The dynamic case is still open: BCPL source that wants to install a slot from within a running routine needs a primitive — a built-in `INSTALL "name" = expr`, an ordinary function call, or both? Decide alongside the JIT-side ABI.
 
 ## Lineage
 

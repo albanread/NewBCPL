@@ -1,0 +1,90 @@
+// event-pump.bcl — BCPL program drains iGui events through the
+// channels mailbox.
+//
+//   cargo run -p newbcpl-driver -- gui examples/event-pump.bcl
+//
+// Opens an MDI child, paints a single splash, then loops on
+// `igui_next_event(-1)` (block forever). Each event prints a line
+// into the log view. Mouse, key, and resize events come in. Close
+// the child or the frame to exit the loop.
+//
+// `igui_next_event` flattens every IGuiEvent variant into seven
+// integer outputs (kind, child, time_ms, p1, p2, p3, p4). The kind
+// is one of (1=KEY, 2=CHAR, 3=MOUSE, 4=FOCUS, 5=RESIZE, 6=PAINT,
+// 7=CLOSE, 8=FRAME_CLOSE, 9=MENU, 11=DPI_CHANGE, 13=TICK). Per-kind
+// field semantics are documented next to `iGui.NextEvent` in
+// src/newbcpl-runtime/src/igui/cp_exports.rs.
+//
+// The numeric kinds are inlined as integer literals because
+// GET-style header inclusion is not yet implemented in NewBCPL.
+
+LET START() BE $(
+    LET win = igui_open("Event Pump")
+
+    igui_begin(win)
+    igui_clear(0.10, 0.15, 0.25, 1.0)
+    igui_text("Click here, type, drag the corner.",
+              20.0, 50.0, 18.0,
+              1.0, 1.0, 1.0, 1.0)
+    igui_text("Close this window or the frame to exit.",
+              20.0, 80.0, 18.0,
+              0.80, 0.80, 0.80, 1.0)
+    igui_submit()
+
+    LET kind = 0
+    LET child = 0
+    LET t = 0
+    LET p1 = 0
+    LET p2 = 0
+    LET p3 = 0
+    LET p4 = 0
+    LET count = 0
+    LET running = 1
+
+    WRITES("[event-pump] entering loop*N")
+
+    WHILE running DO $(
+        UNLESS igui_next_event(@kind, @child, @t,
+                               @p1, @p2, @p3, @p4,
+                               -1) DO LOOP
+        count := count + 1
+
+        SWITCHON kind INTO $(
+            CASE 1:                                  // KEY
+                WRITEF("[%d] key vk=%d down=%d*N",
+                       count, p1, p4 BAND 1)
+                ENDCASE
+            CASE 2:                                  // CHAR
+                WRITEF("[%d] char U+%x mods=%d*N",
+                       count, p1, p2)
+                ENDCASE
+            CASE 3:                                  // MOUSE
+                // p3 packs (mods | button<<8 | op<<16);
+                // op: 0=MOVE, 1=LDOWN, 2=LUP, 3=RDOWN, 4=RUP, 5=WHEEL
+                WRITEF("[%d] mouse %d,%d op=%d*N",
+                       count, p1, p2, (p3 >> 16) BAND 255)
+                ENDCASE
+            CASE 5:                                  // RESIZE
+                WRITEF("[%d] resize %dx%d*N",
+                       count, p1, p2)
+                ENDCASE
+            CASE 6:                                  // PAINT
+                WRITEF("[%d] paint child=%d*N", count, child)
+                ENDCASE
+            CASE 7:                                  // CLOSE (child)
+                WRITEF("[%d] close child=%d*N", count, child)
+                running := 0
+                ENDCASE
+            CASE 8:                                  // FRAME_CLOSE
+                WRITEF("[%d] frame close*N", count)
+                running := 0
+                ENDCASE
+            DEFAULT:
+                WRITEF("[%d] kind=%d child=%d p1=%d*N",
+                       count, kind, child, p1)
+                ENDCASE
+        $)
+    $)
+
+    WRITEF("[event-pump] exited after %d events*N", count)
+$)

@@ -1729,18 +1729,28 @@ impl Parser {
             (TokenKind::Symbol, ">=.") | (TokenKind::Symbol, ">=#") => {
                 Some((BinaryOp::FGe, 4))
             }
-            // Bitwise / logical AND (precedence 3). `AND` is the
-            // word-form synonym for `&` per the reference lexer; the
-            // declaration-tail use (`LET f = ... AND g = ...`) is a
+            // Precedence 3 — AND family:
+            //   `&` symbol form → bitwise (`BitAnd`), matches C convention
+            //   `BAND` keyword → bitwise
+            //   `AND` keyword  → *logical* (returns 0/1)
+            // The declaration-tail use (`LET f = ... AND g = ...`) is a
             // separate form handled at LET-parse time, not here.
             (TokenKind::Symbol, "&") => Some((BinaryOp::BitAnd, 3)),
-            (TokenKind::Keyword, "AND") => Some((BinaryOp::BitAnd, 3)),
-            // Bitwise / logical OR + EQV / NEQV (precedence 2). `OR`
-            // is the word-form synonym for `|`. Inside a `.|…|` lane
-            // bracket, the `|` is the closing delimiter, not an
-            // operator — see `lane_depth`.
+            (TokenKind::Keyword, "BAND") => Some((BinaryOp::BitAnd, 3)),
+            (TokenKind::Keyword, "AND") => Some((BinaryOp::LogAnd, 3)),
+            // Precedence 2 — OR / XOR / EQV family:
+            //   `|` symbol form → bitwise (`BitOr`); inside a `.|…|`
+            //     lane bracket the `|` is the closing delimiter, not
+            //     an operator — see `lane_depth`.
+            //   `BOR` / `BXOR` / `NEQV` keywords → bitwise
+            //   `OR` / `XOR` keywords            → logical
+            //   `EQV` is the single-value equality test (lowered to
+            //     `==`); kept for back-compat.
             (TokenKind::Symbol, "|") if self.lane_depth == 0 => Some((BinaryOp::BitOr, 2)),
-            (TokenKind::Keyword, "OR") => Some((BinaryOp::BitOr, 2)),
+            (TokenKind::Keyword, "BOR") => Some((BinaryOp::BitOr, 2)),
+            (TokenKind::Keyword, "BXOR") => Some((BinaryOp::BitXor, 2)),
+            (TokenKind::Keyword, "OR") => Some((BinaryOp::LogOr, 2)),
+            (TokenKind::Keyword, "XOR") => Some((BinaryOp::LogXor, 2)),
             (TokenKind::Keyword, "EQV") => Some((BinaryOp::Eqv, 2)),
             (TokenKind::Keyword, "NEQV") => Some((BinaryOp::Neqv, 2)),
             _ => None,
@@ -1764,7 +1774,9 @@ impl Parser {
                 hint: unknown_hint(),
             });
         }
-        if self.check_sym("~") || self.check_kw("NOT") {
+        // Bitwise NOT: `~` symbol form, or `BNOT` keyword form. Flips
+        // every bit of the operand.
+        if self.check_sym("~") || self.check_kw("BNOT") {
             let kw = self.eat();
             let operand = self.parse_unary()?;
             let span = SourceSpan {
@@ -1773,6 +1785,22 @@ impl Parser {
             };
             return Ok(Expr::Unary {
                 op: UnaryOp::Not,
+                operand: Box::new(operand),
+                span,
+                hint: unknown_hint(),
+            });
+        }
+        // Logical NOT: `NOT` keyword. Returns 1 if the operand is 0,
+        // else 0. Note this is *not* the same as `BNOT` / `~`.
+        if self.check_kw("NOT") {
+            let kw = self.eat();
+            let operand = self.parse_unary()?;
+            let span = SourceSpan {
+                start: kw.span.start,
+                end: operand.span().end,
+            };
+            return Ok(Expr::Unary {
+                op: UnaryOp::LogNot,
                 operand: Box::new(operand),
                 span,
                 hint: unknown_hint(),

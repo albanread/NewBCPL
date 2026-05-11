@@ -546,8 +546,10 @@ impl TypeConstructorKind {
 pub enum UnaryOp {
     /// `-x` — arithmetic negation.
     Neg,
-    /// `~x` — bitwise / logical NOT (the dialect uses one symbol for both).
+    /// `~x` / `BNOT x` — bitwise NOT (every bit flipped).
     Not,
+    /// `NOT x` — logical NOT. Returns 1 if `x` is 0, else 0.
+    LogNot,
     /// `!x` — pointer dereference (load the word at address x).
     Indirection,
     /// `@x` — address-of x.
@@ -595,11 +597,20 @@ pub enum BinaryOp {
     FLe,
     FGt,
     FGe,
-    // Logical / bitwise
+    // Bitwise (every bit independently)
     BitAnd,
     BitOr,
+    BitXor,
+    /// Equivalence (single-value equality, lowered as `==`).
+    /// Kept for back-compat — programs that really want bitwise
+    /// XNOR can write it as `BNOT (a BXOR b)`.
     Eqv,
+    /// XOR — bitwise. Alias for `BXOR`. Both lower the same way.
     Neqv,
+    // Logical (truthiness-based, return 0 or 1)
+    LogAnd,
+    LogOr,
+    LogXor,
     // Shifts
     Shl,
     Shr,
@@ -742,7 +753,8 @@ impl UnaryOp {
     pub fn as_str(self) -> &'static str {
         match self {
             UnaryOp::Neg => "-",
-            UnaryOp::Not => "~",
+            UnaryOp::Not => "BNOT",
+            UnaryOp::LogNot => "NOT",
             UnaryOp::Indirection => "!",
             UnaryOp::AddressOf => "@",
             UnaryOp::CharIndirection => "%",
@@ -780,10 +792,14 @@ impl BinaryOp {
             BinaryOp::FLe => "<=.",
             BinaryOp::FGt => ">.",
             BinaryOp::FGe => ">=.",
-            BinaryOp::BitAnd => "&",
-            BinaryOp::BitOr => "|",
+            BinaryOp::BitAnd => "BAND",
+            BinaryOp::BitOr => "BOR",
+            BinaryOp::BitXor => "BXOR",
             BinaryOp::Eqv => "EQV",
             BinaryOp::Neqv => "NEQV",
+            BinaryOp::LogAnd => "AND",
+            BinaryOp::LogOr => "OR",
+            BinaryOp::LogXor => "XOR",
             BinaryOp::Shl => "<<",
             BinaryOp::Shr => ">>",
             BinaryOp::Subscript => "!",

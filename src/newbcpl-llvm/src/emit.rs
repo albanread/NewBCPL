@@ -304,6 +304,64 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
             "FWRITE" => i64_t.fn_type(&[f64_t.into()], false),
             "FRND" => f64_t.fn_type(&[], false),
             "RND" => f64_t.fn_type(&[i64_t.into()], false),
+            // iGui wrappers in newbcpl-runtime/src/igui_builtins.rs.
+            // Float coordinates and colours go in XMM registers per
+            // Win64 calling convention, so the LLVM type must use
+            // f64 explicitly — the all-i64 default would route them
+            // through integer registers and produce garbage.
+            "iGui_OpenChild" => i64_t.fn_type(&[ptr_t.into(), ptr_t.into()], false),
+            "iGui_CloseChild" => i64_t.fn_type(&[i64_t.into()], false),
+            "iGui_SetTitle" => i64_t.fn_type(&[i64_t.into(), ptr_t.into()], false),
+            "iGui_BeginBatch" => i64_t.fn_type(&[i64_t.into()], false),
+            "iGui_SubmitBatch" => i64_t.fn_type(&[], false),
+            "iGui_Clear" => i64_t.fn_type(
+                &[f64_t.into(), f64_t.into(), f64_t.into(), f64_t.into()],
+                false,
+            ),
+            // (x0, y0, x1, y1, r, g, b, a)
+            "iGui_FillRect" => i64_t.fn_type(
+                &[
+                    f64_t.into(), f64_t.into(), f64_t.into(), f64_t.into(),
+                    f64_t.into(), f64_t.into(), f64_t.into(), f64_t.into(),
+                ],
+                false,
+            ),
+            // (x0, y0, x1, y1, thickness, r, g, b, a)
+            "iGui_StrokeRect" | "iGui_DrawLine" => i64_t.fn_type(
+                &[
+                    f64_t.into(), f64_t.into(), f64_t.into(), f64_t.into(),
+                    f64_t.into(), f64_t.into(), f64_t.into(), f64_t.into(),
+                    f64_t.into(),
+                ],
+                false,
+            ),
+            // (cx, cy, radius, r, g, b, a)
+            "iGui_FillCircle" => i64_t.fn_type(
+                &[
+                    f64_t.into(), f64_t.into(), f64_t.into(),
+                    f64_t.into(), f64_t.into(), f64_t.into(), f64_t.into(),
+                ],
+                false,
+            ),
+            // (text*, x, y, size, r, g, b, a)
+            "iGui_DrawText" => i64_t.fn_type(
+                &[
+                    ptr_t.into(),
+                    f64_t.into(), f64_t.into(), f64_t.into(),
+                    f64_t.into(), f64_t.into(), f64_t.into(), f64_t.into(),
+                ],
+                false,
+            ),
+            // (kind*, child*, time*, p1*, p2*, p3*, p4*, timeout_ms)
+            "iGui_NextEvent" => i64_t.fn_type(
+                &[
+                    ptr_t.into(), ptr_t.into(), ptr_t.into(), ptr_t.into(),
+                    ptr_t.into(), ptr_t.into(), ptr_t.into(),
+                    i64_t.into(),
+                ],
+                false,
+            ),
+            "iGui_Quit" => i64_t.fn_type(&[], false),
             // Default: i64 fn(i64, ..., i64).
             _ => {
                 let args: Vec<BasicMetadataTypeEnum> =

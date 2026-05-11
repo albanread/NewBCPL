@@ -116,7 +116,15 @@ const KEYWORDS: &[&str] = &[
     "SWITCHON", "INTO", "CASE", "DEFAULT", "ENDCASE",
     "GOTO", "RETURN", "FINISH", "BREAK", "LOOP",
     "TRUE", "FALSE",
-    "NOT", "REM", "EQV", "NEQV",
+    // Logical (truthiness-based, return 0/1)
+    "NOT", "XOR",
+    // Bitwise (operate on every bit)
+    "BAND", "BOR", "BXOR", "BNOT",
+    // Remaining classics: REM is integer remainder, EQV/NEQV are
+    // bitwise xnor/xor kept for backward compatibility (NEQV is
+    // a synonym for BXOR; EQV is a single-value equality test
+    // historically expressed bitwise).
+    "REM", "EQV", "NEQV",
     "GET",
     // Dialect extensions: see reference/documentation/BCPL float extension.md
     // and reference/documentation/classes_and_objects.md

@@ -1,0 +1,19 @@
+// hello.bcl — first GUI hello world.
+//
+// Run with:
+//   cargo run -p newbcpl-driver -- gui examples/hello.bcl
+//
+// The driver opens the iGui frame; bedit and the log view auto-
+// open in the MDI client. Output from WRITES / WRITEN / NEWLINE
+// is captured by a console callback and pushed line-by-line into
+// the log view. Press Ctrl+R or pick Program ▸ Run to invoke
+// START.
+
+LET START() BE $(
+    WRITES("Hello, My 3 GUI world!*N")
+    WRITES("WRITEN: ")
+    WRITEN(2025)
+    NEWLINE()
+    WRITES("WRITEF: ")
+    WRITEF("answer=%d, hex=%x*N", 42, 255)
+$)

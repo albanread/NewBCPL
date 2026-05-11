@@ -1,0 +1,94 @@
+// click-counter.bcl — first interactive BCPL app for the iGui frame.
+//
+//   cargo run -p newbcpl-driver -- gui examples/click-counter.bcl
+//
+// Hit Ctrl+R. A "Click Counter" child opens with a square. Every left
+// click on it cycles the square through six colours and bumps a
+// counter; the count is logged on every click. Closing the child or
+// the frame exits the loop cleanly.
+//
+// This is the minimum pattern for an interactive iGui app:
+//   1.  open the window once
+//   2.  paint the initial state
+//   3.  loop on next_event(-1)
+//   4.  on input events, mutate state + repaint
+//   5.  on Close / FrameClose, drop out of the loop and return
+//
+// State (count) is plain BCPL locals in START — no module-private-word
+// machinery yet. The program lives for the duration of the loop;
+// the JIT memory drops on return from START.
+//
+// Event-kind constants are inlined as integer literals (1=KEY,
+// 3=MOUSE, 7=CLOSE, 8=FRAME_CLOSE) until GET-header support lands;
+// see `iGui_NextEvent` documentation in
+// src/newbcpl-runtime/src/igui_builtins.rs for the full table.
+
+// Paint one frame. Hue cycles through six colours; `count REM 6`
+// picks the band. The square is anchored at (50, 60)–(250, 260).
+LET paint(win, count) BE $(
+    igui_begin(win)
+    igui_clear(0.08, 0.10, 0.14, 1.0)
+    igui_text("Click the square.   Close window to exit.",
+              20.0, 30.0, 16.0,
+              0.85, 0.85, 0.85, 1.0)
+
+    SWITCHON count REM 6 INTO $(
+        CASE 0: igui_fill_rect(50.0, 60.0, 250.0, 260.0, 0.95, 0.30, 0.30, 1.0)
+                ENDCASE
+        CASE 1: igui_fill_rect(50.0, 60.0, 250.0, 260.0, 0.95, 0.65, 0.20, 1.0)
+                ENDCASE
+        CASE 2: igui_fill_rect(50.0, 60.0, 250.0, 260.0, 0.95, 0.92, 0.20, 1.0)
+                ENDCASE
+        CASE 3: igui_fill_rect(50.0, 60.0, 250.0, 260.0, 0.30, 0.85, 0.30, 1.0)
+                ENDCASE
+        CASE 4: igui_fill_rect(50.0, 60.0, 250.0, 260.0, 0.30, 0.55, 0.95, 1.0)
+                ENDCASE
+        DEFAULT:
+                igui_fill_rect(50.0, 60.0, 250.0, 260.0, 0.80, 0.40, 0.95, 1.0)
+                ENDCASE
+    $)
+
+    igui_submit()
+$)
+
+LET START() BE $(
+    LET win = igui_open("Click Counter")
+    LET count = 0
+    LET kind = 0
+    LET child = 0
+    LET t = 0
+    LET p1 = 0
+    LET p2 = 0
+    LET p3 = 0
+    LET p4 = 0
+    LET running = 1
+
+    paint(win, count)
+    WRITES("[counter] window open; clicks = 0*N")
+
+    WHILE running DO $(
+        UNLESS igui_next_event(@kind, @child, @t,
+                               @p1, @p2, @p3, @p4,
+                               -1) DO LOOP
+
+        SWITCHON kind INTO $(
+            CASE 3:                                  // MOUSE
+                // p3 packs (mods | (button<<8) | (op<<16));
+                // op==1 is LEFT_DOWN — the click we care about.
+                IF ((p3 >> 16) BAND 255) = 1 DO $(
+                    count := count + 1
+                    paint(win, count)
+                    WRITEF("[counter] click %d at (%d, %d)*N",
+                           count, p1, p2)
+                $)
+                ENDCASE
+
+            CASE 7:                                  // CLOSE (child)
+            CASE 8:                                  // FRAME_CLOSE
+                running := 0
+                ENDCASE
+        $)
+    $)
+
+    WRITEF("[counter] exited at %d clicks*N", count)
+$)

@@ -1,0 +1,35 @@
+// use-both.bcl — call into two modules from one program; one of
+// the modules (geom) itself calls into the other (maths).
+//
+// Demonstrates:
+//   1. Program-to-module call (START → maths_cube)
+//   2. Module-to-module call (geom_area_of_square → maths_sq)
+//   3. Multiple program-to-module calls in one run
+
+LET START() BE $(
+    WRITES("Direct program-to-module calls:*N")
+
+    WRITES("  maths_cube(3)            = ")
+    WRITEN(maths_cube(3))
+    NEWLINE()
+
+    WRITES("  geom_area_of_rect(4, 5)  = ")
+    WRITEN(geom_area_of_rect(4, 5))
+    NEWLINE()
+
+    WRITES("  geom_perimeter_of_rect(4, 5) = ")
+    WRITEN(geom_perimeter_of_rect(4, 5))
+    NEWLINE()
+
+    NEWLINE()
+    WRITES("Module-to-module call (geom calls maths):*N")
+    WRITES("  geom_area_of_square(7)   = ")
+    WRITEN(geom_area_of_square(7))
+    NEWLINE()
+
+    NEWLINE()
+    WRITES("Backwards module call (maths calls geom):*N")
+    WRITES("  maths_hypot_squared(3, 4) = ")
+    WRITEN(maths_hypot_squared(3, 4))
+    NEWLINE()
+$)

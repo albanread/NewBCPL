@@ -22,6 +22,10 @@ const COMMANDS: &[(&str, &str)] = &[
     ("dump-heap", "snapshot the runtime heap (not implemented yet)"),
     ("run <path>", "JIT-compile and run the program's START routine"),
     (
+        "gui <path>",
+        "open the iGui frame (bedit + log view); Program ▸ Run / Ctrl+R JITs <path>; console output goes to the log view (Windows only)",
+    ),
+    (
         "test-folder <dir> [report]",
         "compile + JIT every *.bcl in <dir>; write per-test results to [report] (default: test-results.txt)",
     ),
@@ -114,7 +118,19 @@ fn main() -> ExitCode {
         "run" => match args.next() {
             Some(path_arg) => {
                 let path = PathBuf::from(path_arg);
-                match newbcpl_llvm::run(&path) {
+                // Active-modules folder: env override wins, else
+                // `./modules-active/` next to the cwd. A missing
+                // folder is fine — newbcpl_llvm::run_with_active_folder
+                // just loads nothing.
+                let modules_dir = env::var_os("NEWBCPL_MODULES_ACTIVE")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("modules-active"));
+                let modules_arg = if modules_dir.is_dir() {
+                    Some(modules_dir.as_path())
+                } else {
+                    None
+                };
+                match newbcpl_llvm::run_with_active_folder(&path, modules_arg) {
                     Ok(rc) => {
                         // BCPL routines return WORD by convention;
                         // typical programs return 0. Surface the
@@ -132,6 +148,14 @@ fn main() -> ExitCode {
             }
             None => {
                 eprintln!("run: missing source path");
+                print_usage();
+                ExitCode::from(2)
+            }
+        },
+        "gui" => match args.next() {
+            Some(path_arg) => run_gui(PathBuf::from(path_arg)),
+            None => {
+                eprintln!("gui: missing source path");
                 print_usage();
                 ExitCode::from(2)
             }
@@ -200,6 +224,204 @@ fn main() -> ExitCode {
             eprintln!("unknown command: {other}\n");
             print_usage();
             ExitCode::from(2)
+        }
+    }
+}
+
+/// Open the iGui frame and route `Program ▸ Run` (or `Ctrl+R`) at
+/// the JIT pipeline. The UI thread owns the frame, bedit, and the
+/// log view; a worker thread runs the language side — it installs a
+/// console-write callback so `WRITES` / `WRITEN` / `WRITEF` / etc.
+/// drain into the log view, then loops on `iGui::channels::next_event`
+/// waiting for a `Menu` event carrying `RUN_MENU_CMD_ID`.
+///
+/// Each Run dispatches `newbcpl_llvm::run_with_active_folder` against
+/// the path the user gave on the command line. The active-modules
+/// folder is loaded the same way as in headless `run`. Output
+/// streams to the log view via the callback; once `START` returns
+/// the worker logs the result and waits for the next Run.
+///
+/// Currently Windows-only because iGui is Windows-only.
+#[cfg(windows)]
+fn run_gui(program_path: PathBuf) -> ExitCode {
+    use newbcpl_runtime::builtins::set_console_write_callback;
+    use newbcpl_runtime::igui;
+
+    // Resolve active-modules folder the same way `run` does.
+    let modules_dir = env::var_os("NEWBCPL_MODULES_ACTIVE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("modules-active"));
+
+    // The worker thread captures the program path and the modules
+    // folder. It runs on a background OS thread spawned by iGui::run.
+    let worker_path = program_path.clone();
+    let worker = move || {
+        gui_language_worker(worker_path, modules_dir);
+    };
+
+    // Install a console-write callback before iGui::run starts so any
+    // very-early output goes to the log view. Buffers bytes into
+    // lines and pushes each line (newline-terminated) into the log
+    // view. UTF-8 partial sequences sitting in the buffer when no
+    // newline arrives stay there until the next call — fine for
+    // the corpus we care about (ASCII-dominant BCPL source).
+    install_gui_console_callback();
+
+    // Pre-load the program file into bedit so the user's Ctrl+S
+    // writes back to the path the loader actually runs. Without
+    // this, bedit opens empty and an edit-save-run cycle silently
+    // diverges (Ctrl+S → "save as" prompt with a different path,
+    // while Run still reads the original).
+    igui::bedit_set_startup_file(program_path.clone());
+
+    // Optional: drop a one-time banner so users see the log view
+    // working even before they hit Run.
+    igui::log_append(&format!(
+        "newbcpl-driver gui — program: {}",
+        program_path.display()
+    ));
+    igui::log_append("Press Ctrl+R or pick Program ▸ Run to execute.");
+
+    match igui::run(Some(worker)) {
+        Ok(code) => {
+            if code != 0 {
+                eprintln!("[gui] frame exited with code {code}");
+            }
+            // Remove the callback so any post-frame output (unlikely
+            // — process is about to exit) goes back to stdout.
+            set_console_write_callback::<fn(&[u8])>(None);
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("gui: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// Stub for non-Windows builds — iGui only targets Windows.
+#[cfg(not(windows))]
+fn run_gui(_program_path: PathBuf) -> ExitCode {
+    eprintln!("gui: iGui is Windows-only; rebuild on x86_64-pc-windows-msvc");
+    ExitCode::from(64)
+}
+
+/// Buffer console bytes by line and ship complete lines into the
+/// iGui log view. Mutates a process-wide buffer guarded by a mutex;
+/// keyed by thread isn't needed because writes serialise through the
+/// console callback's `Mutex` anyway.
+#[cfg(windows)]
+fn install_gui_console_callback() {
+    use newbcpl_runtime::builtins::set_console_write_callback;
+    use newbcpl_runtime::igui;
+    use std::sync::Mutex;
+
+    static LINE_BUFFER: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+
+    set_console_write_callback(Some(move |bytes: &[u8]| {
+        let mut buf = LINE_BUFFER.lock().expect("LINE_BUFFER poisoned");
+        for &b in bytes {
+            if b == b'\n' {
+                // Flush the accumulated bytes as one log line. UTF-8
+                // is preserved because we never split a codepoint.
+                let line = String::from_utf8_lossy(&buf).into_owned();
+                igui::log_append(&line);
+                buf.clear();
+            } else if b == b'\r' {
+                // Ignore — WRITES may emit `*N` as just `\n`, but
+                // formatted writes sometimes carry CR. Either way,
+                // the log view doesn't want them.
+            } else {
+                buf.push(b);
+            }
+        }
+    }));
+}
+
+/// Run on the iGui language thread. Drains the event mailbox; on
+/// `Menu(RUN_MENU_CMD_ID)`, JIT-runs the program and reports the
+/// result back into the log view. Loops until `FrameClose`.
+#[cfg(windows)]
+fn gui_language_worker(program_path: PathBuf, modules_dir: PathBuf) {
+    use newbcpl_runtime::igui::{self, channels::IGuiEvent};
+
+    igui::log_append(&format!(
+        "[gui-worker] ready — modules folder: {}",
+        if modules_dir.is_dir() {
+            modules_dir.display().to_string()
+        } else {
+            format!("{} (missing — running with no modules)", modules_dir.display())
+        }
+    ));
+
+    loop {
+        // -1 ms blocks indefinitely; we don't need polling because
+        // every action is event-driven.
+        match igui::channels::next_event(-1) {
+            None => continue,
+            Some(IGuiEvent::FrameClose) => {
+                igui::log_append("[gui-worker] frame closed; worker exiting");
+                return;
+            }
+            Some(IGuiEvent::Menu { item_id, .. })
+                if item_id as u16 == igui::RUN_MENU_CMD_ID =>
+            {
+                gui_run_program(&program_path, &modules_dir);
+            }
+            Some(_) => {
+                // Other events are not handled in v0 — bedit owns
+                // its own keystrokes on the UI thread, and nothing
+                // else here cares about resize / focus / etc.
+            }
+        }
+    }
+}
+
+/// Single-shot JIT-and-run on the language thread. Snapshots bedit's
+/// live buffer (saved or not) and JITs that text — the user's
+/// in-editor edits run immediately on Ctrl+R, no Save required.
+/// All console output goes through the installed callback into the
+/// log view.
+#[cfg(windows)]
+fn gui_run_program(program_path: &Path, modules_dir: &Path) {
+    use newbcpl_runtime::igui;
+
+    igui::log_append("---");
+
+    // Use the launch-time filename stem as the IR module name so the
+    // emitted IR looks the same whether sourced from buffer or disk
+    // (and matches what dump-ir / dump-llvm would produce on the file).
+    let module_name = program_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("program");
+
+    let source = match igui::bedit_snapshot_buffer() {
+        Some(s) => {
+            igui::log_append(&format!(
+                "[gui-worker] running bedit buffer ({} bytes; module name '{}')",
+                s.len(),
+                module_name
+            ));
+            s
+        }
+        None => {
+            igui::log_append("[gui-worker] no bedit buffer available; nothing to run");
+            return;
+        }
+    };
+
+    let modules_arg = if modules_dir.is_dir() {
+        Some(modules_dir)
+    } else {
+        None
+    };
+    match newbcpl_llvm::run_source_with_active_folder(&source, module_name, modules_arg) {
+        Ok(code) => {
+            igui::log_append(&format!("[gui-worker] START returned {code}"));
+        }
+        Err(e) => {
+            igui::log_append(&format!("[gui-worker] error: {e}"));
         }
     }
 }

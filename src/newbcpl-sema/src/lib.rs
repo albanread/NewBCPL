@@ -1227,6 +1227,7 @@ impl Sema {
                 match op {
                     UnaryOp::Neg => operand_hint,
                     UnaryOp::Not => TypeHint::Int,
+                    UnaryOp::LogNot => TypeHint::Int,
                     UnaryOp::Indirection => TypeHint::Word,
                     UnaryOp::AddressOf => TypeHint::Word,
                     UnaryOp::CharIndirection => TypeHint::Int,
@@ -1389,7 +1390,8 @@ impl Sema {
                 TypeHint::Float
             }
             Eq | Ne | Lt | Le | Gt | Ge | FEq | FNe | FLt | FLe | FGt | FGe => TypeHint::Int,
-            BitAnd | BitOr | Eqv | Neqv | Shl | Shr => TypeHint::Int,
+            BitAnd | BitOr | BitXor | Eqv | Neqv | Shl | Shr => TypeHint::Int,
+            LogAnd | LogOr | LogXor => TypeHint::Int,
             Subscript => TypeHint::Word,
             CharSubscript => TypeHint::Int,
             FloatSubscript => TypeHint::Float,
