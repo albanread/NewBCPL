@@ -689,12 +689,29 @@ impl Sema {
             // an explicit `AS Type` annotation overrides the
             // inferred hint. The parser stores annotations
             // parallel to bindings in `l.annotations`.
+            let mut class_name = self.class_name_of(expr);
             if let Some(Some(ann)) = l.annotations.get(i) {
                 if let Some(annotated) = type_hint_from_annotation(ann) {
                     hint = annotated;
+                } else if let Some(annotated_class) = self.class_name_from_annotation(ann) {
+                    // `LET p AS Foo = ps!i` — the annotation names a
+                    // known class. Class identity is metadata: we
+                    // record `class_name` so member access
+                    // (`p.field`, `p.method()`) can resolve, but we
+                    // leave the slot's hint as whatever the
+                    // initialiser produced (typically `Word` from a
+                    // subscript read on a polymorphic VEC). Flipping
+                    // the hint to `Object` would change the slot's
+                    // LLVM type from i64 to ptr and break the
+                    // round-trip — the value coming out of `ps!i` is
+                    // a Word-shaped read. See the
+                    // `vec_of_class_pointers_round_trip` probe in
+                    // `tests/newbcpl-tests/tests/matrix_tier6.rs`.
+                    if class_name.is_none() {
+                        class_name = Some(annotated_class);
+                    }
                 }
             }
-            let class_name = self.class_name_of(expr);
             // Manifesto §5: a MANAGED instance cannot be aliased.
             // A bare `NEW Foo()` is the original construction and is
             // fine; anything else that resolves to a MANAGED value
@@ -721,6 +738,30 @@ impl Sema {
                 self.lookup(name).and_then(|info| info.class_name.clone())
             }
             _ => None,
+        }
+    }
+
+    /// If an `AS Type` annotation strips down to a name that matches
+    /// a known class, return that class name. The stripping rules
+    /// mirror `type_hint_from_annotation`: leading `^` pointer-to
+    /// markers are dropped, an ` OF tail` suffix is trimmed, and the
+    /// remainder is matched against `self.classes` verbatim. Used to
+    /// recover class identity through reads that sema can't see
+    /// through on its own — `LET p AS Foo = ps!i` is the canonical
+    /// case.
+    fn class_name_from_annotation(&self, annotation: &str) -> Option<String> {
+        let mut s = annotation;
+        while let Some(rest) = s.strip_prefix('^') {
+            s = rest;
+        }
+        let base = match s.split_once(" OF ") {
+            Some((head, _tail)) => head.trim(),
+            None => s.trim(),
+        };
+        if self.classes.contains_key(base) {
+            Some(base.to_string())
+        } else {
+            None
         }
     }
 

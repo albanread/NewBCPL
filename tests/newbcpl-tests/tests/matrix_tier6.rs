@@ -197,16 +197,18 @@ fn many_allocations_do_not_overlap() {
 }
 
 #[test]
-#[ignore = "sema doesn't track class through subscripts — `LET p = ps!i; p.x` can't resolve p's class. Tracked as a Tier 2 sema gap."]
 fn vec_of_class_pointers_round_trip() {
-    // The shape that surfaces the gap above: store NEW P(...)
-    // pointers in a VEC, read them back, dereference fields.
-    // Fixes when sema gains class-tracking through subscripts
-    // (or `LET p AS P = ps!i` propagates the annotation to the
-    // class-name slot of LocalInfo).
+    // Round-trip `NEW P(...)` pointers through a VEC, read them
+    // back, dereference fields. The reader uses an explicit
+    // `LET p AS P = ps!i` annotation — sema can't track class
+    // identity through a subscript on its own (the VEC is
+    // polymorphic at the type level), so the annotation is what
+    // tells sema the slot's static class is `P`. Without the
+    // annotation, `p.x` would fail to resolve at member-access
+    // time.
     expect(
         "vec_of_class_pointers_round_trip",
-        "CLASS P $(\n  DECL x\n  ROUTINE CREATE(ix) BE $( SELF.x := ix $)\n$)\nLET START() BE $(\n  LET ps = VEC 4\n  FOR i = 0 TO 3 DO $( ps!i := NEW P(i * 10) $)\n  FOR i = 0 TO 3 DO $(\n    LET p = ps!i\n    WRITEN(p.x) WRITES(\"*S\")\n  $)\n$)\n",
+        "CLASS P $(\n  DECL x\n  ROUTINE CREATE(ix) BE $( SELF.x := ix $)\n$)\nLET START() BE $(\n  LET ps = VEC 4\n  FOR i = 0 TO 3 DO $( ps!i := NEW P(i * 10) $)\n  FOR i = 0 TO 3 DO $(\n    LET p AS P = ps!i\n    WRITEN(p.x) WRITES(\"*S\")\n  $)\n$)\n",
         "0 10 20 30 ",
     );
 }

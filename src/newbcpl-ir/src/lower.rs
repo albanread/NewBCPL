@@ -1253,12 +1253,25 @@ impl<'a> Lowerer<'a> {
             self.unpack_lanes(&names, elem);
             return;
         }
-        for (name, init) in &l.bindings {
+        for (i, (name, init)) in l.bindings.iter().enumerate() {
             // Capture the class name (if any) before lowering, so
             // the LET binding can record it. Lowering a `NEW Foo()`
             // produces a fresh ValueId but doesn't return the class
-            // name; we read it from the AST shape.
-            let class_name = self.class_name_of_expr(init);
+            // name; we read it from the AST shape. If sema can't
+            // see through the initialiser (e.g. `ps!i` is a
+            // subscript on a polymorphic VEC), an explicit `AS Foo`
+            // annotation overrides — `Foo` is looked up against the
+            // known class layouts. See the
+            // `vec_of_class_pointers_round_trip` probe in
+            // `tests/newbcpl-tests/tests/matrix_tier6.rs`.
+            let mut class_name = self.class_name_of_expr(init);
+            if class_name.is_none() {
+                if let Some(Some(ann)) = l.annotations.get(i) {
+                    if let Some(named) = self.class_name_from_annotation(ann) {
+                        class_name = Some(named);
+                    }
+                }
+            }
             let value = self.lower_expr(init);
             // FLET overrides the slot's hint to Float when the
             // initialiser is a neutral integer scalar. Emit's
@@ -1380,6 +1393,28 @@ impl<'a> Lowerer<'a> {
                     .and_then(|b| b.lookup_local_class(name))
             }
             _ => None,
+        }
+    }
+
+    /// Resolve an `AS Type` annotation string to a known class name.
+    /// Mirrors the stripping logic sema uses: drop leading `^`
+    /// pointer-to markers and any ` OF tail`, then look the
+    /// remainder up against the IR's `layouts` table. Returns `None`
+    /// for non-class annotations (`INT`, `FLOAT`, …) and for class
+    /// names that aren't in this compilation unit.
+    fn class_name_from_annotation(&self, annotation: &str) -> Option<String> {
+        let mut s = annotation;
+        while let Some(rest) = s.strip_prefix('^') {
+            s = rest;
+        }
+        let base = match s.split_once(" OF ") {
+            Some((head, _tail)) => head.trim(),
+            None => s.trim(),
+        };
+        if self.layouts.iter().any(|l| l.class_name == base) {
+            Some(base.to_string())
+        } else {
+            None
         }
     }
 

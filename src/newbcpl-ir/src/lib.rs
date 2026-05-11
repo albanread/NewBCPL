@@ -18,6 +18,11 @@ pub use ir::{
     BasicBlock, BlockId, Const, Function, Instr, IrBinOp, IrUnOp, Module, Param, Terminator,
     TypedKind, Value, ValueId,
 };
+// Re-export sema's `ClassLayout` as a convenience: it travels with
+// every IR `Module` (see `Module.layouts`), so downstream consumers
+// like `newbcpl-llvm` can refer to it via the IR crate without
+// adding an extra `newbcpl-sema` dependency just for the type.
+pub use newbcpl_sema::ClassLayout;
 pub use lower::lower;
 
 /// Read a .bcl file, run the front-end pipeline (lex → parse →
