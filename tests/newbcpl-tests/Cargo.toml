@@ -17,6 +17,10 @@ name = "matrix_tier1_negatives"
 path = "tests/matrix_tier1_negatives.rs"
 
 [[test]]
+name = "matrix_tier2"
+path = "tests/matrix_tier2.rs"
+
+[[test]]
 name = "matrix_tier3"
 path = "tests/matrix_tier3.rs"
 
