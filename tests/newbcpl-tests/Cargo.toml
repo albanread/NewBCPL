@@ -17,6 +17,14 @@ name = "matrix_tier5"
 path = "tests/matrix_tier5.rs"
 
 [[test]]
+name = "matrix_tier6"
+path = "tests/matrix_tier6.rs"
+
+[[test]]
+name = "matrix_tier1_negatives"
+path = "tests/matrix_tier1_negatives.rs"
+
+[[test]]
 name = "lexer_smoke"
 path = "tests/lexer_smoke.rs"
 

@@ -24,58 +24,7 @@
 //! the cell it covers. Bugs that get fixed should land here as a
 //! regression row in the matrix — see `docs/test_matrix.md`.
 
-use std::path::PathBuf;
-use std::process::Command;
-
-/// Resolve the JIT driver path by walking up from the test binary.
-/// Cargo places integration-test binaries at
-/// `target/<profile>/deps/<name>-<hash>[.exe]`; the driver lives
-/// at `target/<profile>/newbcpl-driver[.exe]` (one directory up).
-/// This avoids the `CARGO_BIN_EXE_*` mechanism, which would require
-/// a `lib` target on `newbcpl-driver`.
-fn driver_path() -> PathBuf {
-    let mut p = std::env::current_exe().expect("current_exe");
-    // Drop `deps/<test>.exe` and append the driver name.
-    p.pop(); // remove the test binary
-    p.pop(); // remove `deps`
-    let driver_name = if cfg!(windows) {
-        "newbcpl-driver.exe"
-    } else {
-        "newbcpl-driver"
-    };
-    p.push(driver_name);
-    p
-}
-
-/// Run a probe and assert its captured stdout equals `expected`.
-/// The `name` becomes the temp-file stem so test failures point at
-/// the right cell in the matrix.
-fn expect(name: &str, source: &str, expected: &str) {
-    let tmp = std::env::temp_dir().join(format!("newbcpl-tier5-{name}.bcl"));
-    std::fs::write(&tmp, source).expect("write probe fixture");
-
-    let output = Command::new(driver_path())
-        .arg("run")
-        .arg(&tmp)
-        .output()
-        .expect("spawn newbcpl-driver");
-
-    // Best-effort cleanup; ignore failures so we don't mask the
-    // real test assertion.
-    let _ = std::fs::remove_file(&tmp);
-
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-
-    assert!(
-        output.status.success(),
-        "probe `{name}` did not exit 0\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
-    );
-    assert_eq!(
-        stdout, expected,
-        "probe `{name}` produced unexpected stdout\n--- stderr ---\n{stderr}"
-    );
-}
+use newbcpl_tests::expect_stdout as expect;
 
 // ─── Class shape axis ──────────────────────────────────────────────
 //
