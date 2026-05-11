@@ -275,6 +275,15 @@ impl Parser {
             }
             break;
         }
+        // Some reference programs write `CLASS Foo BE { ... }` —
+        // the `BE` is the same keyword used as a routine-body
+        // opener, repurposed here as a class-body marker. The
+        // body bracket (`{` or `$(`) follows. We accept the
+        // optional `BE` and then proceed with the normal opener
+        // dispatch.
+        if self.check_kw("BE") {
+            self.eat();
+        }
         if !self.check_sym("$(") && !self.check_sym("{") {
             let span = self.peek().span;
             let lex = self.peek().lexeme.clone();
@@ -735,24 +744,29 @@ impl Parser {
         }
         self.expect_sym(")")?;
 
-        let body = if is_function {
-            // FUNCTION foo(p) = expr
-            self.expect_sym("=")?;
-            let body = self.parse_expr()?;
-            ClassMethodBody::Function(body)
-        } else {
-            // ROUTINE foo(p) BE stmt
-            if !self.check_kw("BE") {
-                let span = self.peek().span;
-                let lex = self.peek().lexeme.clone();
-                return Err(ParseError::new(
-                    format!("expected `BE` after ROUTINE parameters, got `{lex}`"),
-                    span,
-                ));
-            }
+        // Body shape: classic BCPL pairs ROUTINE with `BE stmt`
+        // and FUNCTION with `= expr`, but the reference's corpus
+        // also writes `ROUTINE foo() = expr` and
+        // `FUNCTION foo() BE stmt`. Accept either tail after
+        // either keyword — both forms exist in production code,
+        // and there's no semantic difference once the body is in
+        // place. The `$(` / `{` implicit-block form (no `BE`)
+        // is *not* accepted: every routine body must announce
+        // itself with `BE` or `=`.
+        let body = if self.check_sym("=") {
             self.eat();
-            let body = self.parse_stmt()?;
-            ClassMethodBody::Routine(Box::new(body))
+            ClassMethodBody::Function(self.parse_expr()?)
+        } else if self.check_kw("BE") {
+            self.eat();
+            ClassMethodBody::Routine(Box::new(self.parse_stmt()?))
+        } else {
+            let span = self.peek().span;
+            let lex = self.peek().lexeme.clone();
+            let kw_name = if is_function { "FUNCTION" } else { "ROUTINE" };
+            return Err(ParseError::new(
+                format!("expected `=` or `BE` after {kw_name} parameters, got `{lex}`"),
+                span,
+            ));
         };
 
         let end = match &body {
