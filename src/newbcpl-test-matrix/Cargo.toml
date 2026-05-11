@@ -1,0 +1,6 @@
+[package]
+name = "newbcpl-test-matrix"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Probe-matrix generator: read a manifest of test rows, emit `.rs` files of `#[test]` probes for the `newbcpl-tests` crate."

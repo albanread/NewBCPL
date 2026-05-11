@@ -8,6 +8,7 @@ members = [
     "src/newbcpl-parser",
     "src/newbcpl-runtime",
     "src/newbcpl-sema",
+    "src/newbcpl-test-matrix",
     "tests/newbcpl-tests",
 ]
 resolver = "3"

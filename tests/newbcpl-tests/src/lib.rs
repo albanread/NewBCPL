@@ -96,3 +96,68 @@ pub fn expect_reject(name: &str, subcommand: &str, source: &str, stderr_substrin
         "probe `{name}` stderr missing substring `{stderr_substring}`\n--- stderr ---\n{stderr}"
     );
 }
+
+// ─── Declarative probe macros ─────────────────────────────────────
+//
+// Each macro expands to a `#[test]` function calling the matching
+// expectation helper above. The test name doubles as the temp-file
+// stem so failures point at the cell that regressed.
+//
+// Usage:
+//
+//   probe!(int_add => "LET START() BE $( WRITEN(7 + 5) $)" => "12");
+//
+// optionally with a doc-comment that explains what the cell is
+// for — the comment travels through to the generated function so
+// `cargo doc` and grep across the test crate both surface it.
+
+/// Stdout exact-match probe. Compiles to:
+/// ```ignore
+/// #[test]
+/// fn $name() { expect_stdout(stringify!($name), $source, $expected); }
+/// ```
+#[macro_export]
+macro_rules! probe {
+    ($name:ident => $source:expr => $expected:expr) => {
+        #[test]
+        fn $name() {
+            $crate::expect_stdout(stringify!($name), $source, $expected);
+        }
+    };
+    (
+        $(#[$attr:meta])*
+        $name:ident => $source:expr => $expected:expr
+    ) => {
+        $(#[$attr])*
+        #[test]
+        fn $name() {
+            $crate::expect_stdout(stringify!($name), $source, $expected);
+        }
+    };
+}
+
+/// Stdout-contains probe — for outputs with unstable fields
+/// (addresses, counters). Same shape as `probe!` but asserts the
+/// expected text appears *somewhere* in stdout.
+#[macro_export]
+macro_rules! probe_contains {
+    ($name:ident => $source:expr => $substring:expr) => {
+        #[test]
+        fn $name() {
+            $crate::expect_stdout_contains(stringify!($name), $source, $substring);
+        }
+    };
+}
+
+/// Negative probe — asserts the program is rejected with the
+/// expected diagnostic substring on stderr. Uses the `run`
+/// subcommand because parse / sema errors land there.
+#[macro_export]
+macro_rules! reject {
+    ($name:ident => $source:expr => $stderr_substring:expr) => {
+        #[test]
+        fn $name() {
+            $crate::expect_reject(stringify!($name), "run", $source, $stderr_substring);
+        }
+    };
+}

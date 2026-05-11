@@ -41,6 +41,16 @@ name = "matrix_tier7"
 path = "tests/matrix_tier7.rs"
 
 [[test]]
+name = "matrix_extra"
+path = "tests/matrix_extra.rs"
+
+# Generated from `matrix/generated.matrix`. Edit the manifest and
+# regenerate with `cargo run -p newbcpl-test-matrix -- ...`.
+[[test]]
+name = "matrix_generated"
+path = "tests/matrix_generated.rs"
+
+[[test]]
 name = "lexer_smoke"
 path = "tests/lexer_smoke.rs"
 

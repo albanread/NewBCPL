@@ -161,6 +161,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "newbcpl-test-matrix"
+version = "0.1.0"
+
+[[package]]
 name = "newbcpl-tests"
 version = "0.1.0"
 dependencies = [
