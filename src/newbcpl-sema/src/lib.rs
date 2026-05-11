@@ -1112,10 +1112,43 @@ impl Sema {
                 }
                 let _ = self.type_of(callee);
                 if let Expr::Ident { name, .. } = callee.as_ref() {
+                    // Builtin return-type hints. Without these,
+                    // a call to (say) `CONCAT(a, b)` infers as
+                    // Word and a subsequent `LEN(c)` routes to
+                    // the vec-length helper instead of the
+                    // list-length helper — see the
+                    // `list_concat_combines_two_chains` probe
+                    // in `tests/newbcpl-tests/tests/matrix_tier6.rs`.
                     match name.as_str() {
-                        "FLOAT" | "FSQRT" => return TypeHint::Float,
-                        "TRUNC" | "FIX" | "ENTIER" | "LEN" => return TypeHint::Int,
+                        // Float-returning math.
+                        "FLOAT" | "FSQRT" | "FSIN" | "FCOS" | "FTAN"
+                        | "FABS" | "FLOG" | "FEXP" | "FRND" | "RND" => {
+                            return TypeHint::Float;
+                        }
+                        // Int-returning queries.
+                        "TRUNC" | "FIX" | "ENTIER" | "LEN" | "RAND"
+                        | "__newbcpl_len" | "__newbcpl_list_len" | "RDCH" => {
+                            return TypeHint::Int;
+                        }
+                        // String-returning queries.
                         "TYPE" | "TYPEOF" => return TypeHint::String,
+                        // List-returning builtins. `HD` is omitted
+                        // — it returns a single atom's value
+                        // (typically Word), not a list.
+                        "CONCAT" | "TL" | "TAIL" | "REST"
+                        | "__newbcpl_list_tl" | "__newbcpl_list_rest"
+                        | "__newbcpl_list_new_empty" => {
+                            return TypeHint::List;
+                        }
+                        // Vec / pair-array allocators return a
+                        // word-shaped pointer the caller treats
+                        // as a vector. Hinting Vec routes
+                        // `LEN` / `FOREACH` through the right
+                        // path (index-walk, `*(p-8)` length).
+                        "GETVEC" | "FGETVEC" | "PAIRS" | "FPAIRS"
+                        | "__newbcpl_alloc_rec" => {
+                            return TypeHint::Vec;
+                        }
                         _ => {}
                     }
                     if let Some(info) = self.functions.get(name) {

@@ -228,7 +228,6 @@ fn finish_terminates_cleanly() {
 // ─── List heterogeneity ────────────────────────────────────────────
 
 #[test]
-#[ignore = "sema doesn't propagate a builtin function's return type — `CONCAT(a,b)` is inferred as Word, so `LEN(c)` routes to `__newbcpl_len` (vec helper) instead of `__newbcpl_list_len` (list helper). Tracked as a Tier 2 sema gap; fix is a small `builtin_return_types` table read in `type_of`."]
 fn list_concat_combines_two_chains() {
     expect(
         "list_concat_combines_two_chains",

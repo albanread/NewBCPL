@@ -678,7 +678,19 @@ impl<'a> Lowerer<'a> {
 
         self.b().terminate(Terminator::Branch(header));
         self.b().switch_to(header);
-        // i <= end
+        // Pick the loop-continue comparator from the step's sign:
+        //   `FOR i = 5 TO 1 BY -1`  iterates while `i >= end`
+        //   `FOR i = 1 TO 5 [BY n]` iterates while `i <= end`
+        // We only inspect literal / unary-neg-literal steps for
+        // sign; a runtime-valued step falls back to `<=`. That
+        // matches the BCPL convention (constant steps are by far
+        // the common case; runtime-negative steps in the corpus
+        // are rare enough to handle when they arise).
+        let comparator = if step_is_negative_literal(step) {
+            IrBinOp::ICmpGe
+        } else {
+            IrBinOp::ICmpLe
+        };
         let i_dst = self.b().alloc_value();
         self.b().emit(Instr::Load {
             dst: i_dst,
@@ -689,7 +701,7 @@ impl<'a> Lowerer<'a> {
         let cmp = self.b().alloc_value();
         self.b().emit(Instr::BinOp {
             dst: cmp,
-            op: IrBinOp::ICmpLe,
+            op: comparator,
             lhs: Value::Local(i_dst),
             rhs: end_v,
             hint: TypeHint::Int,
@@ -1248,7 +1260,20 @@ impl<'a> Lowerer<'a> {
             // name; we read it from the AST shape.
             let class_name = self.class_name_of_expr(init);
             let value = self.lower_expr(init);
-            let slot = self.b().alloca(name, init.hint());
+            // FLET overrides the slot's hint to Float when the
+            // initialiser is a neutral integer scalar. Emit's
+            // Store path will sitofp the value to match.
+            let slot_hint = if matches!(l.kind, newbcpl_parser::LetKind::FLet)
+                && matches!(
+                    init.hint(),
+                    TypeHint::Int | TypeHint::Word | TypeHint::Unknown
+                )
+            {
+                TypeHint::Float
+            } else {
+                init.hint()
+            };
+            let slot = self.b().alloca(name, slot_hint);
             self.b().emit(Instr::Store { slot, value });
             self.b().declare_local(name, slot, class_name);
         }
@@ -1976,6 +2001,25 @@ fn binop_to_ir(op: BinaryOp, lhs: TypeHint, rhs: TypeHint) -> Option<IrBinOp> {
             return None;
         }
     })
+}
+
+/// True iff the FOR-loop step is a compile-time-known negative
+/// integer — either `-3` (Unary{Neg, IntLit}) or directly an
+/// `IntLit` with a negative value. Used by `lower_for` to pick
+/// `i >= end` instead of `i <= end` for the loop-continue test.
+fn step_is_negative_literal(step: Option<&Expr>) -> bool {
+    let Some(expr) = step else {
+        return false;
+    };
+    match expr {
+        Expr::IntLit { value, .. } => *value < 0,
+        Expr::Unary {
+            op: UnaryOp::Neg,
+            operand,
+            ..
+        } => matches!(operand.as_ref(), Expr::IntLit { value, .. } if *value > 0),
+        _ => false,
+    }
 }
 
 /// Map a SIMD-flavoured `TypeHint` to its IR `TypedKind`. Returns

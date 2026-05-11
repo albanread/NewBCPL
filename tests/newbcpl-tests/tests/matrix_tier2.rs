@@ -32,8 +32,10 @@ fn flet_with_float_literals() {
 }
 
 #[test]
-#[ignore = "FLET should coerce a neutral int literal to its f64 hint at store time. Today the store writes raw i64 bits into the f64 slot — reading back gives a denormal."]
 fn flet_coerces_int_literal_to_float() {
+    // `FLET x = 5` — the FLET binding's hint overrides Int→Float.
+    // Store-time coercion in emit (sitofp i64→f64) lets the slot
+    // round-trip the value as a float.
     expect(
         "flet_coerces_int_literal_to_float",
         "LET START() BE $(\n  FLET x = 5\n  FWRITE(x)\n$)\n",

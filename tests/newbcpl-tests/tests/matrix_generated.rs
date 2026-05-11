@@ -39,77 +39,84 @@ probe!(
     "13"
 );
 
-// manifest line 29
+// manifest line 26
+probe!(
+    for_with_negative_step =>
+    "LET START() BE $(\n  LET total = 0\n  FOR i = 5 TO 1 BY -1 DO total := total + i\n  WRITEN(total)\n$)\n" =>
+    "15"
+);
+
+// manifest line 27
 probe!(
     while_loop_summing_first_ten =>
     "LET START() BE $(\n  LET sum = 0\n  LET i = 1\n  WHILE i <= 10 DO $( sum := sum + i\n i := i + 1 $)\n  WRITEN(sum)\n$)\n" =>
     "55"
 );
 
-// manifest line 30
+// manifest line 28
 probe!(
     switchon_with_consecutive_cases =>
     "LET START() BE $(\n  LET n = 2\n  SWITCHON n INTO $(\n    CASE 1: CASE 2: CASE 3: WRITES(\"low\") ENDCASE\n    CASE 4: CASE 5: WRITES(\"high\") ENDCASE\n    DEFAULT: WRITES(\"?\") ENDCASE\n  $)\n$)" =>
     "low"
 );
 
-// manifest line 33
+// manifest line 31
 probe!(
     class_holds_then_doubles =>
     "CLASS T $(\n  DECL n\n  ROUTINE CREATE(x) BE $( SELF.n := x $)\n  FUNCTION doubled() = SELF.n * 2\n$)\nLET START() BE $( LET t = NEW T(21)\n WRITEN(t.doubled()) $)" =>
     "42"
 );
 
-// manifest line 36
+// manifest line 34
 probe!(
     list_singleton_round_trip =>
     "LET START() BE $( LET xs = LIST(42)\n WRITEN(LEN(xs)) WRITES(\"*S\") WRITEN(HD(xs)) $)" =>
     "1 42"
 );
 
-// manifest line 37
+// manifest line 35
 probe!(
     vec_empty_init_list =>
     "LET START() BE $( LET v = VEC(1, 2, 3, 4, 5)\n WRITEN(LEN(v)) $)" =>
     "5"
 );
 
-// manifest line 40
+// manifest line 38
 probe!(
     pair_lane_sum =>
     "LET START() BE $( LET p = PAIR(7, 13)\n WRITEN(p.|0| + p.|1|) $)" =>
     "20"
 );
 
-// manifest line 41
+// manifest line 39
 probe!(
     oct_lane_sum =>
     "LET START() BE $( LET o = OCT(1, 2, 3, 4, 5, 6, 7, 8)\n WRITEN(o.|0| + o.|1| + o.|2| + o.|3| + o.|4| + o.|5| + o.|6| + o.|7|) $)" =>
     "36"
 );
 
-// manifest line 44
+// manifest line 42
 reject!(
     for_without_to =>
     "LET START() BE $( FOR i = 1 DO WRITES(\"x\") $)" =>
     "TO"
 );
 
-// manifest line 45
+// manifest line 43
 reject!(
     switchon_without_block =>
     "LET START() BE $( SWITCHON 1 INTO CASE 1: WRITES(\"a\") $)" =>
     "SWITCHON"
 );
 
-// manifest line 46
+// manifest line 44
 reject!(
     empty_let_rejected =>
     "LET START() BE $( LET $)" =>
     "parse"
 );
 
-// manifest line 49
+// manifest line 47
 probe_contains!(
     heap_info_mentions_clusters =>
     "LET START() BE $( HEAP_INFO() $)\n" =>

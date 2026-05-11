@@ -63,6 +63,11 @@ struct Emitter<'ctx, 'l> {
     string_pool: HashMap<String, PointerValue<'ctx>>,
     /// Counter for anonymous string globals.
     string_counter: u32,
+    /// Type hint each Alloca'd slot was created with. Used by
+    /// `Store` to coerce a value whose LLVM type doesn't match
+    /// the slot — e.g. `FLET x = 5` stores an i64 literal into
+    /// an f64 slot, which needs an `sitofp` to round-trip.
+    slot_hint: HashMap<ValueId, TypeHint>,
 }
 
 impl<'ctx, 'l> Emitter<'ctx, 'l> {
@@ -78,6 +83,35 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
             by_name: HashMap::new(),
             string_pool: HashMap::new(),
             string_counter: 0,
+            slot_hint: HashMap::new(),
+        }
+    }
+
+    /// Coerce a value to match a slot's hint. Used by Store to
+    /// bridge int↔float typing mismatches (the common case is
+    /// `FLET x = 5` — int literal into a float slot). Unhandled
+    /// type combinations pass through unchanged; downstream
+    /// store validity is the caller's concern.
+    fn coerce_to_hint(
+        &self,
+        v: BasicValueEnum<'ctx>,
+        hint: TypeHint,
+    ) -> BasicValueEnum<'ctx> {
+        let f64_t = self.context.f64_type();
+        let i64_t = self.context.i64_type();
+        match (v, hint) {
+            (BasicValueEnum::IntValue(iv), TypeHint::Float) => self
+                .builder
+                .build_signed_int_to_float(iv, f64_t, "sitofp.store")
+                .expect("sitofp")
+                .into(),
+            (BasicValueEnum::FloatValue(fv), TypeHint::Int)
+            | (BasicValueEnum::FloatValue(fv), TypeHint::Word) => self
+                .builder
+                .build_float_to_signed_int(fv, i64_t, "fptosi.store")
+                .expect("fptosi")
+                .into(),
+            _ => v,
         }
     }
 
@@ -290,6 +324,7 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
         let fv = self.by_name[&f.name];
         // Reset per-function state.
         self.value_map.clear();
+        self.slot_hint.clear();
         self.block_map.clear();
 
         // Allocate every basic block up front so any Branch /
@@ -380,6 +415,12 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
                     .build_alloca(ty, name)
                     .expect("alloca");
                 self.value_map.insert(*dst, slot.into());
+                // Remember the slot's hint so `Store` can coerce
+                // mismatched value types (e.g. `FLET x = 5`
+                // wants an `sitofp` from i64 to f64). Without
+                // this the store writes raw integer bits into
+                // the f64 slot and reading back gives a denormal.
+                self.slot_hint.insert(*dst, *hint);
             }
             Instr::Load { dst, slot, hint } => {
                 let slot_ptr = self.lookup(*slot).into_pointer_value();
@@ -393,7 +434,15 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
             Instr::Store { slot, value } => {
                 let slot_ptr = self.lookup(*slot).into_pointer_value();
                 let v = self.lower_value(value);
-                self.builder.build_store(slot_ptr, v).expect("store");
+                // Coerce the value to the slot's declared type so
+                // `FLET x = 5` (int literal into a float slot)
+                // emits a clean `sitofp` instead of bit-blasting
+                // the i64 into the f64 storage. The slot type was
+                // chosen at allocation from `Lowerer`'s hint —
+                // see `Builder::alloca`.
+                let slot_hint = self.slot_hint.get(slot).copied().unwrap_or(TypeHint::Word);
+                let coerced = self.coerce_to_hint(v, slot_hint);
+                self.builder.build_store(slot_ptr, coerced).expect("store");
             }
             Instr::BinOp {
                 dst,

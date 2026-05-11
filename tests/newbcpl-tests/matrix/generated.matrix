@@ -20,12 +20,10 @@ probe int_double_negation ::= LET START() BE $( WRITEN(0 - (0 - 42)) $) ==> 42
 probe int_paren_chain_three_deep ::= LET START() BE $( WRITEN(((1 + 2) * (3 + 4)) - ((5 - 1) * 2)) $) ==> 13
 
 # ─── Tier 4: control flow combinations ─────────────────────────────────
-# `FOR i = 5 TO 1 BY -1` is supposed to count down, but our lower
-# emits a fixed `i <= end` test on the header — negative-step
-# loops exit immediately. Tracked as a Tier 4 codegen gap; once
-# `lower_for` picks the comparator from the step's sign, lift the
-# `# DISABLED:` prefix to re-enable this row.
-# DISABLED: probe for_with_negative_step ::= LET START() BE $(\n  FOR i = 5 TO 1 BY -1 DO $( WRITEN(i) WRITES(\"*S\") $)\n$)\n ==> 5 4 3 2 1
+# Negative-step FOR loops — `lower_for` picks the comparator from
+# the step's sign at compile time (literal-only; runtime-typed
+# steps still default to `<=`).
+probe for_with_negative_step ::= LET START() BE $(\n  LET total = 0\n  FOR i = 5 TO 1 BY -1 DO total := total + i\n  WRITEN(total)\n$)\n ==> 15
 probe while_loop_summing_first_ten ::= LET START() BE $(\n  LET sum = 0\n  LET i = 1\n  WHILE i <= 10 DO $( sum := sum + i\n i := i + 1 $)\n  WRITEN(sum)\n$)\n ==> 55
 probe switchon_with_consecutive_cases ::= LET START() BE $(\n  LET n = 2\n  SWITCHON n INTO $(\n    CASE 1: CASE 2: CASE 3: WRITES(\"low\") ENDCASE\n    CASE 4: CASE 5: WRITES(\"high\") ENDCASE\n    DEFAULT: WRITES(\"?\") ENDCASE\n  $)\n$) ==> low
 
