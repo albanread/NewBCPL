@@ -13,6 +13,10 @@ newbcpl-parser = { path = "../../src/newbcpl-parser" }
 newbcpl-sema = { path = "../../src/newbcpl-sema" }
 
 [[test]]
+name = "matrix_tier5"
+path = "tests/matrix_tier5.rs"
+
+[[test]]
 name = "lexer_smoke"
 path = "tests/lexer_smoke.rs"
 
