@@ -1,0 +1,116 @@
+// paint-and-log.bcl — one program, two windows, one event loop.
+//
+//   cargo run -p newbcpl-driver -- gui examples/paint-and-log.bcl
+//
+// Demonstrates a multi-window BCPL app:
+//   * a graphics canvas where left-clicks drop colored dots
+//   * a text-pane log that prints the click count + position
+//
+// Single `igui_next_event(-1)` loop dispatches by (kind, child).
+// Both windows share the program's attention; events for either
+// come through naturally without filtering at the language level
+// (the stash machinery still preserves any events that fire
+// between iterations).
+//
+// Close either window to exit.
+
+LET START() BE $(
+    LET canvas = igui_open("Canvas")
+    LET log    = igui_text_open("Log")
+
+    // Register both windows with the persistent event filter.
+    // After this, `next_event` returns only events for `canvas`
+    // or `log` (plus globals like FrameClose) — events for bedit,
+    // log_view, etc. park in the stash and never reach our loop.
+    igui_filter_on_window(canvas)
+    igui_filter_on_window(log)
+
+    // Initial canvas paint — dark slate background.
+    igui_begin(canvas)
+    igui_clear(0.08, 0.10, 0.16, 1.0)
+    igui_submit()
+
+    // Log banner.
+    igui_text_set_pen(log, #XFF66E0E0, #XFF202840)
+    igui_text_writes(log, "+--------------------------+*N")
+    igui_text_writes(log, "|   paint-and-log demo     |*N")
+    igui_text_writes(log, "+--------------------------+*N")
+    igui_text_reset_pen(log)
+    igui_text_writes(log, "Click the Canvas to drop dots.*N")
+    igui_text_writes(log, "Close either window to quit.*N*N")
+
+    LET count = 0
+    LET kind = 0
+    LET child = 0
+    LET t = 0
+    LET p1 = 0
+    LET p2 = 0
+    LET p3 = 0
+    LET p4 = 0
+    LET running = 1
+
+    WHILE running DO $(
+        UNLESS igui_next_event(@kind, @child, @t,
+                               @p1, @p2, @p3, @p4, -1) DO LOOP
+
+        SWITCHON kind INTO $(
+            CASE 3:                              // MOUSE
+                // Dispatch by `child` — both windows can receive
+                // mouse events, but only the canvas reacts.
+                IF child = canvas DO
+                    IF ((p3 >> 16) BAND 255) = 1 DO $(
+                        count := count + 1
+
+                        // Draw a dot on the canvas at (p1, p2).
+                        // FLOAT() converts the i64 click coords
+                        // into the f64 the iGui builtins expect.
+                        igui_begin(canvas)
+                        igui_fill_circle(FLOAT(p1), FLOAT(p2), 7.0,
+                                         0.95, 0.55, 0.30, 1.0)
+                        igui_submit()
+
+                        // Log the click into the text pane. Bytes
+                        // arrive via WRITES → console callback →
+                        // log_view, not via the text pane — so we
+                        // use the text-pane API directly for the
+                        // user-visible log surface.
+                        igui_text_writes(log, "  click ")
+                        // Print the count (one digit per writec).
+                        // For small counts (< 100) this fits two
+                        // digits via integer math; bigger needs
+                        // a real int-to-string helper (TODO).
+                        IF count >= 10 DO
+                            igui_text_writec(log, 48 + (count / 10))
+                        igui_text_writec(log, 48 + (count REM 10))
+                        igui_text_writes(log, " at (")
+                        // x: handle up to four-digit coordinates.
+                        text_writen3(log, p1)
+                        igui_text_writes(log, ", ")
+                        text_writen3(log, p2)
+                        igui_text_writes(log, ")*N")
+                    $)
+                ENDCASE
+
+            CASE 7:                              // CLOSE (child window)
+            CASE 8:                              // FRAME_CLOSE
+                running := 0
+                ENDCASE
+        $)
+    $)
+
+    WRITEF("[paint-and-log] exited after %d clicks*N", count)
+$)
+
+// Print a non-negative integer up to 9999 into the text pane,
+// digit-by-digit. The MVP doesn't yet have a general int-to-string
+// in BCPL; this covers the common case for window coordinates.
+LET text_writen3(pane, n) BE $(
+    IF n < 0 DO $(
+        igui_text_writec(pane, 45)               // '-'
+        n := 0 - n
+    $)
+    IF n >= 1000 DO igui_text_writec(pane, 48 + ((n / 1000) REM 10))
+    IF n >= 100  DO igui_text_writec(pane, 48 + ((n / 100)  REM 10))
+    IF n >= 10   DO igui_text_writec(pane, 48 + ((n / 10)   REM 10))
+    igui_text_writec(pane, 48 + (n REM 10))
+$)

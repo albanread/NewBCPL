@@ -21,7 +21,7 @@
 #![cfg(windows)]
 #![allow(non_snake_case)]
 
-use crate::igui::cp_exports;
+use crate::igui::{channels, cp_exports, text_view, window};
 
 /// `iGui_OpenChild(title, *out_id) -> 1 on success`. `title` is a
 /// NUL-terminated UTF-8 string; cp_exports scans for the NUL so the
@@ -192,6 +192,206 @@ pub unsafe extern "C" fn iGui_NextEvent(
 pub unsafe extern "C" fn iGui_Quit() -> i64 {
     cp_exports::igui_quit();
     0
+}
+
+/// `iGui_NextEventFor(target_child_id, *kind, *child, *time, *p1,
+///                    *p2, *p3, *p4, timeout_ms) -> 1 / 0`. Like
+/// `iGui_NextEvent` but waits only for events targeting
+/// `target_child_id` or "global" events (`FrameClose`,
+/// `ThemeChange`, `Menu`). Events for other windows are stashed for
+/// future consumers — they survive into the next consumer's view
+/// instead of being silently dropped at the BCPL level.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn iGui_NextEventFor(
+    target_child: i64,
+    out_kind: *mut i64,
+    out_child: *mut i64,
+    out_time: *mut i64,
+    out_p1: *mut i64,
+    out_p2: *mut i64,
+    out_p3: *mut i64,
+    out_p4: *mut i64,
+    timeout_ms: i64,
+) -> i64 {
+    let Some(ev) = channels::next_event_for(target_child, timeout_ms) else {
+        return 0;
+    };
+    cp_exports::write_event(
+        ev, out_kind, out_child, out_time, out_p1, out_p2, out_p3, out_p4,
+    );
+    1
+}
+
+/// `iGui_DiscardStashedEvents()` — drop every event currently
+/// parked in the event stash by prior `iGui_NextEventFor` calls.
+/// Useful when the program transitions modes (closes one window,
+/// opens another) and doesn't want backed-up events from the old
+/// state. Does not touch the channel itself — events still arriving
+/// continue to flow.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn iGui_DiscardStashedEvents() -> i64 {
+    channels::discard_stashed_events();
+    0
+}
+
+/// `iGui_FilterOnWindow(child_id)` — add a window id to the
+/// persistent event filter. After the first call, `iGui_NextEvent`
+/// returns only events for windows in the filter (plus "global"
+/// events like FrameClose). The filter is additive; call once per
+/// window the program cares about, typically right after
+/// `iGui_OpenChild` / `iGui_OpenText`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn iGui_FilterOnWindow(child_id: i64) -> i64 {
+    channels::filter_on_window(child_id);
+    0
+}
+
+/// `iGui_UnfilterWindow(child_id)` — remove a window id from the
+/// persistent filter. Use when a window closes so its (now-stale)
+/// id doesn't keep gating which events come through.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn iGui_UnfilterWindow(child_id: i64) -> i64 {
+    channels::unfilter_window(child_id);
+    0
+}
+
+/// `iGui_ClearFilter()` — empty the persistent filter so subsequent
+/// `iGui_NextEvent` calls return every event. The driver also calls
+/// this automatically at the start of each JIT-run so one
+/// program's filter doesn't bleed into the next.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn iGui_ClearFilter() -> i64 {
+    channels::clear_filter();
+    0
+}
+
+// ─── Text-pane (terminal-grid) builtins ─────────────────────────────
+//
+// A text pane is a monospaced character-cell MDI child with a
+// software grid + cursor — distinct from the graphics-batch
+// `OpenChild` surface (which is for shapes / text rendered via
+// Direct2D) and distinct from the log view (which is a scroll-back
+// for diagnostic output).
+//
+// User programs use it as a console: `Open` returns a child id,
+// `WriteStr` / `WriteChar` / `Newline` append at the caret,
+// `SetCursor` / `Clear` / `ScrollUp` reposition or erase, `SetPen`
+// changes foreground / background colour (packed RGBA u32).
+
+/// Open a text pane MDI child, write its id to `*out_id`, return 1.
+/// `title` is NUL-terminated.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn iGui_OpenText(title: *const u8, out_id: *mut i64) -> i64 {
+    if title.is_null() || out_id.is_null() {
+        return 0;
+    }
+    let title_str = unsafe { read_cstr(title) };
+    match window::open_text_child(&title_str) {
+        Some(id) => {
+            unsafe {
+                *out_id = id;
+            }
+            1
+        }
+        None => 0,
+    }
+}
+
+/// `iGui_TextWriteStr(id, text)` — append `text` (NUL-terminated,
+/// UTF-8) at the current caret. Each LF advances to a fresh row;
+/// TAB rounds to the next 8-column stop.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn iGui_TextWriteStr(id: i64, text: *const u8) -> i64 {
+    if text.is_null() {
+        return 0;
+    }
+    let s = unsafe { read_cstr(text) };
+    text_view::write_str(id, &s) as i64
+}
+
+/// `iGui_TextWriteChar(id, codepoint)` — append one Unicode
+/// codepoint (low 32 bits) at the caret.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn iGui_TextWriteChar(id: i64, codepoint: i64) -> i64 {
+    text_view::write_char(id, (codepoint & 0xFFFF_FFFF) as u32) as i64
+}
+
+/// `iGui_TextNewline(id)` — carriage-return + line-feed at the caret.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn iGui_TextNewline(id: i64) -> i64 {
+    text_view::newline_cmd(id) as i64
+}
+
+/// `iGui_TextSetCursor(id, row, col)` — move the caret. Rows and
+/// columns are 0-based.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn iGui_TextSetCursor(id: i64, row: i64, col: i64) -> i64 {
+    text_view::set_cursor(id, row as u32, col as u32) as i64
+}
+
+/// `iGui_TextClear(id)` — clear the entire grid, reset caret to (0, 0).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn iGui_TextClear(id: i64) -> i64 {
+    text_view::clear_all_cmd(id) as i64
+}
+
+/// `iGui_TextClearEol(id)` — clear from caret to end of line.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn iGui_TextClearEol(id: i64) -> i64 {
+    text_view::clear_to_eol_cmd(id) as i64
+}
+
+/// `iGui_TextClearEos(id)` — clear from caret to end of screen.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn iGui_TextClearEos(id: i64) -> i64 {
+    text_view::clear_to_eos_cmd(id) as i64
+}
+
+/// `iGui_TextScrollUp(id, n)` — scroll the grid up by `n` rows,
+/// inserting blank rows at the bottom.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn iGui_TextScrollUp(id: i64, n: i64) -> i64 {
+    text_view::scroll_up_cmd(id, n.max(0) as u32) as i64
+}
+
+/// `iGui_TextSetPen(id, fg, bg)` — set foreground / background
+/// colours for subsequent writes. Each colour is a packed
+/// `0xAARRGGBB` u32 (low 32 bits of the BCPL i64 argument).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn iGui_TextSetPen(id: i64, fg: i64, bg: i64) -> i64 {
+    text_view::set_pen(
+        id,
+        (fg & 0xFFFF_FFFF) as u32,
+        (bg & 0xFFFF_FFFF) as u32,
+    ) as i64
+}
+
+/// `iGui_TextResetPen(id)` — restore the default fg / bg.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn iGui_TextResetPen(id: i64) -> i64 {
+    text_view::reset_pen(id) as i64
+}
+
+/// `iGui_TextShowCaret(id, visible)` — `visible` non-zero shows the
+/// blinking caret block; zero hides it.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn iGui_TextShowCaret(id: i64, visible: i64) -> i64 {
+    text_view::set_caret_visible(id, visible != 0) as i64
+}
+
+/// Read a NUL-terminated UTF-8 / ASCII byte sequence into an owned
+/// String. Used by the text-pane shims that take BCPL string args.
+unsafe fn read_cstr(p: *const u8) -> String {
+    if p.is_null() {
+        return String::new();
+    }
+    let mut len = 0usize;
+    while unsafe { *p.add(len) } != 0 {
+        len += 1;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(p, len) };
+    String::from_utf8_lossy(bytes).into_owned()
 }
 
 /// `iGui_DrawText(text, x, y, size, r, g, b, a)` — draw `text` with

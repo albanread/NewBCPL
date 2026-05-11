@@ -362,6 +362,40 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
                 false,
             ),
             "iGui_Quit" => i64_t.fn_type(&[], false),
+            // (target_child, kind*, child*, time*, p1*, p2*, p3*, p4*, timeout_ms)
+            "iGui_NextEventFor" => i64_t.fn_type(
+                &[
+                    i64_t.into(),
+                    ptr_t.into(), ptr_t.into(), ptr_t.into(), ptr_t.into(),
+                    ptr_t.into(), ptr_t.into(), ptr_t.into(),
+                    i64_t.into(),
+                ],
+                false,
+            ),
+            "iGui_DiscardStashedEvents" => i64_t.fn_type(&[], false),
+            // Text-pane builtins.
+            //   OpenText(title*, *out_id) -> i64
+            "iGui_OpenText" => {
+                i64_t.fn_type(&[ptr_t.into(), ptr_t.into()], false)
+            }
+            //   TextWriteStr(id, text*) -> i64
+            "iGui_TextWriteStr" => {
+                i64_t.fn_type(&[i64_t.into(), ptr_t.into()], false)
+            }
+            // All other text-pane builtins are i64-only (id + int
+            // args, int return) — the default lowering already
+            // handles them. Listed here just to keep the surface
+            // documented in one place:
+            //   iGui_TextWriteChar(id, codepoint) -> i64
+            //   iGui_TextNewline(id)              -> i64
+            //   iGui_TextSetCursor(id, row, col)  -> i64
+            //   iGui_TextClear(id)                -> i64
+            //   iGui_TextClearEol(id)             -> i64
+            //   iGui_TextClearEos(id)             -> i64
+            //   iGui_TextScrollUp(id, n)          -> i64
+            //   iGui_TextSetPen(id, fg, bg)       -> i64
+            //   iGui_TextResetPen(id)             -> i64
+            //   iGui_TextShowCaret(id, visible)   -> i64
             // Default: i64 fn(i64, ..., i64).
             _ => {
                 let args: Vec<BasicMetadataTypeEnum> =

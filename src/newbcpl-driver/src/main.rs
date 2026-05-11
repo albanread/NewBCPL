@@ -386,6 +386,14 @@ fn gui_language_worker(program_path: PathBuf, modules_dir: PathBuf) {
 fn gui_run_program(program_path: &Path, modules_dir: &Path) {
     use newbcpl_runtime::igui;
 
+    // Reset the event subsystem so the new program starts from a
+    // clean state regardless of what the previous run did. Clears
+    // the persistent window-filter set + discards stashed events
+    // — without this, filters and events from the prior Run would
+    // bleed into the next.
+    igui::channels::clear_filter();
+    igui::channels::discard_stashed_events();
+
     igui::log_append("---");
 
     // Use the launch-time filename stem as the IR module name so the

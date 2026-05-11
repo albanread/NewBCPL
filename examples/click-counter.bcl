@@ -67,9 +67,13 @@ LET START() BE $(
     WRITES("[counter] window open; clicks = 0*N")
 
     WHILE running DO $(
-        UNLESS igui_next_event(@kind, @child, @t,
-                               @p1, @p2, @p3, @p4,
-                               -1) DO LOOP
+        // Use the per-window filter: only events whose child_id is
+        // our `win` come through, plus "global" events like
+        // FrameClose. Mouse moves over bedit / log_view park in the
+        // stash and don't pollute the loop.
+        UNLESS igui_next_event_for(win, @kind, @child, @t,
+                                   @p1, @p2, @p3, @p4,
+                                   -1) DO LOOP
 
         SWITCHON kind INTO $(
             CASE 3:                                  // MOUSE

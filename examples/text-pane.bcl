@@ -1,0 +1,82 @@
+// text-pane.bcl — open a terminal-grid MDI child and drive it from BCPL.
+//
+//   cargo run -p newbcpl-driver -- gui examples/text-pane.bcl
+//
+// Hit Ctrl+R. A "Console" MDI child opens with a coloured banner and
+// a row of digits printed in two passes — one via `text_writes`
+// (string), one character-at-a-time via `text_writec` (codepoint).
+// Cursor addressing (`text_set_cursor`) and clear-line are
+// demonstrated by drawing a status row at row 5, then erasing it
+// and reprinting it. Caret remains visible at the end so the user
+// sees where output would continue.
+//
+// The pane is independent of the log view: WRITES to the log view
+// still works, but text_writes is the path for programs that want
+// their own console surface with cursor control.
+
+LET START() BE $(
+    LET win = igui_text_open("Console")
+    WRITES("[demo] opened text pane id=")
+    WRITEN(win)
+    NEWLINE()
+
+    // Banner in cyan-on-slate. Pen colours are 0xAARRGGBB.
+    igui_text_set_pen(win, #XFF66E0E0, #XFF202840)
+    igui_text_writes(win, "+-------------------------+*N")
+    igui_text_writes(win, "|   NewBCPL text pane     |*N")
+    igui_text_writes(win, "+-------------------------+*N")
+    igui_text_reset_pen(win)
+    igui_text_newline(win)
+
+    // Two passes printing digits 0..9 — first as a string, then one
+    // codepoint at a time. They produce identical output.
+    igui_text_writes(win, "via writes:  0 1 2 3 4 5 6 7 8 9*N")
+
+    igui_text_writes(win, "via writec:  ")
+    FOR i = 0 TO 9 DO $(
+        // '0' is codepoint 48 (#X30). Add i to print the digit.
+        igui_text_writec(win, 48 + i)
+        igui_text_writec(win, 32)         // space
+    $)
+    igui_text_newline(win)
+    igui_text_newline(win)
+
+    // Status line at row 7, column 0. Write it, then erase + rewrite
+    // to demonstrate clear-to-end-of-line + cursor addressing.
+    igui_text_set_cursor(win, 7, 0)
+    igui_text_writes(win, "status: ready (about to clear)")
+    igui_text_set_cursor(win, 7, 0)
+    igui_text_clear_eol(win)
+    igui_text_writes(win, "status: done")
+
+    // ─── Interactive input ───────────────────────────────────────
+    //
+    // Park the caret on row 9, then prompt for a name. `text_read_line`
+    // drains the event channel until Enter, echoing every printable
+    // character into the pane and capturing it in `name_buf` (one
+    // codepoint per word). Click the Console window first so it has
+    // keyboard focus.
+    igui_text_set_cursor(win, 9, 0)
+    igui_text_writes(win, "Click here, then type a name and press Enter:*N> ")
+    igui_text_show_caret(win, 1)
+
+    LET name_buf = VEC 64
+    LET n = igui_text_read_line(win, name_buf, 64)
+
+    // After Enter, advance to a fresh row and greet the user. Print
+    // the captured codepoints one-at-a-time via `text_writec` —
+    // that's the simplest path until we have a VEC-to-byte-string
+    // packer.
+    igui_text_newline(win)
+    igui_text_set_pen(win, #XFFFFD080, #XFF202840)
+    igui_text_writes(win, "Hello, ")
+    FOR i = 0 TO n - 1 DO igui_text_writec(win, name_buf!i)
+    igui_text_writes(win, "! ")
+    igui_text_writes(win, "Welcome to the text pane.")
+    igui_text_reset_pen(win)
+    igui_text_newline(win)
+
+    WRITES("[demo] read ")
+    WRITEN(n)
+    WRITES(" chars; close the Console window to exit*N")
+$)

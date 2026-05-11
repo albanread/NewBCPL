@@ -51,7 +51,7 @@ mod replies;
 pub mod system_colors;
 pub(crate) mod text_view;
 mod tools_menu;
-mod window;
+pub(crate) mod window;
 
 pub use bedit::{
     install_checker, set_startup_file as bedit_set_startup_file,

@@ -1050,6 +1050,75 @@ pub fn builtin_addresses() -> &'static [Builtin] {
                 name: "iGui_Quit",
                 address: g::iGui_Quit as *const () as usize,
             });
+            v.push(Builtin {
+                name: "iGui_NextEventFor",
+                address: g::iGui_NextEventFor as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "iGui_DiscardStashedEvents",
+                address: g::iGui_DiscardStashedEvents as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "iGui_FilterOnWindow",
+                address: g::iGui_FilterOnWindow as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "iGui_UnfilterWindow",
+                address: g::iGui_UnfilterWindow as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "iGui_ClearFilter",
+                address: g::iGui_ClearFilter as *const () as usize,
+            });
+            // Text-pane (terminal-grid) builtins.
+            v.push(Builtin {
+                name: "iGui_OpenText",
+                address: g::iGui_OpenText as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "iGui_TextWriteStr",
+                address: g::iGui_TextWriteStr as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "iGui_TextWriteChar",
+                address: g::iGui_TextWriteChar as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "iGui_TextNewline",
+                address: g::iGui_TextNewline as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "iGui_TextSetCursor",
+                address: g::iGui_TextSetCursor as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "iGui_TextClear",
+                address: g::iGui_TextClear as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "iGui_TextClearEol",
+                address: g::iGui_TextClearEol as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "iGui_TextClearEos",
+                address: g::iGui_TextClearEos as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "iGui_TextScrollUp",
+                address: g::iGui_TextScrollUp as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "iGui_TextSetPen",
+                address: g::iGui_TextSetPen as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "iGui_TextResetPen",
+                address: g::iGui_TextResetPen as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "iGui_TextShowCaret",
+                address: g::iGui_TextShowCaret as *const () as usize,
+            });
         }
         v
     })

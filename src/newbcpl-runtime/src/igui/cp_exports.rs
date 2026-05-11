@@ -1144,7 +1144,7 @@ unsafe fn read_cp_shortstr(ptr: *const u8) -> String {
 
 #[allow(clippy::too_many_arguments)]
 #[allow(unused_assignments)] // initial defaults overwritten by every match arm
-fn write_event(
+pub(crate) fn write_event(
     ev: IGuiEvent,
     out_kind: *mut i64,
     out_child: *mut i64,
