@@ -13,6 +13,18 @@ newbcpl-parser = { path = "../../src/newbcpl-parser" }
 newbcpl-sema = { path = "../../src/newbcpl-sema" }
 
 [[test]]
+name = "matrix_tier1_negatives"
+path = "tests/matrix_tier1_negatives.rs"
+
+[[test]]
+name = "matrix_tier3"
+path = "tests/matrix_tier3.rs"
+
+[[test]]
+name = "matrix_tier4"
+path = "tests/matrix_tier4.rs"
+
+[[test]]
 name = "matrix_tier5"
 path = "tests/matrix_tier5.rs"
 
@@ -21,8 +33,8 @@ name = "matrix_tier6"
 path = "tests/matrix_tier6.rs"
 
 [[test]]
-name = "matrix_tier1_negatives"
-path = "tests/matrix_tier1_negatives.rs"
+name = "matrix_tier7"
+path = "tests/matrix_tier7.rs"
 
 [[test]]
 name = "lexer_smoke"
