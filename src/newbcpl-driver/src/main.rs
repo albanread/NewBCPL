@@ -591,15 +591,27 @@ fn run_test_folder(
             duration_ms: 0,
         };
 
-        match Command::new(&exe).arg("run").arg(file).output() {
+        // Bound each test to a wall-clock timeout — some corpus
+        // files have infinite loops or read RDCH and would block
+        // the whole sweep indefinitely. Close stdin too so
+        // RDCH-from-stdin returns immediately (-1, EOF) instead of
+        // blocking on user input.
+        match run_one_with_timeout(&exe, file, std::time::Duration::from_secs(5)) {
             Ok(o) => {
-                outcome.exit_code = o.status.code().unwrap_or(-1);
-                outcome.stdout = String::from_utf8_lossy(&o.stdout).into_owned();
-                outcome.stderr = String::from_utf8_lossy(&o.stderr).into_owned();
-                if !o.status.success() {
+                outcome.exit_code = o.exit_code;
+                outcome.stdout = o.stdout;
+                outcome.stderr = o.stderr;
+                if o.timed_out {
+                    outcome.pass = false;
+                    outcome.failed_at = Some(Phase::Crash);
+                    if outcome.stderr.is_empty() {
+                        outcome.stderr =
+                            "test timed out (>5s); subprocess killed".to_string();
+                    }
+                } else if o.exit_code != 0 {
                     outcome.pass = false;
                     outcome.failed_at =
-                        Some(classify_run_stderr(&outcome.stderr, o.status.code().is_some()));
+                        Some(classify_run_stderr(&outcome.stderr, o.exit_code != -1));
                 }
             }
             Err(e) => {
@@ -723,4 +735,68 @@ fn print_usage() {
         eprintln!("    {:width$}    {}", cmd, blurb, width = max);
     }
     let _ = Path::new(""); // import touched for future use
+}
+
+/// One subprocess outcome captured by `run_one_with_timeout`.
+struct TimedOutput {
+    exit_code: i32,
+    stdout: String,
+    stderr: String,
+    timed_out: bool,
+}
+
+/// Run `<driver> run <file>` with `stdin` closed and a wall-clock
+/// limit. On timeout, kill the child and return what we managed to
+/// capture. Used by `test-folder` so a single hanging corpus file
+/// can't stall the whole sweep.
+///
+/// Polling via `try_wait` rather than a worker thread keeps the
+/// dependency surface to std only. 50 ms poll cadence — overhead
+/// is negligible against the ~50 ms typical per-test JIT time.
+fn run_one_with_timeout(
+    exe: &Path,
+    file: &Path,
+    timeout: std::time::Duration,
+) -> std::io::Result<TimedOutput> {
+    use std::io::Read;
+    use std::process::Stdio;
+    let mut child = std::process::Command::new(exe)
+        .arg("run")
+        .arg(file)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let start = std::time::Instant::now();
+    let (status, timed_out) = loop {
+        match child.try_wait()? {
+            Some(s) => break (Some(s), false),
+            None => {
+                if start.elapsed() > timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break (None, true);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+    };
+    let mut stdout = String::new();
+    if let Some(mut s) = child.stdout.take() {
+        let _ = s.read_to_string(&mut stdout);
+    }
+    let mut stderr = String::new();
+    if let Some(mut s) = child.stderr.take() {
+        let _ = s.read_to_string(&mut stderr);
+    }
+    let exit_code = match status {
+        Some(s) => s.code().unwrap_or(-1),
+        None => -1,
+    };
+    Ok(TimedOutput {
+        exit_code,
+        stdout,
+        stderr,
+        timed_out,
+    })
 }
