@@ -510,3 +510,87 @@ fn virtual_dispatch_picks_subclass_body_via_vtable() {
         "1 7",
     );
 }
+
+// ─── Visibility enforcement (PUBLIC / PRIVATE / PROTECTED) ────────
+//
+// Sema rejects accesses that violate the declared visibility. The
+// access-site's class identity (the class whose method body the
+// access is happening inside) is checked against the member's
+// defining class. PUBLIC always passes; PRIVATE requires identity;
+// PROTECTED allows the defining class or any descendant. Top-level
+// code (outside any class) can only reach PUBLIC members.
+
+#[test]
+fn public_field_accessible_from_outside() {
+    expect(
+        "public_field_accessible_from_outside",
+        "CLASS P $(\n  PUBLIC:\n  DECL x\n  ROUTINE CREATE(ix) BE SELF.x := ix\n$)\nLET START() BE $(\n  LET p = NEW P(5)\n  WRITEN(p.x)\n$)\n",
+        "5",
+    );
+}
+
+#[test]
+fn private_field_rejected_from_outside() {
+    use newbcpl_tests::expect_reject;
+    expect_reject(
+        "private_field_rejected_from_outside",
+        "run",
+        "CLASS P $(\n  PRIVATE:\n  DECL secret\n  PUBLIC:\n  ROUTINE CREATE(s) BE SELF.secret := s\n$)\nLET START() BE $(\n  LET p = NEW P(42)\n  WRITEN(p.secret)\n$)\n",
+        "private",
+    );
+}
+
+#[test]
+fn private_field_accessible_from_inside() {
+    // Same class accessing its own private field — fine.
+    expect(
+        "private_field_accessible_from_inside",
+        "CLASS P $(\n  PRIVATE:\n  DECL secret\n  PUBLIC:\n  ROUTINE CREATE(s) BE SELF.secret := s\n  FUNCTION reveal() = SELF.secret\n$)\nLET START() BE $(\n  LET p = NEW P(77)\n  WRITEN(p.reveal())\n$)\n",
+        "77",
+    );
+}
+
+#[test]
+fn protected_field_rejected_from_outside() {
+    use newbcpl_tests::expect_reject;
+    expect_reject(
+        "protected_field_rejected_from_outside",
+        "run",
+        "CLASS P $(\n  PROTECTED:\n  DECL value\n  PUBLIC:\n  ROUTINE CREATE(v) BE SELF.value := v\n$)\nLET START() BE $(\n  LET p = NEW P(1)\n  WRITEN(p.value)\n$)\n",
+        "protected",
+    );
+}
+
+#[test]
+fn protected_field_accessible_in_subclass() {
+    // Sub extends Base and reads Base's PROTECTED field from its
+    // own method — allowed.
+    expect(
+        "protected_field_accessible_in_subclass",
+        "CLASS Base $(\n  PROTECTED:\n  DECL value\n  PUBLIC:\n  ROUTINE CREATE(v) BE SELF.value := v\n$)\nCLASS Sub EXTENDS Base $(\n  PUBLIC:\n  FUNCTION peek() = SELF.value\n$)\nLET START() BE $(\n  LET s = NEW Sub(11)\n  WRITEN(s.peek())\n$)\n",
+        "11",
+    );
+}
+
+#[test]
+fn private_method_rejected_from_outside() {
+    use newbcpl_tests::expect_reject;
+    expect_reject(
+        "private_method_rejected_from_outside",
+        "run",
+        "CLASS P $(\n  PRIVATE:\n  FUNCTION helper() = 1\n  PUBLIC:\n  ROUTINE CREATE() BE $( $)\n$)\nLET START() BE $(\n  LET p = NEW P\n  WRITEN(p.helper())\n$)\n",
+        "private",
+    );
+}
+
+#[test]
+fn private_method_callable_through_public_wrapper() {
+    // Same class calling its own private method via a public
+    // wrapper — fine. Demonstrates the standard helper-method
+    // pattern.
+    expect(
+        "private_method_callable_through_public_wrapper",
+        "CLASS P $(\n  PRIVATE:\n  FUNCTION compute() = 99\n  PUBLIC:\n  FUNCTION result() = SELF.compute()\n$)\nLET START() BE $(\n  LET p = NEW P\n  WRITEN(p.result())\n$)\n",
+        "99",
+    );
+}

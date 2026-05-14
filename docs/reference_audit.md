@@ -167,7 +167,7 @@ Per `classes_and_objects.md`:
 | `EXTENDS` single inheritance | ✓ | Tier 5 |
 | `SUPER.method()` | ⚠ | Parser + sema know SUPER; method-dispatch through it lacks a probe verifying parent's body runs |
 | `CREATE` / `RELEASE` slots 0 / 1 | ✓ | Tier 5 |
-| `PUBLIC` / `PRIVATE` / `PROTECTED` | ⚠ | Parser recognises; sema records visibility; no enforcement probe |
+| `PUBLIC` / `PRIVATE` / `PROTECTED` | ✓ | Enforced by sema. Visibility check at every `obj.field` and `obj.method()` site; `PRIVATE` requires access from the declaring class, `PROTECTED` extends to descendants. Sema's new `errors` channel rejects offenders; the driver refuses to proceed to IR/codegen. Tier 5 probes (`public_*`, `private_*`, `protected_*`). |
 | `VIRTUAL` / `FINAL` modifiers | ⚠ | Parsed and surfaced in vtable; no override-via-VIRTUAL probe |
 
 ## §9 — Memory model
@@ -216,9 +216,7 @@ Per `BCPL Runtime.md`:
 
 ### Medium-leverage (advisory)
 
-6. **Visibility enforcement.** `PRIVATE`/`PROTECTED` are parsed but sema doesn't reject `outsider.private_field`. The reference doesn't *demand* enforcement at compile time but the user guide claims it. *Either implement or soften the doc claim.*
-
-7. **`findinput` / `findoutput` family.** Old-BCPL file I/O. Not in user guide. Skip unless the corpus blocks on it.
+6. **`findinput` / `findoutput` family.** Old-BCPL file I/O. Not in user guide. Skip unless the corpus blocks on it.
 
 ### Low-leverage (cleanup)
 

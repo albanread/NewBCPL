@@ -571,6 +571,21 @@ fn build_ir_from_source_with_base(
         .map_err(|e| format!("parse: {}", e.render()))?;
     let expanded = expand_gets(program, base_dir, modules_dir)?;
     let sema = newbcpl_sema::analyze(&expanded);
+    if !sema.errors.is_empty() {
+        // Sema errors are hard — visibility violations, etc. Don't
+        // proceed to IR/codegen with broken access control. Report
+        // the first; render the rest in a follow-on summary so users
+        // who want full context can see it.
+        let mut msg = format!("sema: {}", sema.errors[0].render());
+        if sema.errors.len() > 1 {
+            msg.push_str(&format!(
+                "\nsema: ({} more error{})",
+                sema.errors.len() - 1,
+                if sema.errors.len() == 2 { "" } else { "s" }
+            ));
+        }
+        return Err(msg);
+    }
     Ok(newbcpl_ir::lower(&expanded, &sema, module_name))
 }
 

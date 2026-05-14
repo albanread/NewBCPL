@@ -138,6 +138,27 @@ impl SemaWarning {
     }
 }
 
+/// A hard sema diagnostic. Unlike `SemaWarning`, the driver refuses
+/// to proceed to IR/codegen when any are present. Reserved for
+/// violations that aren't *type* questions (which sema never errors
+/// on, per the manifesto) but *meaning* questions — e.g. accessing
+/// a `PRIVATE` member from outside its class. The user guide
+/// promises these are enforced; sema is where the enforcement lives.
+#[derive(Debug, Clone)]
+pub struct SemaError {
+    pub message: String,
+    pub span: Span,
+}
+
+impl SemaError {
+    pub fn render(&self) -> String {
+        format!(
+            "{} at {}:{}",
+            self.message, self.span.start.line, self.span.start.column
+        )
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SemaOutput {
     /// Every binding sema observed, in declaration order.
@@ -167,6 +188,10 @@ pub struct SemaOutput {
     /// Non-fatal diagnostics. Sema never fails on type grounds, so
     /// every interesting observation lands here.
     pub warnings: Vec<SemaWarning>,
+    /// Hard diagnostics — the driver refuses to JIT a program when
+    /// these are non-empty. Currently populated only by visibility
+    /// enforcement (`PRIVATE` / `PROTECTED` member access).
+    pub errors: Vec<SemaError>,
 }
 
 #[derive(Debug, Clone)]
@@ -206,6 +231,7 @@ pub fn analyze(program: &Program) -> SemaOutput {
         manifests: sema.manifests,
         globals: sema.globals,
         warnings: sema.warnings,
+        errors: sema.errors,
     }
 }
 
@@ -400,7 +426,15 @@ struct Sema {
     /// How many SWITCHON bodies are currently open. `ENDCASE` warns
     /// when 0.
     switchon_depth: u32,
+    /// Set while analysing a class method body so visibility checks
+    /// can answer "is this access happening from inside class X?".
+    /// `None` outside any class body — top-level routines and free
+    /// functions. Visibility checks reject `PRIVATE` / `PROTECTED`
+    /// accesses when `current_class` doesn't match the member's
+    /// declaring class (or a descendant, for `PROTECTED`).
+    current_class: Option<String>,
     warnings: Vec<SemaWarning>,
+    errors: Vec<SemaError>,
 }
 
 impl Sema {
@@ -418,7 +452,9 @@ impl Sema {
             globals: HashMap::new(),
             loop_depth: 0,
             switchon_depth: 0,
+            current_class: None,
             warnings: Vec::new(),
+            errors: Vec::new(),
         }
     }
 
@@ -493,6 +529,75 @@ impl Sema {
             message: message.into(),
             span,
         });
+    }
+
+    fn error(&mut self, message: impl Into<String>, span: Span) {
+        self.errors.push(SemaError {
+            message: message.into(),
+            span,
+        });
+    }
+
+    /// True iff `candidate` is `ancestor` or transitively extends it.
+    /// Walks the class table's `extends` chain. Used by visibility
+    /// checks to grant `PROTECTED` access from any subclass.
+    fn is_class_or_descendant_of(&self, candidate: &str, ancestor: &str) -> bool {
+        let mut cur = Some(candidate.to_string());
+        while let Some(name) = cur {
+            if name == ancestor {
+                return true;
+            }
+            cur = self.classes.get(&name).and_then(|c| c.extends.clone());
+        }
+        false
+    }
+
+    /// Enforce `PUBLIC` / `PRIVATE` / `PROTECTED` at a member-access
+    /// site. The defining-class declares the member's visibility;
+    /// `self.current_class` is the class whose method body the
+    /// access is occurring inside (or `None` for top-level code).
+    ///
+    /// - `PUBLIC` — always allowed.
+    /// - `PRIVATE` — only when `current_class == defining_class`.
+    /// - `PROTECTED` — `current_class` is `defining_class` or any
+    ///   descendant. Mirrors C++ / classical OO semantics.
+    fn check_member_visibility(
+        &mut self,
+        defining_class: &str,
+        member_name: &str,
+        visibility: Visibility,
+        span: Span,
+    ) {
+        if matches!(visibility, Visibility::Public) {
+            return;
+        }
+        let access = self.current_class.clone();
+        let allowed = match visibility {
+            Visibility::Public => true,
+            Visibility::Private => access.as_deref() == Some(defining_class),
+            Visibility::Protected => match access.as_deref() {
+                Some(ac) => self.is_class_or_descendant_of(ac, defining_class),
+                None => false,
+            },
+        };
+        if allowed {
+            return;
+        }
+        let vis_word = match visibility {
+            Visibility::Private => "private",
+            Visibility::Protected => "protected",
+            Visibility::Public => unreachable!(),
+        };
+        let from = match access {
+            Some(c) => format!("from class `{c}`"),
+            None => "from top-level code".to_string(),
+        };
+        self.error(
+            format!(
+                "`{defining_class}.{member_name}` is {vis_word} — cannot access {from}"
+            ),
+            span,
+        );
     }
 
     fn analyze_program(&mut self, program: &Program) {
@@ -945,6 +1050,9 @@ impl Sema {
                 for p in &method.params {
                     self.declare(p, TypeHint::Word, None, method.span);
                 }
+                // Mark this body as "inside class c" so visibility
+                // checks can answer "where is this access from?".
+                let saved_class = self.current_class.replace(c.name.clone());
                 let (result_hint, result_class) = match &method.body {
                     ClassMethodBody::Routine(s) => {
                         self.analyze_stmt(s);
@@ -956,6 +1064,7 @@ impl Sema {
                         (hint, class_name)
                     }
                 };
+                self.current_class = saved_class;
                 self.pop_scope();
                 // Refine the previously-recorded method's result hint
                 // and result class identity (the latter lets chained
@@ -989,11 +1098,47 @@ impl Sema {
     /// Look up a field by walking the class's inheritance chain. Returns
     /// the field's hint if found, `None` otherwise.
     fn lookup_field(&self, class_name: &str, field: &str) -> Option<TypeHint> {
+        self.lookup_field_owner(class_name, field).map(|(_, info)| info.hint)
+    }
+
+    /// As `lookup_field`, but also reports which class in the
+    /// inheritance chain actually declared the field. Visibility
+    /// checks key off the defining class — `PRIVATE`/`PROTECTED` are
+    /// relative to it, not to the receiver's runtime class.
+    fn lookup_field_owner(
+        &self,
+        class_name: &str,
+        field: &str,
+    ) -> Option<(String, ClassFieldInfo)> {
         let mut current = Some(class_name.to_string());
         while let Some(name) = current {
             if let Some(class) = self.classes.get(&name) {
                 if let Some(f) = class.fields.iter().find(|f| f.name == field) {
-                    return Some(f.hint);
+                    return Some((name, f.clone()));
+                }
+                current = class.extends.clone();
+            } else {
+                return None;
+            }
+        }
+        None
+    }
+
+    /// As `lookup_method`, but reports which class actually declared
+    /// the method body. Visibility checks consult this defining
+    /// class, not the receiver's static class — a `PRIVATE` method
+    /// in `Base` stays private even when called through a `Sub`
+    /// instance.
+    fn lookup_method_owner(
+        &self,
+        class_name: &str,
+        method: &str,
+    ) -> Option<(String, ClassMethodInfo)> {
+        let mut current = Some(class_name.to_string());
+        while let Some(name) = current {
+            if let Some(class) = self.classes.get(&name) {
+                if let Some(m) = class.methods.iter().find(|m| m.name == method) {
+                    return Some((name, m.clone()));
                 }
                 current = class.extends.clone();
             } else {
@@ -1498,13 +1643,22 @@ impl Sema {
                     op: BinaryOp::Dot,
                     lhs,
                     rhs,
+                    span: dot_span,
                     ..
                 } = callee.as_ref()
                 {
                     if let (Some(class_name), Expr::Ident { name: method, .. }) =
                         (self.class_of_expr(lhs), rhs.as_ref())
                     {
-                        if let Some(method_info) = self.lookup_method(&class_name, method) {
+                        if let Some((defining_class, method_info)) =
+                            self.lookup_method_owner(&class_name, method)
+                        {
+                            self.check_member_visibility(
+                                &defining_class,
+                                method,
+                                method_info.visibility,
+                                *dot_span,
+                            );
                             return match method_info.kind {
                                 FunctionKind::Routine => TypeHint::Word,
                                 FunctionKind::Function => method_info.result,
@@ -1533,7 +1687,7 @@ impl Sema {
                     UnaryOp::FreeVec | UnaryOp::FreeList => TypeHint::Word,
                 }
             }
-            Expr::Binary { op, lhs, rhs, .. } => {
+            Expr::Binary { op, lhs, rhs, span: dot_span, .. } => {
                 // Member access: resolve `obj.field` through the class
                 // table when sema knows obj's class. The RHS is
                 // syntactically an identifier (the parser enforces it),
@@ -1544,11 +1698,23 @@ impl Sema {
                     if let (Some(class_name), Expr::Ident { name: field, .. }) =
                         (self.class_of_expr(lhs), rhs.as_ref())
                     {
-                        if let Some(hint) = self.lookup_field(&class_name, field) {
-                            return hint;
+                        if let Some((defining_class, field_info)) =
+                            self.lookup_field_owner(&class_name, field)
+                        {
+                            self.check_member_visibility(
+                                &defining_class,
+                                field,
+                                field_info.visibility,
+                                *dot_span,
+                            );
+                            return field_info.hint;
                         }
                         // Fall back to method lookup so `obj.method`
                         // (without a call) still has a sensible hint.
+                        // No visibility check here — `obj.method` as a
+                        // value is a function-pointer reference, which
+                        // we don't model fully; the call site catches
+                        // the violation when it fires.
                         if let Some(_) = self.lookup_method(&class_name, field) {
                             return TypeHint::Function;
                         }

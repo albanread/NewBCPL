@@ -969,16 +969,18 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
 
         let _ = i64_t; // silence unused if no other use below
 
-        // Call the mangled CREATE if declared.
-        let has_create = layout
-            .and_then(|l| {
-                l.vtable
-                    .iter()
-                    .find(|v| v.method_name == "CREATE" && v.defining_class.is_some())
-            })
-            .is_some();
-        if has_create {
-            let create_name = format!("{class_name}_CREATE");
+        // Call the mangled CREATE if declared. Use the *defining*
+        // class — for `NEW Sub` where Sub inherits CREATE from Base,
+        // we want `Base_CREATE` not `Sub_CREATE`. The layout's
+        // vtable already tracks `defining_class` for slot 0.
+        let create_owner = layout.and_then(|l| {
+            l.vtable
+                .iter()
+                .find(|v| v.method_name == "CREATE")
+                .and_then(|v| v.defining_class.clone())
+        });
+        if let Some(owner) = create_owner {
+            let create_name = format!("{owner}_CREATE");
             let create_fn = match self.by_name.get(&create_name) {
                 Some(&f) => f,
                 None => self.declare_extern(&create_name, args.len() + 1),
