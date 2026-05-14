@@ -18,7 +18,7 @@
 //! matching probe fails with a clean stdout diff pointing at the
 //! cell.
 
-use newbcpl_tests::{expect_stdout as expect, expect_stdout_contains};
+use newbcpl_tests::{expect_reject, expect_stdout as expect, expect_stdout_contains};
 
 // ─── Allocation surfaces ───────────────────────────────────────────
 
@@ -275,6 +275,47 @@ fn deep_chain_survives_collection() {
         "deep_chain_survives_collection",
         "CLASS C $(\n  DECL leaf\n  ROUTINE CREATE(v) BE SELF.leaf := v\n$)\nCLASS B $(\n  DECL mid\n  ROUTINE CREATE(v) BE SELF.mid := NEW C(v)\n$)\nCLASS A $(\n  DECL top\n  ROUTINE CREATE(v) BE SELF.top := NEW B(v)\n$)\nLET START() BE $(\n  LET a = NEW A(777)\n  GC()\n  WRITEN(a.top.mid.leaf)\n$)\n",
         "777",
+    );
+}
+
+// ─── SEH unwind through JIT frames ────────────────────────────────
+//
+// Calling a runtime helper that raises `panic!` must unwind cleanly
+// back through the JIT frame to the host process's default panic
+// handler — stderr gets the standard "thread '...' panicked at ..."
+// line, exit code is the normal panic value (101 on Linux, hex
+// `8000_0003` on Windows). Without the SEH machinery (`uwtable=2` on
+// every JIT'd function, custom MCJIT memory manager that registers
+// `.pdata` with `RtlAddFunctionTable`, runtime helpers declared
+// `extern "C-unwind"`), the panic would corrupt the JIT frame's
+// stack and fast-fail with STATUS_STACK_BUFFER_OVERRUN
+// (0xC0000409) — a process abort with no panic message at all.
+//
+// Asserting on the substring "panicked at" is what discriminates a
+// graceful unwind from a corruption crash: the panic message only
+// reaches stderr if the unwinder walked back through the JIT frame
+// and into the Rust runtime's default hook.
+
+#[test]
+fn runtime_panic_unwinds_through_jit() {
+    expect_reject(
+        "runtime_panic_unwinds_through_jit",
+        "run",
+        "LET START() BE $( __newbcpl_test_panic() $)\n",
+        "deliberate panic from runtime helper",
+    );
+}
+
+#[test]
+fn runtime_panic_unwinds_through_nested_call() {
+    // Two JIT frames between the panic and the host: `START` calls
+    // `provoke`, which calls `__newbcpl_test_panic`. Both JIT frames
+    // need their unwind info registered for the panic to land.
+    expect_reject(
+        "runtime_panic_unwinds_through_nested_call",
+        "run",
+        "LET provoke() = __newbcpl_test_panic()\nLET START() BE $( provoke() $)\n",
+        "deliberate panic from runtime helper",
     );
 }
 

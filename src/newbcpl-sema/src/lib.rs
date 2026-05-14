@@ -449,8 +449,10 @@ impl Sema {
     }
 
     /// Best-effort: return true when an expression evaluates to a
-    /// MANAGED-class instance. Used by the manifesto §5 alias /
-    /// container-storage checks.
+    /// MANAGED-class instance. Kept available for any future diagnostic
+    /// that wants the signal; the linearity warnings that originally
+    /// called it were retired when `USING` blocks landed.
+    #[allow(dead_code)]
     fn expr_is_managed(&self, e: &Expr) -> bool {
         match e {
             Expr::Ident { name, .. } => self
@@ -458,11 +460,6 @@ impl Sema {
                 .map(|info| info.is_managed)
                 .unwrap_or(false),
             Expr::New { class_name, .. } => self.class_is_managed(class_name),
-            // Method calls returning MANAGED, lane access, etc. could
-            // also be tracked once sema records method-return classes.
-            // For now they fall through to false — false negatives
-            // are preferable to false positives in a soft-warning
-            // pass.
             _ => false,
         }
     }

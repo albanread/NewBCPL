@@ -54,7 +54,7 @@ where
 /// already cooked the BCPL `*N` / `*T` etc. escapes when emitting
 /// the global.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn WRITES(s: *const u8) -> i64 {
+pub unsafe extern "C-unwind" fn WRITES(s: *const u8) -> i64 {
     if s.is_null() {
         return 0;
     }
@@ -65,7 +65,7 @@ pub unsafe extern "C" fn WRITES(s: *const u8) -> i64 {
 
 /// `WRITEN(n)` — print a signed integer in decimal.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn WRITEN(n: i64) -> i64 {
+pub unsafe extern "C-unwind" fn WRITEN(n: i64) -> i64 {
     let s = format!("{n}");
     write_bytes(s.as_bytes());
     0
@@ -73,7 +73,7 @@ pub unsafe extern "C" fn WRITEN(n: i64) -> i64 {
 
 /// `WRITEC(c)` — print a single character (low byte of `c`).
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn WRITEC(c: i64) -> i64 {
+pub unsafe extern "C-unwind" fn WRITEC(c: i64) -> i64 {
     let byte = (c & 0xff) as u8;
     write_bytes(&[byte]);
     0
@@ -81,7 +81,7 @@ pub unsafe extern "C" fn WRITEC(c: i64) -> i64 {
 
 /// `NEWLINE()` — print a single newline.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn NEWLINE() -> i64 {
+pub unsafe extern "C-unwind" fn NEWLINE() -> i64 {
     write_bytes(b"\n");
     0
 }
@@ -89,7 +89,7 @@ pub unsafe extern "C" fn NEWLINE() -> i64 {
 /// `FWRITE(f)` — print a double in the reference's `%f` style.
 /// Reference name is `FWRITE`; the corpus also uses it heavily.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn FWRITE(f: f64) -> i64 {
+pub unsafe extern "C-unwind" fn FWRITE(f: f64) -> i64 {
     let s = format!("{f}");
     write_bytes(s.as_bytes());
     0
@@ -97,7 +97,7 @@ pub unsafe extern "C" fn FWRITE(f: f64) -> i64 {
 
 /// `RDCH()` — read one byte from stdin; -1 on EOF.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn RDCH() -> i64 {
+pub unsafe extern "C-unwind" fn RDCH() -> i64 {
     let mut buf = [0u8; 1];
     match std::io::stdin().read(&mut buf) {
         Ok(0) | Err(_) => -1,
@@ -111,7 +111,7 @@ pub unsafe extern "C" fn RDCH() -> i64 {
 /// purpose at that moment. `test-folder` runs each program in its
 /// own subprocess so this is harmless.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn FINISH() -> i64 {
+pub unsafe extern "C-unwind" fn FINISH() -> i64 {
     let _ = std::io::stdout().flush();
     std::process::exit(0);
 }
@@ -125,8 +125,26 @@ pub unsafe extern "C" fn FINISH() -> i64 {
 /// writes this address into every entry whose `defining_class`
 /// is `None`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn __newbcpl_default_method() -> i64 {
+pub unsafe extern "C-unwind" fn __newbcpl_default_method() -> i64 {
     0
+}
+
+/// Test fixture: raise a Rust `panic!` from inside a JIT-callable
+/// helper. Used to verify the Windows SEH unwind pipeline is wired
+/// correctly — every JIT'd function carries `uwtable=2`, the custom
+/// MCJIT memory manager registers `.pdata` with `RtlAddFunctionTable`,
+/// and runtime helpers are declared `extern "C-unwind"`. With all
+/// three in place, a panic here propagates back through any depth of
+/// JIT frames to the host's `catch_unwind` boundary; without them
+/// the OS sees an unregistered unwind and fast-fails the process with
+/// STATUS_STACK_BUFFER_OVERRUN (0xC0000409).
+///
+/// Exposed unconditionally (not `#[cfg(test)]`) so the JIT-end
+/// integration probes in `tests/newbcpl-tests` can call it as a
+/// plain BCPL builtin; the runtime adds no overhead when nothing
+/// invokes it.
+pub unsafe extern "C-unwind" fn __newbcpl_test_panic() -> i64 {
+    panic!("__newbcpl_test_panic: deliberate panic from runtime helper");
 }
 
 /// `GC()` — request a full collection right now. Useful for
@@ -134,7 +152,7 @@ pub unsafe extern "C" fn __newbcpl_default_method() -> i64 {
 /// collection on a heap-pressure threshold so most programs
 /// never need to call this. Returns 0 by BCPL convention.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn GC() -> i64 {
+pub unsafe extern "C-unwind" fn GC() -> i64 {
     crate::gc::collect();
     0
 }
@@ -149,7 +167,7 @@ pub unsafe extern "C" fn GC() -> i64 {
 /// the current threshold the allocator will trigger at. Nothing
 /// here changes program state.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn HEAP_INFO() -> i64 {
+pub unsafe extern "C-unwind" fn HEAP_INFO() -> i64 {
     use std::sync::atomic::Ordering;
     let c = &crate::gc::HEAP_COUNTERS;
     let alloc_blocks = c.alloc_blocks_lifetime.load(Ordering::Acquire);
@@ -284,32 +302,32 @@ fn writef_impl(format: *const u8, args: &[i64]) {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn WRITEF(fmt: *const u8) -> i64 {
+pub unsafe extern "C-unwind" fn WRITEF(fmt: *const u8) -> i64 {
     writef_impl(fmt, &[]);
     0
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn WRITEF1(fmt: *const u8, a1: i64) -> i64 {
+pub unsafe extern "C-unwind" fn WRITEF1(fmt: *const u8, a1: i64) -> i64 {
     writef_impl(fmt, &[a1]);
     0
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn WRITEF2(fmt: *const u8, a1: i64, a2: i64) -> i64 {
+pub unsafe extern "C-unwind" fn WRITEF2(fmt: *const u8, a1: i64, a2: i64) -> i64 {
     writef_impl(fmt, &[a1, a2]);
     0
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn WRITEF3(fmt: *const u8, a1: i64, a2: i64, a3: i64) -> i64 {
+pub unsafe extern "C-unwind" fn WRITEF3(fmt: *const u8, a1: i64, a2: i64, a3: i64) -> i64 {
     writef_impl(fmt, &[a1, a2, a3]);
     0
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn WRITEF4(fmt: *const u8, a1: i64, a2: i64, a3: i64, a4: i64) -> i64 {
+pub unsafe extern "C-unwind" fn WRITEF4(fmt: *const u8, a1: i64, a2: i64, a3: i64, a4: i64) -> i64 {
     writef_impl(fmt, &[a1, a2, a3, a4]);
     0
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn WRITEF5(
+pub unsafe extern "C-unwind" fn WRITEF5(
     fmt: *const u8,
     a1: i64,
     a2: i64,
@@ -321,7 +339,7 @@ pub unsafe extern "C" fn WRITEF5(
     0
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn WRITEF6(
+pub unsafe extern "C-unwind" fn WRITEF6(
     fmt: *const u8,
     a1: i64,
     a2: i64,
@@ -334,7 +352,7 @@ pub unsafe extern "C" fn WRITEF6(
     0
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn WRITEF7(
+pub unsafe extern "C-unwind" fn WRITEF7(
     fmt: *const u8,
     a1: i64,
     a2: i64,
@@ -351,36 +369,36 @@ pub unsafe extern "C" fn WRITEF7(
 // ─── float math (libm-equivalent) ─────────────────────────────────
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn FSIN(x: f64) -> f64 {
+pub unsafe extern "C-unwind" fn FSIN(x: f64) -> f64 {
     x.sin()
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn FCOS(x: f64) -> f64 {
+pub unsafe extern "C-unwind" fn FCOS(x: f64) -> f64 {
     x.cos()
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn FTAN(x: f64) -> f64 {
+pub unsafe extern "C-unwind" fn FTAN(x: f64) -> f64 {
     x.tan()
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn FABS(x: f64) -> f64 {
+pub unsafe extern "C-unwind" fn FABS(x: f64) -> f64 {
     x.abs()
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn FLOG(x: f64) -> f64 {
+pub unsafe extern "C-unwind" fn FLOG(x: f64) -> f64 {
     x.ln()
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn FEXP(x: f64) -> f64 {
+pub unsafe extern "C-unwind" fn FEXP(x: f64) -> f64 {
     x.exp()
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn FIX(x: f64) -> i64 {
+pub unsafe extern "C-unwind" fn FIX(x: f64) -> i64 {
     x.trunc() as i64
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn FSQRT(x: f64) -> f64 {
+pub unsafe extern "C-unwind" fn FSQRT(x: f64) -> f64 {
     x.sqrt()
 }
 
@@ -388,7 +406,7 @@ pub unsafe extern "C" fn FSQRT(x: f64) -> f64 {
 /// `FLOAT` is a built-in coercion (`(double)n`); BCPL programs use
 /// it whenever a float result is wanted from integer arithmetic.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn FLOAT(n: i64) -> f64 {
+pub unsafe extern "C-unwind" fn FLOAT(n: i64) -> f64 {
     n as f64
 }
 
@@ -413,7 +431,7 @@ fn next_u64() -> u64 {
 /// `RAND(max)` — uniform integer in `[0, max]` (inclusive both ends),
 /// matching the reference. `max <= 0` yields 0.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn RAND(max_val: i64) -> i64 {
+pub unsafe extern "C-unwind" fn RAND(max_val: i64) -> i64 {
     if max_val <= 0 {
         return 0;
     }
@@ -423,7 +441,7 @@ pub unsafe extern "C" fn RAND(max_val: i64) -> i64 {
 
 /// `FRND()` — uniform double in `[0, 1)`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn FRND() -> f64 {
+pub unsafe extern "C-unwind" fn FRND() -> f64 {
     // Build a [0, 1) double from the top 53 bits.
     let bits = next_u64() >> 11;
     bits as f64 / (1u64 << 53) as f64
@@ -432,7 +450,7 @@ pub unsafe extern "C" fn FRND() -> f64 {
 /// `RND(max)` — uniform double in `[0, max)` (per the reference's
 /// loose contract).
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn RND(max_val: i64) -> f64 {
+pub unsafe extern "C-unwind" fn RND(max_val: i64) -> f64 {
     if max_val <= 0 {
         return 0.0;
     }
@@ -512,7 +530,7 @@ fn leak_atom(type_tag: i32, value: i64) -> *mut ListAtom {
 /// Create a fresh empty list. JIT-emitted `LIST(...)` construction
 /// calls this once, then issues an `APND_*` per initialiser.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn __newbcpl_list_new_empty() -> *mut ListHeader {
+pub unsafe extern "C-unwind" fn __newbcpl_list_new_empty() -> *mut ListHeader {
     leak_list_header()
 }
 
@@ -537,7 +555,7 @@ fn append_atom(hdr: *mut ListHeader, atom: *mut ListAtom) {
 /// entry point handles boolean / character / packed-word values
 /// since BCPL treats every word identically at the ABI.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn APND(hdr: *mut ListHeader, value: i64) -> i64 {
+pub unsafe extern "C-unwind" fn APND(hdr: *mut ListHeader, value: i64) -> i64 {
     append_atom(hdr, leak_atom(ATOM_INT, value));
     0
 }
@@ -547,25 +565,25 @@ pub unsafe extern "C" fn APND(hdr: *mut ListHeader, value: i64) -> i64 {
 /// comes in as `f64`; we reinterpret-store its bits in the atom's
 /// `i64` value slot.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn APND_FLOAT(hdr: *mut ListHeader, value: f64) -> i64 {
+pub unsafe extern "C-unwind" fn APND_FLOAT(hdr: *mut ListHeader, value: f64) -> i64 {
     append_atom(hdr, leak_atom(ATOM_FLOAT, value.to_bits() as i64));
     0
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn APND_STRING(hdr: *mut ListHeader, ptr: *const u8) -> i64 {
+pub unsafe extern "C-unwind" fn APND_STRING(hdr: *mut ListHeader, ptr: *const u8) -> i64 {
     append_atom(hdr, leak_atom(ATOM_STRING, ptr as i64));
     0
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn APND_OBJECT(hdr: *mut ListHeader, ptr: *const u8) -> i64 {
+pub unsafe extern "C-unwind" fn APND_OBJECT(hdr: *mut ListHeader, ptr: *const u8) -> i64 {
     append_atom(hdr, leak_atom(ATOM_OBJECT, ptr as i64));
     0
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn APND_PAIR(hdr: *mut ListHeader, packed: i64) -> i64 {
+pub unsafe extern "C-unwind" fn APND_PAIR(hdr: *mut ListHeader, packed: i64) -> i64 {
     append_atom(hdr, leak_atom(ATOM_PAIR, packed));
     0
 }
@@ -575,7 +593,7 @@ pub unsafe extern "C" fn APND_PAIR(hdr: *mut ListHeader, packed: i64) -> i64 {
 /// `BCPL_CONCAT_LISTS` is destructive (rewires `a.tail.next`);
 /// we copy for safety since neither header is GC-tracked yet.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn CONCAT(a: *mut ListHeader, b: *mut ListHeader) -> *mut ListHeader {
+pub unsafe extern "C-unwind" fn CONCAT(a: *mut ListHeader, b: *mut ListHeader) -> *mut ListHeader {
     let result = leak_list_header();
     for src in [a, b] {
         if src.is_null() {
@@ -629,27 +647,27 @@ fn alloc_vec_words(n_words: i64) -> *mut i64 {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn GETVEC(n_words: i64) -> *mut i64 {
+pub unsafe extern "C-unwind" fn GETVEC(n_words: i64) -> *mut i64 {
     alloc_vec_words(n_words)
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn FGETVEC(n_words: i64) -> *mut i64 {
+pub unsafe extern "C-unwind" fn FGETVEC(n_words: i64) -> *mut i64 {
     alloc_vec_words(n_words)
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn PAIRS(n_pairs: i64) -> *mut i64 {
+pub unsafe extern "C-unwind" fn PAIRS(n_pairs: i64) -> *mut i64 {
     alloc_vec_words(n_pairs)
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn FPAIRS(n_pairs: i64) -> *mut i64 {
+pub unsafe extern "C-unwind" fn FPAIRS(n_pairs: i64) -> *mut i64 {
     alloc_vec_words(n_pairs)
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn FREEVEC(_p: *mut i64) -> i64 {
+pub unsafe extern "C-unwind" fn FREEVEC(_p: *mut i64) -> i64 {
     // Leak — proper free needs the GC's metadata. Tests don't
     // assert on memory pressure yet, so this is fine for now.
     0
@@ -661,7 +679,7 @@ pub unsafe extern "C" fn FREEVEC(_p: *mut i64) -> i64 {
 /// length lives at a different offset inside a `ListHeader`.
 /// Returns 0 for null.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn __newbcpl_len(p: *const i64) -> i64 {
+pub unsafe extern "C-unwind" fn __newbcpl_len(p: *const i64) -> i64 {
     if p.is_null() {
         return 0;
     }
@@ -672,7 +690,7 @@ pub unsafe extern "C" fn __newbcpl_len(p: *const i64) -> i64 {
 /// O(1) (the length is maintained on every append). Returns 0 for
 /// null.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn __newbcpl_list_len(hdr: *const ListHeader) -> i64 {
+pub unsafe extern "C-unwind" fn __newbcpl_list_len(hdr: *const ListHeader) -> i64 {
     if hdr.is_null() {
         return 0;
     }
@@ -680,12 +698,12 @@ pub unsafe extern "C" fn __newbcpl_list_len(hdr: *const ListHeader) -> i64 {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn __newbcpl_freevec(_p: *mut i64) -> i64 {
+pub unsafe extern "C-unwind" fn __newbcpl_freevec(_p: *mut i64) -> i64 {
     0
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn __newbcpl_freelist(_p: *mut i64) -> i64 {
+pub unsafe extern "C-unwind" fn __newbcpl_freelist(_p: *mut i64) -> i64 {
     0
 }
 
@@ -761,7 +779,7 @@ fn intern_typedesc_for_size(size: usize) -> *const crate::gc::TypeDesc {
 /// The JIT'd `NEW Class` site passes
 /// `layout.instance_size` from sema.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn __newbcpl_alloc_rec(size: i64) -> *mut u8 {
+pub unsafe extern "C-unwind" fn __newbcpl_alloc_rec(size: i64) -> *mut u8 {
     let size = size.max(0) as usize;
     let td = intern_typedesc_for_size(size);
     unsafe { crate::gc::__newbcpl_new_rec(td) }
@@ -773,7 +791,7 @@ pub unsafe extern "C" fn __newbcpl_alloc_rec(size: i64) -> *mut u8 {
 /// site, with the caller responsible for interpretation (`HD` of
 /// a list-of-pairs is an i64-packed PAIR, etc.).
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn __newbcpl_list_hd(hdr: *const ListHeader) -> i64 {
+pub unsafe extern "C-unwind" fn __newbcpl_list_hd(hdr: *const ListHeader) -> i64 {
     if hdr.is_null() {
         return 0;
     }
@@ -794,7 +812,7 @@ pub unsafe extern "C" fn __newbcpl_list_hd(hdr: *const ListHeader) -> i64 {
 /// the sharing is still safe because we mark via the head
 /// pointer's reachability.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn __newbcpl_list_tl(hdr: *mut ListHeader) -> *mut ListHeader {
+pub unsafe extern "C-unwind" fn __newbcpl_list_tl(hdr: *mut ListHeader) -> *mut ListHeader {
     if hdr.is_null() {
         return std::ptr::null_mut();
     }
@@ -821,7 +839,7 @@ pub unsafe extern "C" fn __newbcpl_list_tl(hdr: *mut ListHeader) -> *mut ListHea
 /// strategy as `TL`. `n <= 0` returns the original; null in →
 /// null out.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn __newbcpl_list_rest(hdr: *mut ListHeader, n: i64) -> *mut ListHeader {
+pub unsafe extern "C-unwind" fn __newbcpl_list_rest(hdr: *mut ListHeader, n: i64) -> *mut ListHeader {
     if hdr.is_null() {
         return std::ptr::null_mut();
     }
@@ -850,17 +868,17 @@ pub unsafe extern "C" fn __newbcpl_list_rest(hdr: *mut ListHeader, n: i64) -> *m
 // expose the same addresses under those names.
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn HD(hdr: *const ListHeader) -> i64 {
+pub unsafe extern "C-unwind" fn HD(hdr: *const ListHeader) -> i64 {
     unsafe { __newbcpl_list_hd(hdr) }
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn TL(hdr: *mut ListHeader) -> *mut ListHeader {
+pub unsafe extern "C-unwind" fn TL(hdr: *mut ListHeader) -> *mut ListHeader {
     unsafe { __newbcpl_list_tl(hdr) }
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn TAIL(hdr: *mut ListHeader) -> *mut ListHeader {
+pub unsafe extern "C-unwind" fn TAIL(hdr: *mut ListHeader) -> *mut ListHeader {
     unsafe { __newbcpl_list_tl(hdr) }
 }
 
@@ -868,7 +886,7 @@ pub unsafe extern "C" fn TAIL(hdr: *mut ListHeader) -> *mut ListHeader {
 /// list runtime; for now return a null pointer so callers see an
 /// empty list and can at least proceed.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn SPLIT(_s: *const u8, _delim: *const u8) -> *mut i64 {
+pub unsafe extern "C-unwind" fn SPLIT(_s: *const u8, _delim: *const u8) -> *mut i64 {
     std::ptr::null_mut()
 }
 
@@ -994,6 +1012,7 @@ pub fn builtin_addresses() -> &'static [Builtin] {
             builtin!(GC),
             builtin!(HEAP_INFO),
             builtin!(__newbcpl_default_method),
+            builtin!(__newbcpl_test_panic),
         ];
         #[cfg(windows)]
         {

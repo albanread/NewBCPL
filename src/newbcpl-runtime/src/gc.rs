@@ -86,7 +86,7 @@ impl BlockHeader {
     }
 }
 
-pub type Finalizer = unsafe extern "C" fn(*mut u8);
+pub type Finalizer = unsafe extern "C-unwind" fn(*mut u8);
 
 /// Runtime type descriptor emitted by `newbcpl-llvm` for every heap-
 /// allocated record type.  Layout-frozen.
@@ -716,7 +716,7 @@ fn register_thread_inner(stack_top: usize, _explicit: bool) -> Arc<Mutator> {
 /// only the first call has effect.  Called once from runtime startup
 /// on the bootstrap thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn __newbcpl_init_gc(base_stack: *const u8) {
+pub unsafe extern "C-unwind" fn __newbcpl_init_gc(base_stack: *const u8) {
     let prev = BOOTSTRAP_STACK_BASE.load(Ordering::Acquire);
     if prev == 0 {
         BOOTSTRAP_STACK_BASE.store(base_stack as usize, Ordering::Release);
@@ -730,7 +730,7 @@ pub unsafe extern "C" fn __newbcpl_init_gc(base_stack: *const u8) {
 /// path if the caller didn't, using the bootstrap stack base as a
 /// fallback (suitable for single-thread cases).
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn __newbcpl_register_thread(stack_top: *const u8) {
+pub unsafe extern "C-unwind" fn __newbcpl_register_thread(stack_top: *const u8) {
     let _ = register_thread_inner(stack_top as usize, true);
 }
 
@@ -738,7 +738,7 @@ pub unsafe extern "C" fn __newbcpl_register_thread(stack_top: *const u8) {
 /// The TLS guard's `Drop` runs the same cleanup at thread exit, so
 /// explicitly calling this is optional.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn __newbcpl_unregister_thread() {
+pub unsafe extern "C-unwind" fn __newbcpl_unregister_thread() {
     let id = std::thread::current().id();
     let mut threads = MUTATORS.write().unwrap();
     threads.retain(|m| m.thread_id != id);
@@ -752,7 +752,7 @@ pub unsafe extern "C" fn __newbcpl_unregister_thread() {
 
 /// Register a module's global roots.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn __newbcpl_register_module(
+pub unsafe extern "C-unwind" fn __newbcpl_register_module(
     var_base: *const u8,
     offsets_ptr: *const isize,
     count: usize,
@@ -770,7 +770,7 @@ pub unsafe extern "C" fn __newbcpl_register_module(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn __newbcpl_register_module_named(
+pub unsafe extern "C-unwind" fn __newbcpl_register_module_named(
     name_utf8: *const u8,
     name_len: usize,
     var_base: *const u8,
@@ -800,7 +800,7 @@ pub unsafe extern "C" fn __newbcpl_register_module_named(
 /// Allocate and zero-initialise a heap-tracked record.  The single
 /// allocation entry point for managed CP code.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn __newbcpl_new_rec(tag: *const TypeDesc) -> *mut u8 {
+pub unsafe extern "C-unwind" fn __newbcpl_new_rec(tag: *const TypeDesc) -> *mut u8 {
     // Allocation is implicitly a safepoint: poll before doing the work
     // so a concurrent collector can pause us cleanly.  Without this
     // poll, a tight loop of allocations that all hit the TLAB / cluster
@@ -874,7 +874,7 @@ pub unsafe extern "C" fn __newbcpl_new_rec(tag: *const TypeDesc) -> *mut u8 {
 /// heuristic doesn't fit the workload (benchmarks, tests, "I
 /// just freed a huge thing").
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn __newbcpl_collect() -> i64 {
+pub unsafe extern "C-unwind" fn __newbcpl_collect() -> i64 {
     collect();
     0
 }
@@ -882,7 +882,7 @@ pub unsafe extern "C" fn __newbcpl_collect() -> i64 {
 /// Allocate untracked, untraced bytes (`SYSTEM.NEW`).  These live
 /// outside the cluster heap and are never reclaimed.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn __newbcpl_sys_new(n: usize) -> *mut u8 {
+pub unsafe extern "C-unwind" fn __newbcpl_sys_new(n: usize) -> *mut u8 {
     if n == 0 {
         return std::ptr::NonNull::<u8>::dangling().as_ptr();
     }
@@ -902,7 +902,7 @@ pub unsafe extern "C" fn __newbcpl_sys_new(n: usize) -> *mut u8 {
 /// `Parked`, and waits on the safepoint condvar until the collector
 /// clears the request.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn __newbcpl_safepoint() {
+pub unsafe extern "C-unwind" fn __newbcpl_safepoint() {
     if SAFEPOINT_REQUESTED.load(Ordering::Acquire) == 0 {
         return;
     }

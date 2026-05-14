@@ -8,12 +8,12 @@
 //! See `emit::emit` for the IR-to-LLVM walker.
 
 pub mod emit;
+mod jit_mm;
 
 use std::path::Path;
 
 use inkwell::OptimizationLevel;
 use inkwell::context::Context;
-use inkwell::execution_engine::JitFunction;
 use inkwell::targets::{
     CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
 };
@@ -244,26 +244,13 @@ fn run_program_ir(ir: &IrModule, modules_dir: Option<&Path>) -> Result<i64, Stri
     }
 
     // ─── JIT setup ────────────────────────────────────────────────
-    let exec_engine = module
-        .create_jit_execution_engine(OptimizationLevel::Default)
-        .map_err(|e| format!("create_jit_execution_engine: {}", e.to_string()))?;
-
-    // Register every builtin's host-process address with the JIT
-    // by symbol name. We can't rely on the dynamic linker finding
-    // them — this binary is the JIT host, so we hand the addresses
-    // over directly.
-    for builtin in newbcpl_runtime::builtins::builtin_addresses() {
-        if let Some(fv) = module.get_function(builtin.name) {
-            exec_engine.add_global_mapping(&fv, builtin.address);
-        }
-    }
-
-    // Catch unbound externs *before* execution. Any function the
+    //
+    // Catch unbound externs *before* code emission. Any function the
     // module declares without a body (linkage = external, no entry
-    // basic block) and that we did not just register a mapping for
-    // would otherwise be called at address 0 and segfault. Surface
-    // it as a clean diagnostic instead. With module linking,
-    // cross-module references now have bodies and pass the check.
+    // basic block) and that isn't a known runtime builtin would
+    // otherwise be called at address 0 and segfault. Surface it as a
+    // clean diagnostic instead. With module linking, cross-module
+    // references now have bodies and pass the check.
     let mut missing: Vec<String> = Vec::new();
     let mut fopt = module.get_first_function();
     while let Some(f) = fopt {
@@ -283,6 +270,98 @@ fn run_program_ir(ir: &IrModule, modules_dir: Option<&Path>) -> Result<i64, Stri
         return Err(format!("missing builtin: {}", missing.join(", ")));
     }
 
+    // Build the MCJIT engine through llvm-sys so we can pass a
+    // custom memory manager that captures `.pdata`/`.xdata`/`.text`
+    // and registers Windows SEH unwind tables on finalize. inkwell's
+    // `create_jit_execution_engine` doesn't expose the `MCJMM` slot
+    // on `LLVMMCJITCompilerOptions`, so we drop one layer down and
+    // hold a raw `LLVMExecutionEngineRef`.
+    //
+    // Trade-off: we lose the `inkwell::ExecutionEngine` wrapper and
+    // do builtin binding / function-pointer lookup via the LLVM C
+    // API directly (`LLVMAddGlobalMapping`, `LLVMGetFunctionAddress`,
+    // `LLVMGetPointerToGlobal`). Same operations, lower-level surface.
+    //
+    // Without this manager, JIT'd code carries unwind tables LLVM
+    // emitted (uwtable=2 on every function in emit.rs) but the OS
+    // unwinder can't see them — a panic from a runtime helper
+    // escapes through MSVC SEH 0xE06D7363 and aborts the process.
+    use inkwell::llvm_sys::execution_engine::{
+        LLVMAddGlobalMapping, LLVMCreateMCJITCompilerForModule,
+        LLVMExecutionEngineRef, LLVMGetFunctionAddress, LLVMGetGlobalValueAddress,
+        LLVMGetPointerToGlobal, LLVMInitializeMCJITCompilerOptions,
+        LLVMLinkInMCJIT, LLVMMCJITCompilerOptions,
+    };
+    use inkwell::values::AsValueRef;
+    use std::ffi::CString;
+
+    // First-time MCJIT setup. Calling these more than once is a
+    // documented no-op. inkwell's `create_jit_execution_engine` does
+    // these internally; doing it ourselves means we have to do these.
+    use std::sync::Once;
+    static MCJIT_INIT: Once = Once::new();
+    MCJIT_INIT.call_once(|| {
+        unsafe {
+            LLVMLinkInMCJIT();
+        }
+        Target::initialize_native(&InitializationConfig::default())
+            .expect("Target::initialize_native");
+    });
+
+    let mut opts: LLVMMCJITCompilerOptions = unsafe { std::mem::zeroed() };
+    unsafe {
+        LLVMInitializeMCJITCompilerOptions(
+            &mut opts,
+            std::mem::size_of::<LLVMMCJITCompilerOptions>(),
+        );
+    }
+    opts.OptLevel = OptimizationLevel::Default as u32;
+    opts.MCJMM = unsafe { jit_mm::make_mm() };
+
+    let mut engine: LLVMExecutionEngineRef = std::ptr::null_mut();
+    let mut err_msg: *mut std::ffi::c_char = std::ptr::null_mut();
+    // `LLVMCreateMCJITCompilerForModule` consumes the module; we
+    // can't keep using the inkwell `Module` after this. inkwell's
+    // wrapper is non-owning so dropping it is fine — the engine
+    // owns the underlying module from here on.
+    let rc = unsafe {
+        LLVMCreateMCJITCompilerForModule(
+            &mut engine,
+            module.as_mut_ptr(),
+            &mut opts,
+            std::mem::size_of::<LLVMMCJITCompilerOptions>(),
+            &mut err_msg,
+        )
+    };
+    if rc != 0 || engine.is_null() {
+        let msg = if err_msg.is_null() {
+            "LLVMCreateMCJITCompilerForModule failed with no message".to_string()
+        } else {
+            let s = unsafe { std::ffi::CStr::from_ptr(err_msg) }
+                .to_string_lossy()
+                .into_owned();
+            unsafe { inkwell::llvm_sys::core::LLVMDisposeMessage(err_msg) };
+            s
+        };
+        return Err(format!("LLVMCreateMCJITCompilerForModule: {msg}"));
+    }
+
+    // Register every builtin's host-process address with the JIT by
+    // symbol name. We can't rely on the dynamic linker finding them —
+    // this binary is the JIT host, so we hand the addresses over
+    // directly via `LLVMAddGlobalMapping`.
+    for builtin in newbcpl_runtime::builtins::builtin_addresses() {
+        if let Some(fv) = module.get_function(builtin.name) {
+            unsafe {
+                LLVMAddGlobalMapping(
+                    engine,
+                    fv.as_value_ref(),
+                    builtin.address as *mut std::ffi::c_void,
+                );
+            }
+        }
+    }
+
     // ─── vtable patch loop (NewCP-style for MCJIT) ──────────────
     //
     // For each class layout, look up the @Class.vtable global's
@@ -296,11 +375,6 @@ fn run_program_ir(ir: &IrModule, modules_dir: Option<&Path>) -> Result<i64, Stri
     // `LLVMGetPointerToGlobal` resolves a method's compiled address
     // (more reliable than name-based `get_function_address` for
     // non-exported / mangled methods, per NewCP's findings).
-    use inkwell::llvm_sys::execution_engine::{
-        LLVMGetGlobalValueAddress, LLVMGetPointerToGlobal,
-    };
-    use inkwell::values::AsValueRef;
-    use std::ffi::CString;
     for layout in &all_layouts {
         if layout.vtable.is_empty() {
             continue;
@@ -310,10 +384,7 @@ fn run_program_ir(ir: &IrModule, modules_dir: Option<&Path>) -> Result<i64, Stri
             Err(_) => continue,
         };
         let vt_addr = unsafe {
-            LLVMGetGlobalValueAddress(
-                exec_engine.as_mut_ptr(),
-                vt_name.as_ptr(),
-            )
+            LLVMGetGlobalValueAddress(engine, vt_name.as_ptr())
         };
         if vt_addr == 0 {
             // Vtable global was DCE'd by an LLVM pass. Skip — any
@@ -347,10 +418,7 @@ fn run_program_ir(ir: &IrModule, modules_dir: Option<&Path>) -> Result<i64, Stri
                     match module.get_function(&method_symbol) {
                         Some(fv) => {
                             let a = unsafe {
-                                LLVMGetPointerToGlobal(
-                                    exec_engine.as_mut_ptr(),
-                                    fv.as_value_ref(),
-                                )
+                                LLVMGetPointerToGlobal(engine, fv.as_value_ref())
                             } as usize;
                             if a == 0 {
                                 default_method_addr
@@ -371,19 +439,40 @@ fn run_program_ir(ir: &IrModule, modules_dir: Option<&Path>) -> Result<i64, Stri
 
     // Locate START. Every BCPL program declares one; if it isn't
     // there, the program is malformed for execution purposes.
-    let start_fn = module
+    let _start_fn = module
         .get_function("START")
         .ok_or_else(|| "no START function declared".to_string())?;
 
-    // Safety: the function takes no args and returns i64 by our
-    // BCPL-routine ABI convention.
-    let start: JitFunction<unsafe extern "C" fn() -> i64> = unsafe {
-        exec_engine
-            .get_function("START")
-            .map_err(|e| format!("get_function START: {}", e.to_string()))?
-    };
-    let _ = start_fn; // suppress unused; we used .get_function for the name lookup
-    let result = unsafe { start.call() };
+    // Resolve START's compiled address via `LLVMGetFunctionAddress`
+    // — this is what actually triggers code emission and finalize on
+    // the engine, which in turn fires the custom memory manager's
+    // `finalize_memory` callback and therefore the SEH registration.
+    // Without calling this, the JIT'd code would never become
+    // executable.
+    let start_cname = CString::new("START").expect("no NUL in START");
+    let start_addr = unsafe { LLVMGetFunctionAddress(engine, start_cname.as_ptr()) };
+    if start_addr == 0 {
+        return Err("LLVMGetFunctionAddress(START) returned 0".to_string());
+    }
+
+    // Leak the engine. Drop would call LLVMDisposeExecutionEngine
+    // which tears down our memory manager and leaves stale SEH
+    // function tables registered with the OS unwinder. The host
+    // process keeps JIT'd code forever, so leaking is the right
+    // contract; module-retirement support would pair this with
+    // RtlDeleteFunctionTable, but we don't have retirement yet.
+    let engine_box = Box::new(engine);
+    let _ = Box::leak(engine_box);
+
+    // Safety: START takes no args and returns i64 by the BCPL-routine
+    // ABI convention. Marked `extern "C-unwind"` so a Rust panic
+    // raised in a runtime helper inside this call propagates through
+    // the JIT frame back to the host's `catch_unwind` boundary (the
+    // unwind info LLVM emitted via `uwtable=2` is registered with the
+    // OS by our custom memory manager's `finalize_memory`).
+    type StartFn = unsafe extern "C-unwind" fn() -> i64;
+    let start: StartFn = unsafe { std::mem::transmute(start_addr as *const ()) };
+    let result = unsafe { start() };
 
     Ok(result)
 }

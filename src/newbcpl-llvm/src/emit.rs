@@ -258,6 +258,23 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
             None => self.context.void_type().fn_type(&param_types, false),
         };
         let fv = self.module.add_function(&f.name, fn_type, None);
+        // Stamp `uwtable=2` so LLVM emits Windows-style `.pdata` /
+        // `.xdata` for this function. The custom JIT memory manager
+        // captures those sections and registers them with the OS via
+        // `RtlAddFunctionTable`, which lets a Rust panic raised in a
+        // runtime helper unwind cleanly back through the JIT frame to
+        // a `catch_unwind` boundary in the host. Without uwtable the
+        // panic escapes as MSVC SEH 0xE06D7363 and aborts the
+        // process. uwtable=2 (async) is the safe setting; =1 lets
+        // LLVM elide unwind info for leaf-ish sequences in some
+        // versions, which silently breaks the unwinder.
+        let uwtable_kind =
+            inkwell::attributes::Attribute::get_named_enum_kind_id("uwtable");
+        let uwtable_attr = self.context.create_enum_attribute(uwtable_kind, 2);
+        fv.add_attribute(
+            inkwell::attributes::AttributeLoc::Function,
+            uwtable_attr,
+        );
         self.by_name.insert(f.name.clone(), fv);
         fv
     }

@@ -55,7 +55,7 @@ pub static FRAME_HWND: OnceLock<isize> = OnceLock::new();
 /// | EvMenu       | 0                | 0         | menu_id   | item_id     | 0           | 0               |
 #[unsafe(export_name = "iGui.NextEvent")]
 #[allow(clippy::too_many_arguments)]
-pub extern "C" fn igui_next_event(
+pub extern "C-unwind" fn igui_next_event(
     out_kind: *mut i64,
     out_child: *mut i64,
     out_time: *mut i64,
@@ -75,7 +75,7 @@ pub extern "C" fn igui_next_event(
 /// `iGui.Quit`. Posts WM_CLOSE to the frame; the GUI thread tears down
 /// in its own time.
 #[unsafe(export_name = "iGui.Quit")]
-pub extern "C" fn igui_quit() {
+pub extern "C-unwind" fn igui_quit() {
     if let Some(&hwnd_raw) = FRAME_HWND.get() {
         let hwnd = HWND(hwnd_raw as *mut _);
         let _ = unsafe { PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) };
@@ -89,7 +89,7 @@ pub extern "C" fn igui_quit() {
 /// SHORTCHAR NUL terminator ourselves; ignoring it would shift all
 /// later arguments by one register/stack slot.
 #[unsafe(export_name = "iGui.OpenChild")]
-pub extern "C" fn igui_open_child(
+pub extern "C-unwind" fn igui_open_child(
     title: *const u8,
     _title_len: i64,
     out_child: *mut i64,
@@ -110,7 +110,7 @@ pub extern "C" fn igui_open_child(
 /// `iGui.CloseChild(childId: INTEGER): INTSHORT`. Returns 1 on success,
 /// 0 if the child id is unknown.
 #[unsafe(export_name = "iGui.CloseChild")]
-pub extern "C" fn igui_close_child(child_id: i64) -> i32 {
+pub extern "C-unwind" fn igui_close_child(child_id: i64) -> i32 {
     if super::window::close_child(child_id) {
         1
     } else {
@@ -120,7 +120,7 @@ pub extern "C" fn igui_close_child(child_id: i64) -> i32 {
 
 /// `iGui.SetTitle(childId: INTEGER; title: ARRAY OF SHORTCHAR)`.
 #[unsafe(export_name = "iGui.SetTitle")]
-pub extern "C" fn igui_set_title(child_id: i64, title: *const u8, _title_len: i64) {
+pub extern "C-unwind" fn igui_set_title(child_id: i64, title: *const u8, _title_len: i64) {
     if title.is_null() {
         return;
     }
@@ -131,12 +131,12 @@ pub extern "C" fn igui_set_title(child_id: i64, title: *const u8, _title_len: i6
 // ─── Phase 3b: batch builder + first geometry primitives ─────────────
 
 #[unsafe(export_name = "iGui.BeginBatch")]
-pub extern "C" fn igui_begin_batch(child_id: i64) {
+pub extern "C-unwind" fn igui_begin_batch(child_id: i64) {
     batch_mod::begin(child_id);
 }
 
 #[unsafe(export_name = "iGui.SubmitBatch")]
-pub extern "C" fn igui_submit_batch() -> i32 {
+pub extern "C-unwind" fn igui_submit_batch() -> i32 {
     let Some(batch) = batch_mod::finish() else {
         return 0;
     };
@@ -148,7 +148,7 @@ pub extern "C" fn igui_submit_batch() -> i32 {
 }
 
 #[unsafe(export_name = "iGui.EmitClear")]
-pub extern "C" fn igui_emit_clear(r: f64, g: f64, b: f64, a: f64) {
+pub extern "C-unwind" fn igui_emit_clear(r: f64, g: f64, b: f64, a: f64) {
     eprintln!(
         "[igui-export] EmitClear rgba=({:.3}, {:.3}, {:.3}, {:.3})",
         r, g, b, a
@@ -164,13 +164,13 @@ pub extern "C" fn igui_emit_clear(r: f64, g: f64, b: f64, a: f64) {
 }
 
 #[unsafe(export_name = "iGui.EmitPresentHint")]
-pub extern "C" fn igui_emit_present_hint() {
+pub extern "C-unwind" fn igui_emit_present_hint() {
     batch_mod::push(SurfaceCmd::PresentHint);
 }
 
 #[unsafe(export_name = "iGui.EmitFillRect")]
 #[allow(clippy::too_many_arguments)]
-pub extern "C" fn igui_emit_fill_rect(
+pub extern "C-unwind" fn igui_emit_fill_rect(
     x0: f64,
     y0: f64,
     x1: f64,
@@ -204,7 +204,7 @@ pub extern "C" fn igui_emit_fill_rect(
 
 #[unsafe(export_name = "iGui.EmitStrokeRect")]
 #[allow(clippy::too_many_arguments)]
-pub extern "C" fn igui_emit_stroke_rect(
+pub extern "C-unwind" fn igui_emit_stroke_rect(
     x0: f64,
     y0: f64,
     x1: f64,
@@ -240,7 +240,7 @@ pub extern "C" fn igui_emit_stroke_rect(
 
 #[unsafe(export_name = "iGui.EmitDrawLine")]
 #[allow(clippy::too_many_arguments)]
-pub extern "C" fn igui_emit_draw_line(
+pub extern "C-unwind" fn igui_emit_draw_line(
     x0: f64,
     y0: f64,
     x1: f64,
@@ -278,7 +278,7 @@ pub extern "C" fn igui_emit_draw_line(
 
 #[unsafe(export_name = "iGui.EmitFillOval")]
 #[allow(clippy::too_many_arguments)]
-pub extern "C" fn igui_emit_fill_oval(
+pub extern "C-unwind" fn igui_emit_fill_oval(
     x0: f64, y0: f64, x1: f64, y1: f64,
     r: f64, g: f64, b: f64, a: f64,
 ) {
@@ -294,7 +294,7 @@ pub extern "C" fn igui_emit_fill_oval(
 
 #[unsafe(export_name = "iGui.EmitFillCircle")]
 #[allow(clippy::too_many_arguments)]
-pub extern "C" fn igui_emit_fill_circle(
+pub extern "C-unwind" fn igui_emit_fill_circle(
     cx: f64, cy: f64, radius: f64,
     r: f64, g: f64, b: f64, a: f64,
 ) {
@@ -309,7 +309,7 @@ pub extern "C" fn igui_emit_fill_circle(
 
 #[unsafe(export_name = "iGui.EmitStrokeOval")]
 #[allow(clippy::too_many_arguments)]
-pub extern "C" fn igui_emit_stroke_oval(
+pub extern "C-unwind" fn igui_emit_stroke_oval(
     x0: f64, y0: f64, x1: f64, y1: f64,
     half_thickness: f64,
     r: f64, g: f64, b: f64, a: f64,
@@ -327,7 +327,7 @@ pub extern "C" fn igui_emit_stroke_oval(
 
 #[unsafe(export_name = "iGui.EmitStrokeCircle")]
 #[allow(clippy::too_many_arguments)]
-pub extern "C" fn igui_emit_stroke_circle(
+pub extern "C-unwind" fn igui_emit_stroke_circle(
     cx: f64, cy: f64, radius: f64,
     half_thickness: f64,
     r: f64, g: f64, b: f64, a: f64,
@@ -344,7 +344,7 @@ pub extern "C" fn igui_emit_stroke_circle(
 
 #[unsafe(export_name = "iGui.EmitDrawArc")]
 #[allow(clippy::too_many_arguments)]
-pub extern "C" fn igui_emit_draw_arc(
+pub extern "C-unwind" fn igui_emit_draw_arc(
     cx: f64, cy: f64, radius: f64,
     rotation_rad: f64, half_aperture_rad: f64,
     half_thickness: f64,
@@ -369,7 +369,7 @@ pub extern "C" fn igui_emit_draw_arc(
 /// the log-view demo to confirm the cache is doing useful work.
 /// Returns 1 always.
 #[unsafe(export_name = "iGui.LayoutCacheStats")]
-pub extern "C" fn igui_layout_cache_stats(
+pub extern "C-unwind" fn igui_layout_cache_stats(
     out_hits: *mut i64,
     out_misses: *mut i64,
     out_size: *mut i64,
@@ -394,7 +394,7 @@ pub extern "C" fn igui_layout_cache_stats(
 ///
 /// Returns 1 on success, 0 if `childId` is unknown.
 #[unsafe(export_name = "iGui.SetRedrawRate")]
-pub extern "C" fn igui_set_redraw_rate(child_id: i64, interval_ms: i64) -> i32 {
+pub extern "C-unwind" fn igui_set_redraw_rate(child_id: i64, interval_ms: i64) -> i32 {
     if super::window::set_redraw_rate(child_id, interval_ms) {
         1
     } else {
@@ -407,7 +407,7 @@ pub extern "C" fn igui_set_redraw_rate(child_id: i64, interval_ms: i64) -> i32 {
 /// `iGui.SetMenu(spec: ARRAY OF SHORTCHAR): INTSHORT`. See
 /// [`super::menu`] for the spec format.
 #[unsafe(export_name = "iGui.SetMenu")]
-pub extern "C" fn igui_set_menu(spec: *const u8, _spec_len: i64) -> i32 {
+pub extern "C-unwind" fn igui_set_menu(spec: *const u8, _spec_len: i64) -> i32 {
     let spec_str = unsafe { read_cp_shortstr(spec) };
     if super::window::set_menu(&spec_str) {
         1
@@ -423,7 +423,7 @@ pub extern "C" fn igui_set_menu(spec: *const u8, _spec_len: i64) -> i32 {
 /// directly. Returns 1 on success, 0 if DirectWrite refused the
 /// typeface (caller should retry with a fallback family).
 #[unsafe(export_name = "iGui.MeasureFont")]
-pub extern "C" fn igui_measure_font(
+pub extern "C-unwind" fn igui_measure_font(
     family: *const u8,
     _family_len: i64,
     size: f64,
@@ -466,7 +466,7 @@ pub extern "C" fn igui_measure_font(
 /// `iGui.MeasureString(s, family, size, weight, italic; OUT width):
 ///                    INTSHORT`. Width is in DIPs.
 #[unsafe(export_name = "iGui.MeasureString")]
-pub extern "C" fn igui_measure_string(
+pub extern "C-unwind" fn igui_measure_string(
     text: *const u8,
     _text_len: i64,
     family: *const u8,
@@ -504,40 +504,40 @@ pub extern "C" fn igui_measure_string(
 /// entries. The log view (Tools > Log / Ctrl+Shift+L) repaints
 /// automatically when it's open. Safe to call from any thread.
 #[unsafe(export_name = "iGui.LogAppend")]
-pub extern "C" fn igui_log_append(s: *const u8, _s_len: i64) {
+pub extern "C-unwind" fn igui_log_append(s: *const u8, _s_len: i64) {
     let line = unsafe { read_cp_shortstr(s) };
     super::log_view::append(&line);
 }
 
 #[unsafe(export_name = "iGui.MdiCascade")]
-pub extern "C" fn igui_mdi_cascade() {
+pub extern "C-unwind" fn igui_mdi_cascade() {
     super::window::dispatch_mdi_verb(super::menu::MdiVerb::Cascade);
 }
 
 #[unsafe(export_name = "iGui.MdiTileH")]
-pub extern "C" fn igui_mdi_tile_h() {
+pub extern "C-unwind" fn igui_mdi_tile_h() {
     super::window::dispatch_mdi_verb(super::menu::MdiVerb::TileH);
 }
 
 #[unsafe(export_name = "iGui.MdiTileV")]
-pub extern "C" fn igui_mdi_tile_v() {
+pub extern "C-unwind" fn igui_mdi_tile_v() {
     super::window::dispatch_mdi_verb(super::menu::MdiVerb::TileV);
 }
 
 #[unsafe(export_name = "iGui.MdiCloseAll")]
-pub extern "C" fn igui_mdi_close_all() {
+pub extern "C-unwind" fn igui_mdi_close_all() {
     super::window::dispatch_mdi_verb(super::menu::MdiVerb::CloseAll);
 }
 
 #[unsafe(export_name = "iGui.MdiArrangeIcons")]
-pub extern "C" fn igui_mdi_arrange_icons() {
+pub extern "C-unwind" fn igui_mdi_arrange_icons() {
     super::window::dispatch_mdi_verb(super::menu::MdiVerb::ArrangeIcons);
 }
 
 // ─── Phase 5: composition + overlays + paths + system colors ─────
 
 #[unsafe(export_name = "iGui.EmitPushClipRect")]
-pub extern "C" fn igui_emit_push_clip_rect(x0: f64, y0: f64, x1: f64, y1: f64) {
+pub extern "C-unwind" fn igui_emit_push_clip_rect(x0: f64, y0: f64, x1: f64, y1: f64) {
     batch_mod::push(SurfaceCmd::PushClipRect {
         rect: Rect {
             x0: x0 as f32, y0: y0 as f32, x1: x1 as f32, y1: y1 as f32,
@@ -546,12 +546,12 @@ pub extern "C" fn igui_emit_push_clip_rect(x0: f64, y0: f64, x1: f64, y1: f64) {
 }
 
 #[unsafe(export_name = "iGui.EmitPopClipRect")]
-pub extern "C" fn igui_emit_pop_clip_rect() {
+pub extern "C-unwind" fn igui_emit_pop_clip_rect() {
     batch_mod::push(SurfaceCmd::PopClipRect);
 }
 
 #[unsafe(export_name = "iGui.EmitPushOffset")]
-pub extern "C" fn igui_emit_push_offset(dx: f64, dy: f64) {
+pub extern "C-unwind" fn igui_emit_push_offset(dx: f64, dy: f64) {
     batch_mod::push(SurfaceCmd::PushOffset {
         dx: dx as f32,
         dy: dy as f32,
@@ -559,12 +559,12 @@ pub extern "C" fn igui_emit_push_offset(dx: f64, dy: f64) {
 }
 
 #[unsafe(export_name = "iGui.EmitPopOffset")]
-pub extern "C" fn igui_emit_pop_offset() {
+pub extern "C-unwind" fn igui_emit_pop_offset() {
     batch_mod::push(SurfaceCmd::PopOffset);
 }
 
 #[unsafe(export_name = "iGui.EmitScrollRect")]
-pub extern "C" fn igui_emit_scroll_rect(
+pub extern "C-unwind" fn igui_emit_scroll_rect(
     x0: f64, y0: f64, x1: f64, y1: f64, dx: f64, dy: f64,
 ) {
     batch_mod::push(SurfaceCmd::ScrollRect {
@@ -577,7 +577,7 @@ pub extern "C" fn igui_emit_scroll_rect(
 }
 
 #[unsafe(export_name = "iGui.EmitSaveRect")]
-pub extern "C" fn igui_emit_save_rect(slot: i32, x0: f64, y0: f64, x1: f64, y1: f64) {
+pub extern "C-unwind" fn igui_emit_save_rect(slot: i32, x0: f64, y0: f64, x1: f64, y1: f64) {
     batch_mod::push(SurfaceCmd::SaveRect {
         slot: slot.clamp(0, 7) as u8,
         rect: Rect {
@@ -587,14 +587,14 @@ pub extern "C" fn igui_emit_save_rect(slot: i32, x0: f64, y0: f64, x1: f64, y1: 
 }
 
 #[unsafe(export_name = "iGui.EmitRestoreRect")]
-pub extern "C" fn igui_emit_restore_rect(slot: i32) {
+pub extern "C-unwind" fn igui_emit_restore_rect(slot: i32) {
     batch_mod::push(SurfaceCmd::RestoreRect {
         slot: slot.clamp(0, 7) as u8,
     });
 }
 
 #[unsafe(export_name = "iGui.EmitInstallChildViewBounds")]
-pub extern "C" fn igui_emit_install_child_view_bounds(
+pub extern "C-unwind" fn igui_emit_install_child_view_bounds(
     child_view_id: i32, x0: f64, y0: f64, x1: f64, y1: f64,
 ) {
     batch_mod::push(SurfaceCmd::InstallChildViewBounds {
@@ -606,7 +606,7 @@ pub extern "C" fn igui_emit_install_child_view_bounds(
 }
 
 #[unsafe(export_name = "iGui.EmitMarkRect")]
-pub extern "C" fn igui_emit_mark_rect(x0: f64, y0: f64, x1: f64, y1: f64, mode: i32) {
+pub extern "C-unwind" fn igui_emit_mark_rect(x0: f64, y0: f64, x1: f64, y1: f64, mode: i32) {
     use batch_mod::MarkMode;
     let mode = match mode {
         1 => MarkMode::Invert,
@@ -625,7 +625,7 @@ pub extern "C" fn igui_emit_mark_rect(x0: f64, y0: f64, x1: f64, y1: f64, mode: 
 
 #[unsafe(export_name = "iGui.EmitCaret")]
 #[allow(clippy::too_many_arguments)]
-pub extern "C" fn igui_emit_caret(
+pub extern "C-unwind" fn igui_emit_caret(
     x0: f64, y0: f64, x1: f64, y1: f64, r: f64, g: f64, b: f64, a: f64,
 ) {
     batch_mod::push(SurfaceCmd::Caret {
@@ -640,7 +640,7 @@ pub extern "C" fn igui_emit_caret(
 
 #[unsafe(export_name = "iGui.EmitSelectionRange")]
 #[allow(clippy::too_many_arguments)]
-pub extern "C" fn igui_emit_selection_range(
+pub extern "C-unwind" fn igui_emit_selection_range(
     x0: f64, y0: f64, x1: f64, y1: f64, r: f64, g: f64, b: f64, a: f64,
 ) {
     batch_mod::push(SurfaceCmd::SelectionRange {
@@ -655,7 +655,7 @@ pub extern "C" fn igui_emit_selection_range(
 
 #[unsafe(export_name = "iGui.EmitFocusRing")]
 #[allow(clippy::too_many_arguments)]
-pub extern "C" fn igui_emit_focus_ring(
+pub extern "C-unwind" fn igui_emit_focus_ring(
     x0: f64, y0: f64, x1: f64, y1: f64,
     corner_radius: f64, half_thickness: f64,
     r: f64, g: f64, b: f64, a: f64,
@@ -675,26 +675,26 @@ pub extern "C" fn igui_emit_focus_ring(
 // ─── Path builder ────────────────────────────────────────────────────
 
 #[unsafe(export_name = "iGui.PathBegin")]
-pub extern "C" fn igui_path_begin() {
+pub extern "C-unwind" fn igui_path_begin() {
     batch_mod::path_begin();
 }
 
 #[unsafe(export_name = "iGui.PathMoveTo")]
-pub extern "C" fn igui_path_move_to(x: f64, y: f64) {
+pub extern "C-unwind" fn igui_path_move_to(x: f64, y: f64) {
     batch_mod::path_push(batch_mod::PathCmd::MoveTo(batch_mod::Point {
         x: x as f32, y: y as f32,
     }));
 }
 
 #[unsafe(export_name = "iGui.PathLineTo")]
-pub extern "C" fn igui_path_line_to(x: f64, y: f64) {
+pub extern "C-unwind" fn igui_path_line_to(x: f64, y: f64) {
     batch_mod::path_push(batch_mod::PathCmd::LineTo(batch_mod::Point {
         x: x as f32, y: y as f32,
     }));
 }
 
 #[unsafe(export_name = "iGui.PathQuadTo")]
-pub extern "C" fn igui_path_quad_to(cx: f64, cy: f64, ex: f64, ey: f64) {
+pub extern "C-unwind" fn igui_path_quad_to(cx: f64, cy: f64, ex: f64, ey: f64) {
     batch_mod::path_push(batch_mod::PathCmd::QuadTo {
         ctrl: batch_mod::Point { x: cx as f32, y: cy as f32 },
         end: batch_mod::Point { x: ex as f32, y: ey as f32 },
@@ -703,7 +703,7 @@ pub extern "C" fn igui_path_quad_to(cx: f64, cy: f64, ex: f64, ey: f64) {
 
 #[unsafe(export_name = "iGui.PathCubicTo")]
 #[allow(clippy::too_many_arguments)]
-pub extern "C" fn igui_path_cubic_to(
+pub extern "C-unwind" fn igui_path_cubic_to(
     c1x: f64, c1y: f64, c2x: f64, c2y: f64, ex: f64, ey: f64,
 ) {
     batch_mod::path_push(batch_mod::PathCmd::CubicTo {
@@ -715,7 +715,7 @@ pub extern "C" fn igui_path_cubic_to(
 
 #[unsafe(export_name = "iGui.PathArcTo")]
 #[allow(clippy::too_many_arguments)]
-pub extern "C" fn igui_path_arc_to(
+pub extern "C-unwind" fn igui_path_arc_to(
     rx: f64, ry: f64, rotation_rad: f64,
     large_arc: i32, sweep_clockwise: i32,
     ex: f64, ey: f64,
@@ -730,7 +730,7 @@ pub extern "C" fn igui_path_arc_to(
 }
 
 #[unsafe(export_name = "iGui.PathClose")]
-pub extern "C" fn igui_path_close() {
+pub extern "C-unwind" fn igui_path_close() {
     batch_mod::path_push(batch_mod::PathCmd::Close);
 }
 
@@ -742,7 +742,7 @@ pub extern "C" fn igui_path_close() {
 /// equal-segment dash pattern of length 4.
 #[unsafe(export_name = "iGui.EmitPath")]
 #[allow(clippy::too_many_arguments)]
-pub extern "C" fn igui_emit_path(
+pub extern "C-unwind" fn igui_emit_path(
     fill_mode: i32,
     fill_r: f64, fill_g: f64, fill_b: f64, fill_a: f64,
     stroke_mode: i32,
@@ -801,7 +801,7 @@ pub extern "C" fn igui_emit_path(
 // ─── System colors ───────────────────────────────────────────────────
 
 #[unsafe(export_name = "iGui.SystemColor")]
-pub extern "C" fn igui_system_color(
+pub extern "C-unwind" fn igui_system_color(
     kind: i32,
     out_r: *mut f64,
     out_g: *mut f64,
@@ -891,7 +891,7 @@ fn build_text_run(
 /// we still scan for NUL.
 #[unsafe(export_name = "iGui.EmitDrawTextRun")]
 #[allow(clippy::too_many_arguments)]
-pub extern "C" fn igui_emit_draw_text_run(
+pub extern "C-unwind" fn igui_emit_draw_text_run(
     text: *const u8,
     _text_len: i64,
     origin_x: f64,
@@ -927,7 +927,7 @@ pub extern "C" fn igui_emit_draw_text_run(
 /// reply channel. Returns 1 on success, 0 on failure / timeout.
 #[unsafe(export_name = "iGui.MeasureTextRun")]
 #[allow(clippy::too_many_arguments)]
-pub extern "C" fn igui_measure_text_run(
+pub extern "C-unwind" fn igui_measure_text_run(
     child_id: i64,
     text: *const u8,
     _text_len: i64,
@@ -990,7 +990,7 @@ pub extern "C" fn igui_measure_text_run(
 /// VAR charIndex: INTEGER; VAR isInside, isTrailing: INTSHORT): INTSHORT`.
 #[unsafe(export_name = "iGui.CharIndexAtPoint")]
 #[allow(clippy::too_many_arguments)]
-pub extern "C" fn igui_char_index_at_point(
+pub extern "C-unwind" fn igui_char_index_at_point(
     child_id: i64,
     text: *const u8,
     _text_len: i64,
@@ -1047,7 +1047,7 @@ pub extern "C" fn igui_char_index_at_point(
 /// charIndex, VAR x, y, height: REAL): INTSHORT`.
 #[unsafe(export_name = "iGui.PointAtCharIndex")]
 #[allow(clippy::too_many_arguments)]
-pub extern "C" fn igui_point_at_char_index(
+pub extern "C-unwind" fn igui_point_at_char_index(
     child_id: i64,
     text: *const u8,
     _text_len: i64,
@@ -1094,7 +1094,7 @@ pub extern "C" fn igui_point_at_char_index(
 /// `iGui.GetDpi(childId: INTEGER; VAR dpiX, dpiY: REAL): INTSHORT`.
 /// Returns 1 on success, 0 if the child id is unknown.
 #[unsafe(export_name = "iGui.GetDpi")]
-pub extern "C" fn igui_get_dpi(
+pub extern "C-unwind" fn igui_get_dpi(
     child_id: i64,
     out_dpi_x: *mut f64,
     out_dpi_y: *mut f64,
@@ -1116,7 +1116,7 @@ pub extern "C" fn igui_get_dpi(
 
 /// `iGui.SetCursor(childId: INTEGER; kind: INTSHORT)`.
 #[unsafe(export_name = "iGui.SetCursor")]
-pub extern "C" fn igui_set_cursor(child_id: i64, kind: i32) {
+pub extern "C-unwind" fn igui_set_cursor(child_id: i64, kind: i32) {
     super::cursor::set_kind(child_id, kind);
 }
 
