@@ -492,6 +492,17 @@ impl Sema {
                 self.register_class(c);
             }
         }
+        // Pre-pass 1b: now that every class has a record, resolve any
+        // `AS Class` annotation on a class member's LET-initialiser
+        // into the field's `class_name`. Forward references
+        // (`CLASS Outer $( LET inner AS Inner $)` declared above
+        // `Inner`) only work because this pass runs after every class
+        // has been registered.
+        for decl in &program.items {
+            if let Decl::Class(c) = decl {
+                self.refine_class_field_annotations(c);
+            }
+        }
         // Pre-pass 2: register functions / routines with placeholder
         // result hints so forward calls (`g()` referenced before
         // `g`'s body is seen) resolve. Real inference happens during
@@ -502,6 +513,53 @@ impl Sema {
         // Main pass.
         for decl in &program.items {
             self.analyze_decl(decl);
+        }
+    }
+
+    /// After every class is in `self.classes`, walk one class's members
+    /// and back-fill `class_name` on any LET-form field whose AST
+    /// annotation names a known class. The initial `register_class`
+    /// pass only sets `class_name` from direct `Expr::New` evidence
+    /// because forward-referenced classes aren't yet registered
+    /// there.
+    fn refine_class_field_annotations(&mut self, c: &ClassDecl) {
+        for m in &c.members {
+            let ClassMemberKind::Let(let_decl) = &m.kind else {
+                continue;
+            };
+            for (idx, (field_name, _)) in let_decl.bindings.iter().enumerate() {
+                let Some(Some(annotation)) = let_decl.annotations.get(idx) else {
+                    continue;
+                };
+                let Some(class_name) = self.class_name_from_annotation(annotation) else {
+                    continue;
+                };
+                // First write wins — `LET f AS Foo = NEW Bar()` keeps
+                // the initialiser's class. Reasonable: the initialiser
+                // is the concrete evidence; the annotation is a hint.
+                if let Some(class_info) = self.classes.get_mut(&c.name) {
+                    if let Some(f) =
+                        class_info.fields.iter_mut().find(|f| f.name == *field_name)
+                    {
+                        if f.class_name.is_none() {
+                            f.class_name = Some(class_name.clone());
+                        }
+                    }
+                }
+                if let Some(class_log_entry) =
+                    self.class_log.iter_mut().find(|ci| ci.name == c.name)
+                {
+                    if let Some(f) = class_log_entry
+                        .fields
+                        .iter_mut()
+                        .find(|f| f.name == *field_name)
+                    {
+                        if f.class_name.is_none() {
+                            f.class_name = Some(class_name.clone());
+                        }
+                    }
+                }
+            }
         }
     }
 

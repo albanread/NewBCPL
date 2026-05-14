@@ -236,6 +236,21 @@ fn chain_method_then_method() {
     );
 }
 
+#[test]
+fn chain_via_as_class_annotation() {
+    // The field's class identity comes from an explicit `AS Inner`
+    // annotation on the class member declaration rather than a
+    // CREATE-time `SELF.field := NEW Inner(...)` back-fill. The
+    // forward-reference form — Outer declared above Inner — has to
+    // work because the AS-resolution pass runs after every class is
+    // registered.
+    expect(
+        "chain_via_as_class_annotation",
+        "CLASS Outer $(\n  LET inner AS Inner = ?\n  ROUTINE CREATE(v) BE SELF.inner := NEW Inner(v)\n$)\nCLASS Inner $(\n  DECL value\n  ROUTINE CREATE(v) BE SELF.value := v\n  FUNCTION getValue() = SELF.value\n$)\nLET START() BE $(\n  LET o = NEW Outer(123)\n  WRITEN(o.inner.getValue())\n$)\n",
+        "123",
+    );
+}
+
 // ─── Two-field accessors / setters ────────────────────────────────
 
 #[test]
