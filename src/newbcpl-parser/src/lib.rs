@@ -960,7 +960,9 @@ mod tests {
 
     #[test]
     fn keyword_and_or_not_parse_as_operators() {
-        // AND is binary &; OR is binary |; NOT is unary ~.
+        // Per the manifesto / user guide: `AND` / `OR` / `NOT` are the
+        // *logical* operators (LogAnd / LogOr / LogNot). The bitwise
+        // forms are `BAND` / `BOR` / `BNOT` (or `&` / `|` / `~`).
         let p = parse_ok("LET x = a = 1 AND b = 2 OR NOT c");
         let Decl::Let(l) = &p.items[0] else {
             panic!();
@@ -968,13 +970,41 @@ mod tests {
         // Expected tree: (a=1 AND b=2) OR (NOT c)
         // OR binds looser than AND, AND binds looser than =.
         let Expr::Binary {
+            op: BinaryOp::LogOr,
+            lhs,
+            rhs,
+            ..
+        } = &l.bindings[0].1
+        else {
+            panic!("expected logical OR at the root");
+        };
+        assert!(matches!(
+            lhs.as_ref(),
+            Expr::Binary { op: BinaryOp::LogAnd, .. }
+        ));
+        assert!(matches!(
+            rhs.as_ref(),
+            Expr::Unary { op: UnaryOp::LogNot, .. }
+        ));
+    }
+
+    #[test]
+    fn symbol_and_or_not_parse_as_bitwise() {
+        // The symbol/keyword split: `&` / `|` / `~` and `BAND` / `BOR` /
+        // `BNOT` are the *bitwise* forms. Same precedence skeleton as
+        // the logical test above.
+        let p = parse_ok("LET x = a = 1 BAND b = 2 BOR BNOT c");
+        let Decl::Let(l) = &p.items[0] else {
+            panic!();
+        };
+        let Expr::Binary {
             op: BinaryOp::BitOr,
             lhs,
             rhs,
             ..
         } = &l.bindings[0].1
         else {
-            panic!("expected OR at the root");
+            panic!("expected bitwise OR at the root");
         };
         assert!(matches!(
             lhs.as_ref(),
