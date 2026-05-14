@@ -157,14 +157,25 @@ fn render_instr(i: &Instr) -> String {
             byte_offset,
             render_value(value)
         ),
-        Instr::IndirectLoad { dst, addr, hint } => format!(
-            "%{} = iload [{}] : {}",
+        Instr::IndirectLoad {
+            dst,
+            addr,
+            hint,
+            byte_width,
+        } => format!(
+            "%{} = iload.{}b [{}] : {}",
             dst.0,
+            byte_width,
             render_value(addr),
             hint.as_str()
         ),
-        Instr::IndirectStore { addr, value } => format!(
-            "istore [{}], {}",
+        Instr::IndirectStore {
+            addr,
+            value,
+            byte_width,
+        } => format!(
+            "istore.{}b [{}], {}",
+            byte_width,
             render_value(addr),
             render_value(value)
         ),

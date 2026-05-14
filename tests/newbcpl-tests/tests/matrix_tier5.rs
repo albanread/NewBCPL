@@ -446,3 +446,67 @@ fn setter_then_getter() {
         "10 20 33 44",
     );
 }
+
+// ─── SUPER dispatch ───────────────────────────────────────────────
+//
+// `SUPER.method()` inside a subclass dispatches to the parent class's
+// implementation, not the subclass's. Used to call the parent's
+// CREATE from a subclass CREATE, or chain into a parent's override.
+
+#[test]
+fn super_create_runs_parent_init() {
+    // The subclass CREATE explicitly calls SUPER.CREATE, which runs
+    // the parent's initialiser. Both fields should land populated.
+    expect(
+        "super_create_runs_parent_init",
+        "CLASS Base $(\n  DECL a\n  ROUTINE CREATE(ia) BE SELF.a := ia\n$)\nCLASS Sub EXTENDS Base $(\n  DECL b\n  ROUTINE CREATE(ia, ib) BE $(\n    SUPER.CREATE(ia)\n    SELF.b := ib\n  $)\n$)\nLET START() BE $(\n  LET s = NEW Sub(10, 20)\n  WRITEN(s.a) WRITES(\"*S\") WRITEN(s.b)\n$)\n",
+        "10 20",
+    );
+}
+
+#[test]
+fn super_method_call_reaches_parent_body() {
+    // Subclass overrides `tag`, but `tag_via_super` calls the
+    // parent's version explicitly. The parent's body returns 1,
+    // the subclass's returns 2 — we want to see both in order.
+    expect(
+        "super_method_call_reaches_parent_body",
+        "CLASS Base $(\n  FUNCTION tag() = 1\n$)\nCLASS Sub EXTENDS Base $(\n  FUNCTION tag() = 2\n  FUNCTION tag_via_super() = SUPER.tag()\n$)\nLET START() BE $(\n  LET s = NEW Sub\n  WRITEN(s.tag()) WRITES(\"*S\") WRITEN(s.tag_via_super())\n$)\n",
+        "2 1",
+    );
+}
+
+// ─── VIRTUAL override + dynamic dispatch ──────────────────────────
+//
+// A `VIRTUAL` method declared in the parent and overridden in the
+// child must dispatch to the child's body when called on a child
+// instance — even through a base-class reference path.
+
+#[test]
+fn virtual_method_dispatches_to_override() {
+    // Direct call on a Sub instance: should see the subclass's body.
+    expect(
+        "virtual_method_dispatches_to_override",
+        "CLASS Base $(\n  VIRTUAL FUNCTION speak() = 100\n$)\nCLASS Sub EXTENDS Base $(\n  FUNCTION speak() = 200\n$)\nLET START() BE $(\n  LET s = NEW Sub\n  WRITEN(s.speak())\n$)\n",
+        "200",
+    );
+}
+
+#[test]
+fn virtual_dispatch_picks_subclass_body_via_vtable() {
+    // Variant of `virtual_method_dispatches_to_override` that pins
+    // the inheritance chain end-to-end: Base.code returns 1,
+    // Sub.code returns 7. Both instances live in the same scope,
+    // both dispatched via the same `.code()` call shape — the
+    // vtable must route each to its dynamic class's body, not the
+    // static call site's expectation.
+    //
+    // (A fuller probe that passes Sub through a routine typed
+    // `AS Base` is blocked on the parser not accepting `AS` on
+    // parameters yet — recorded in the reference audit.)
+    expect(
+        "virtual_dispatch_picks_subclass_body_via_vtable",
+        "CLASS Base $(\n  VIRTUAL FUNCTION code() = 1\n$)\nCLASS Sub EXTENDS Base $(\n  FUNCTION code() = 7\n$)\nLET START() BE $(\n  LET b = NEW Base\n  LET s = NEW Sub\n  WRITEN(b.code()) WRITES(\"*S\") WRITEN(s.code())\n$)\n",
+        "1 7",
+    );
+}

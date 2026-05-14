@@ -650,30 +650,68 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
                 };
                 self.value_map.insert(*dst, addr.into());
             }
-            Instr::IndirectLoad { dst, addr, hint } => {
-                // `!ptr` and the back-end of `v!i` / `v.%i`. The
-                // load type is determined by the IR's hint.
-                //
-                // KNOWN GAP: `%ptr` (char indirection) currently emits
-                // `load i64` because the hint is INT, but BCPL char
-                // semantics want `load i8 + zext`. Will be fixed
-                // when the IR carries an explicit byte-width.
+            Instr::IndirectLoad {
+                dst,
+                addr,
+                hint,
+                byte_width,
+            } => {
+                // `!ptr` / `v!i` / `v.%i` are word-shaped loads
+                // (byte_width=8) and use the IR hint to pick i64 vs
+                // f64. `%ptr` / `v%i` are byte loads (byte_width=1):
+                // emit `load i8` then `zext` to i64 so the result
+                // sits in a register-sized slot like any other word.
                 let addr_v = self.lower_value(addr);
                 let addr_ptr = self.as_pointer(addr_v);
-                let ty = self.basic_type_for(*hint);
-                let loaded = self
-                    .builder
-                    .build_load(ty, addr_ptr, "iload")
-                    .expect("indirect load");
-                self.value_map.insert(*dst, loaded);
+                if *byte_width == 1 {
+                    let i8_t = self.context.i8_type();
+                    let i64_t = self.context.i64_type();
+                    let raw = self
+                        .builder
+                        .build_load(i8_t, addr_ptr, "iload.byte")
+                        .expect("indirect byte load")
+                        .into_int_value();
+                    let zext = self
+                        .builder
+                        .build_int_z_extend(raw, i64_t, "iload.zext")
+                        .expect("zext");
+                    self.value_map.insert(*dst, zext.into());
+                } else {
+                    let ty = self.basic_type_for(*hint);
+                    let loaded = self
+                        .builder
+                        .build_load(ty, addr_ptr, "iload")
+                        .expect("indirect load");
+                    self.value_map.insert(*dst, loaded);
+                }
             }
-            Instr::IndirectStore { addr, value } => {
+            Instr::IndirectStore {
+                addr,
+                value,
+                byte_width,
+            } => {
+                // Byte stores (`%ptr := v`, `v%i := v`) truncate the
+                // word-shaped source value to i8 before storing.
+                // Word stores use whatever LLVM type the value
+                // already carries.
                 let addr_v = self.lower_value(addr);
                 let addr_ptr = self.as_pointer(addr_v);
                 let v = self.lower_value(value);
-                self.builder
-                    .build_store(addr_ptr, v)
-                    .expect("indirect store");
+                if *byte_width == 1 {
+                    let i8_t = self.context.i8_type();
+                    let iv = self.as_int_word(v);
+                    let narrowed = self
+                        .builder
+                        .build_int_truncate(iv, i8_t, "istore.trunc")
+                        .expect("trunc");
+                    self.builder
+                        .build_store(addr_ptr, narrowed)
+                        .expect("indirect byte store");
+                } else {
+                    self.builder
+                        .build_store(addr_ptr, v)
+                        .expect("indirect store");
+                }
             }
             Instr::LaneExtract {
                 dst,

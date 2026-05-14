@@ -667,7 +667,32 @@ impl<'a> Lowerer<'a> {
                 body,
                 span,
             } => self.lower_using(name, value, body, *span),
-            // SWITCHON / FOREACH / labels / RETAIN etc. — subsequent
+            Stmt::Retain {
+                name,
+                value: Some(init),
+                ..
+            } => {
+                // `RETAIN x = expr` — declares `x` and pins it past
+                // its natural scope. In our GC model the binding is
+                // already tracked as a stack root for as long as the
+                // current scope holds it; the explicit "pin" matters
+                // chiefly across scope boundaries (returning from
+                // VALOF, etc.), which we approximate by lowering the
+                // same as `LET x = expr`. The user-visible behaviour
+                // — `x.field` reads through the value, surviving an
+                // explicit `GC()` while in scope — is preserved.
+                let class_name = self.class_name_of_expr(init);
+                let value = self.lower_expr(init);
+                let slot_hint = init.hint();
+                let slot = self.b().alloca(name, slot_hint);
+                self.b().emit(Instr::Store { slot, value });
+                self.b().declare_local(name, slot, class_name);
+            }
+            Stmt::Retain { value: None, .. } => {
+                // `RETAIN x` (mark existing) — no IR effect. The
+                // binding is already a stack root in our model.
+            }
+            // SWITCHON / FOREACH / labels etc. — subsequent
             // IR-grow chunks lower these.
             _ => {}
         }
@@ -1125,6 +1150,7 @@ impl<'a> Lowerer<'a> {
             dst: elem,
             addr: Value::Local(elem_addr),
             hint: TypeHint::Word,
+            byte_width: 8,
         });
 
         // Bind names. With one name, the element is the binding.
@@ -1230,6 +1256,7 @@ impl<'a> Lowerer<'a> {
             dst: initial_head,
             addr: Value::Local(head_field),
             hint: TypeHint::List,
+            byte_width: 8,
         });
 
         // cursor slot — holds the current atom pointer.
@@ -1290,6 +1317,7 @@ impl<'a> Lowerer<'a> {
             dst: elem,
             addr: Value::Local(value_field),
             hint: TypeHint::Word,
+            byte_width: 8,
         });
 
         if names.len() == 1 {
@@ -1336,6 +1364,7 @@ impl<'a> Lowerer<'a> {
             dst: next,
             addr: Value::Local(next_field),
             hint: TypeHint::List,
+            byte_width: 8,
         });
         self.b().emit(Instr::Store {
             slot: cursor_slot,
@@ -1599,11 +1628,15 @@ impl<'a> Lowerer<'a> {
                     ..
                 } if subscript_stride_and_hint(*op).is_some() => {
                     // `v!i := value`, `v%i := value`, `v.%i := value`.
-                    // Compute the address via GEP and emit an
-                    // IndirectStore — symmetric with the rvalue path.
+                    // Stride 1 is the byte-subscript form — IndirectStore
+                    // carries the width so codegen truncates to i8.
                     let stride = subscript_stride_and_hint(*op).unwrap().0;
                     let addr = self.lower_subscript_address(lhs, rhs, stride);
-                    self.b().emit(Instr::IndirectStore { addr, value: v });
+                    self.b().emit(Instr::IndirectStore {
+                        addr,
+                        value: v,
+                        byte_width: stride as u32,
+                    });
                 }
                 Expr::Unary {
                     op: UnaryOp::Indirection,
@@ -1612,16 +1645,24 @@ impl<'a> Lowerer<'a> {
                 } => {
                     // `!ptr := value`.
                     let addr = self.lower_expr(operand);
-                    self.b().emit(Instr::IndirectStore { addr, value: v });
+                    self.b().emit(Instr::IndirectStore {
+                        addr,
+                        value: v,
+                        byte_width: 8,
+                    });
                 }
                 Expr::Unary {
                     op: UnaryOp::CharIndirection,
                     operand,
                     ..
                 } => {
-                    // `%ptr := value` — codegen handles the byte-store.
+                    // `%ptr := value` — byte-store.
                     let addr = self.lower_expr(operand);
-                    self.b().emit(Instr::IndirectStore { addr, value: v });
+                    self.b().emit(Instr::IndirectStore {
+                        addr,
+                        value: v,
+                        byte_width: 1,
+                    });
                 }
                 Expr::Binary {
                     op: BinaryOp::Bitfield,
@@ -1685,11 +1726,21 @@ impl<'a> Lowerer<'a> {
         match expr {
             Expr::New { class_name, .. } => Some(class_name.clone()),
             Expr::Ident { name, .. } => {
-                // SELF / SUPER inside a class method resolve to the
-                // surrounding class so `SELF.field` and `SELF.m()`
-                // work.
-                if (name == "SELF" || name == "SUPER") && self.current_class.is_some() {
+                // SELF resolves to the current class; SUPER resolves
+                // to its parent for member-access purposes. This is
+                // what makes `SUPER.field` reach an inherited field
+                // (via the parent's layout) and what teaches
+                // `class_name_of_expr` on `SUPER.foo` to return the
+                // parent's field-class — so chains rooted at SUPER
+                // line up correctly.
+                if name == "SELF" && self.current_class.is_some() {
                     return self.current_class.clone();
+                }
+                if name == "SUPER" {
+                    return self
+                        .current_class
+                        .as_ref()
+                        .and_then(|c| self.parent_class_of(c));
                 }
                 self.current
                     .as_ref()
@@ -1776,6 +1827,17 @@ impl<'a> Lowerer<'a> {
             .iter()
             .find(|f| f.name == field)
             .map(|f| f.offset)
+    }
+
+    /// The immediate parent of `class_name` (the `EXTENDS` target),
+    /// or `None` if the class has no parent or doesn't appear in our
+    /// layout table.
+    fn parent_class_of(&self, class_name: &str) -> Option<String> {
+        self.layouts
+            .iter()
+            .find(|l| l.class_name == class_name)?
+            .extends
+            .clone()
     }
 
     /// Look up a method's vtable slot by class name + method name.
@@ -2226,8 +2288,9 @@ impl<'a> Lowerer<'a> {
             return Value::Local(dst);
         }
         // Subscript family: `v ! i` / `v % i` / `v .% i` lower to
-        // GEP + IndirectLoad. The element stride and result hint
-        // depend on the subscript variant.
+        // GEP + IndirectLoad. The element stride drives both the
+        // address calculation and the load width — stride 1 means
+        // byte load + zero-extend, stride 8 means word/float load.
         if let Some((stride, load_hint)) = subscript_stride_and_hint(op) {
             let addr = self.lower_subscript_address(lhs, rhs, stride);
             let dst = self.b().alloc_value();
@@ -2235,6 +2298,7 @@ impl<'a> Lowerer<'a> {
                 dst,
                 addr,
                 hint: load_hint,
+                byte_width: stride as u32,
             });
             return Value::Local(dst);
         }
@@ -2365,6 +2429,7 @@ impl<'a> Lowerer<'a> {
                     dst,
                     addr,
                     hint: TypeHint::Word,
+                    byte_width: 8,
                 });
                 Value::Local(dst)
             }
@@ -2382,14 +2447,15 @@ impl<'a> Lowerer<'a> {
             }
             UnaryOp::CharIndirection => {
                 // `%ptr` — load a single byte from address ptr,
-                // zero-extended to a word. Codegen emits `i8 load
-                // -> zext i64`.
+                // zero-extended to a word. byte_width=1 tells
+                // codegen to emit `load i8 + zext i64`.
                 let addr = self.lower_expr(operand);
                 let dst = self.b().alloc_value();
                 self.b().emit(Instr::IndirectLoad {
                     dst,
                     addr,
                     hint: TypeHint::Int,
+                    byte_width: 1,
                 });
                 Value::Local(dst)
             }
@@ -2451,6 +2517,48 @@ impl<'a> Lowerer<'a> {
     }
 
     fn lower_call(&mut self, callee: &Expr, args: &[Expr], hint: TypeHint) -> Value {
+        // SUPER.method(args) — static dispatch to the *parent*'s
+        // implementation, bypassing the vtable. C++-style semantics:
+        // even if the dynamic class overrides `method`, a SUPER call
+        // must reach the parent's body, otherwise SUPER.CREATE in a
+        // subclass would recurse into its own CREATE. We emit a
+        // direct `<parent>_<method>` call with SELF as the implicit
+        // first argument.
+        if let Expr::Binary {
+            op: BinaryOp::Dot,
+            lhs,
+            rhs,
+            ..
+        } = callee
+        {
+            let receiver_is_super = matches!(
+                lhs.as_ref(),
+                Expr::Ident { name, .. } if name == "SUPER"
+            );
+            if receiver_is_super {
+                if let (Some(parent), Expr::Ident { name: method, .. }) = (
+                    self.current_class
+                        .as_ref()
+                        .and_then(|c| self.parent_class_of(c)),
+                    rhs.as_ref(),
+                ) {
+                    let receiver = self.load_self();
+                    let mut call_args: Vec<Value> = Vec::with_capacity(args.len() + 1);
+                    call_args.push(receiver);
+                    for a in args {
+                        call_args.push(self.lower_expr(a));
+                    }
+                    let dst = self.b().alloc_value();
+                    self.b().emit(Instr::Call {
+                        dst: Some(dst),
+                        callee: Value::Function(mangle_method(&parent, method)),
+                        args: call_args,
+                        hint,
+                    });
+                    return Value::Local(dst);
+                }
+            }
+        }
         // Method dispatch: callee is `obj.methodName`. When sema /
         // class lookup tells us the receiver's class and that class
         // has the named method in its vtable, lower as a MethodCall

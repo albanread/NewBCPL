@@ -356,3 +356,39 @@ fn list_concat_walked_through_hd_tl_chain() {
         "1 2 3 4",
     );
 }
+
+// ─── RETAIN ───────────────────────────────────────────────────────
+//
+// `RETAIN x = expr` declares `x` and pins it past its natural scope.
+// In our GC model the binding is a stack root for as long as the
+// scope holds it; the probe pins that an explicit `GC()` cycle
+// doesn't reclaim a retained object.
+
+#[test]
+fn retain_declares_binding_and_survives_gc() {
+    expect(
+        "retain_declares_binding_and_survives_gc",
+        "CLASS P $(\n  DECL n\n  ROUTINE CREATE(v) BE SELF.n := v\n$)\nLET START() BE $(\n  RETAIN p = NEW P(999)\n  GC()\n  WRITEN(p.n)\n$)\n",
+        "999",
+    );
+}
+
+// ─── UTF-8 string indexing via % ──────────────────────────────────
+//
+// Our `%` operator reads a byte (i64-extended), per the user guide
+// §2.6's note that strings are UTF-8 bytes. A multibyte glyph like
+// `λ` (U+03BB) encodes to two bytes (0xCE 0xBB) and reads as two
+// distinct `s % i` values — pinning the UTF-8 convention so a
+// future refactor doesn't drift toward the reference's 32-bit-char
+// model without us noticing.
+
+#[test]
+fn utf8_multibyte_glyph_reads_as_two_bytes() {
+    // λ = 0xCE 0xBB; bytes 2 and 3 are the start of the next glyph
+    // (we follow with 'a' to give bytes 2 a known value).
+    expect(
+        "utf8_multibyte_glyph_reads_as_two_bytes",
+        "LET START() BE $(\n  LET s = \"λa\"\n  WRITEN(s % 0) WRITES(\"*S\")\n  WRITEN(s % 1) WRITES(\"*S\")\n  WRITEN(s % 2)\n$)\n",
+        "206 187 97",
+    );
+}

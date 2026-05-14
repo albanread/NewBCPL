@@ -163,16 +163,25 @@ pub enum Instr {
     },
     /// `!ptr` — load the value at an address. Used for both prefix
     /// `!ptr` and the result of subscript-family lowering
-    /// (`v!i` / `v%i` / `v.%i`) after the GEP step.
+    /// (`v!i` / `v%i` / `v.%i`) after the GEP step. `byte_width`
+    /// records the load width: 8 for word / float / pointer loads,
+    /// 1 for the char-subscript path (`v%i` / `%ptr`) so codegen
+    /// emits `load i8 + zext to i64`. Default 8 keeps every existing
+    /// caller correct; the byte path opts in explicitly.
     IndirectLoad {
         dst: ValueId,
         addr: Value,
         hint: TypeHint,
+        byte_width: u32,
     },
-    /// `!ptr := value` — store a value at an address.
+    /// `!ptr := value` — store a value at an address. `byte_width`
+    /// mirrors the load: 1 for byte stores (`%ptr := v` and `v%i :=
+    /// v`), 8 otherwise. Codegen truncates the source value to i8
+    /// when narrowing.
     IndirectStore {
         addr: Value,
         value: Value,
+        byte_width: u32,
     },
     /// `base + index * element_bytes` — pointer arithmetic for
     /// subscripts. `element_bytes` is 8 for word vectors (`v!i`),

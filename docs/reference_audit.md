@@ -102,8 +102,8 @@ Reference precedence table (high → low): `()`, `! OF`, `@ !`, `* / REM`,
 | `FLET` float binding | ✓ | Tier 2 |
 | `MANIFEST $( N = K; ... $)` | ✓ | Tier 2; lowering substitutes inline |
 | `STATIC $( N = K; ... $)` | ✓ | Tier 2 |
-| `GLOBAL $( name : offset; ... $)` classic slot-pinning | ⚠ | Parses; no behavioural probe through the global-vector indirection |
-| `GLOBALS` modern form | ✓ | |
+| `GLOBAL $( name : offset; ... $)` classic slot-pinning | ✗ | Parses + sema records the binding, but IR lowering doesn't emit a runtime slot → JIT reports `missing builtin: <name>`. Real implementation gap, not a probe gap. |
+| `GLOBALS` modern form | ⚠ | Same shape as `GLOBAL`; needs a behavioural probe |
 | `LET v = VEC k` | ✓ | Tier 6 |
 | `LET v = FVEC k` | ✓ | Tier 6 |
 | `LET F(p) = expr` function | ✓ | Tier 3 |
@@ -241,3 +241,38 @@ Items 6, 7, 8 are real *implementation* work and should be separate.
 The Δ rows are not gaps — they're language design choices that the
 user guide already explains. The audit's value here is making sure
 we don't accidentally drift back toward the reference behaviour.
+
+## Sweep results (post-audit pass)
+
+The basic-feature sweep ran and found three real bugs the audit had
+listed as "thin" — exactly the kind of thing this exercise was for:
+
+* **`SUPER.method()` didn't dispatch.** `SUPER` was treated as just
+  an identifier; the call fell through to a generic name lookup and
+  the JIT reported `missing builtin: SUPER`. Fix: `class_name_of_expr`
+  returns the parent class for `SUPER`, and `lower_call` emits a
+  *direct* call to `<parent>_<method>` instead of vtable dispatch
+  (so SUPER.CREATE can't recurse into its own CREATE). `ClassLayout`
+  now carries `extends` so the IR can look up the parent.
+
+* **`%ptr` / `v%i` did word loads.** Marked "KNOWN GAP" in
+  `emit.rs`: the IR's `IndirectLoad` hint said INT but the codegen
+  emitted `load i64`, returning eight bytes worth of garbage from a
+  single-byte index. Fix: `IndirectLoad` and `IndirectStore` now
+  carry an explicit `byte_width`; `byte_width=1` emits `load i8 +
+  zext i64` (read) or truncate-to-i8 + store (write).
+
+* **`RETAIN x = expr` didn't declare the binding.** IR comment said
+  "subsequent chunks lower these" — never happened. Fix: lower as
+  equivalent to `LET x = expr`; the GC tracks the stack root the
+  same way, satisfying the user-visible "survives a GC()" contract.
+
+* **`LET f(p AS Class)` parameter annotation doesn't parse.**
+  Discovered while writing the SUPER probe. Not in scope for the
+  sweep — recorded as a separate gap.
+
+* **`GLOBAL $( name : 42 $)`** confirmed as a real implementation
+  gap (not a probe gap). Updated status to ✗.
+
+After the sweep, the matrix gains ~16 probes across tiers 3, 4, 5,
+6 and the workspace stays at 33 binaries green.

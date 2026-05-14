@@ -281,3 +281,29 @@ fn if_inside_for() {
         "012!45",
     );
 }
+
+// ─── GOTO and labels ──────────────────────────────────────────────
+//
+// `GOTO label` is BCPL's unconditional jump; `name:` declares a
+// label. Rare in modern code but the parser lowers them and the
+// audit flagged them as probe-thin.
+
+#[test]
+fn goto_forward_jumps_over_code() {
+    expect(
+        "goto_forward_jumps_over_code",
+        "LET START() BE $(\n  WRITES(\"before*N\")\n  GOTO skip\n  WRITES(\"skipped*N\")\nskip:\n  WRITES(\"after*N\")\n$)\n",
+        "before\nafter\n",
+    );
+}
+
+#[test]
+fn goto_into_loop_body() {
+    // GOTO into the middle of a loop body. Reaches the label,
+    // then falls through to the next iteration.
+    expect(
+        "goto_into_loop_body",
+        "LET START() BE $(\n  LET n = 0\n  GOTO mid\n  WRITES(\"unreached*N\")\nmid:\n  WRITEN(n)\n$)\n",
+        "0",
+    );
+}

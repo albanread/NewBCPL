@@ -34,6 +34,11 @@ use crate::ClassInfo;
 #[derive(Debug, Clone)]
 pub struct ClassLayout {
     pub class_name: String,
+    /// Direct parent class for single inheritance (`CLASS Sub EXTENDS
+    /// Base`). Lets IR lowering resolve `SUPER.method()` to the
+    /// parent class's mangled name without re-walking the sema
+    /// `ClassInfo` table.
+    pub extends: Option<String>,
     /// Total bytes per instance, including the leading vtable
     /// pointer at offset 0.
     pub instance_size: usize,
@@ -262,6 +267,7 @@ fn compute_one(
         class.name.clone(),
         ClassLayout {
             class_name: class.name.clone(),
+            extends: class.extends.clone(),
             instance_size: next_offset,
             fields,
             vtable,

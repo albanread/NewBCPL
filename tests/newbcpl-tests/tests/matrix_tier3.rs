@@ -407,3 +407,61 @@ fn bitfield_write_preserves_other_bits() {
         "243",
     );
 }
+
+// ─── EQV / NEQV operators ─────────────────────────────────────────
+//
+// `EQV` is the equivalence test (returns 1 when operands are equal,
+// 0 otherwise; lowered through `ICmpEq`). `NEQV` is the
+// not-equivalent / XOR form (lowered through `BitXor`). They sit in
+// the OR family of the precedence table.
+
+#[test]
+fn eqv_equal_operands_is_true() {
+    expect(
+        "eqv_equal_operands_is_true",
+        "LET START() BE $( WRITEN(5 EQV 5) $)\n",
+        "1",
+    );
+}
+
+#[test]
+fn eqv_unequal_operands_is_false() {
+    expect(
+        "eqv_unequal_operands_is_false",
+        "LET START() BE $( WRITEN(5 EQV 3) $)\n",
+        "0",
+    );
+}
+
+#[test]
+fn neqv_xor_returns_bitwise_difference() {
+    // `5 NEQV 3` is 5 ^ 3 = 6 (bitwise XOR). This is the BCPL
+    // tradition — NEQV is BXOR's spelling in the OR family.
+    expect(
+        "neqv_xor_returns_bitwise_difference",
+        "LET START() BE $( WRITEN(5 NEQV 3) $)\n",
+        "6",
+    );
+}
+
+#[test]
+fn neqv_equal_operands_zero() {
+    expect(
+        "neqv_equal_operands_zero",
+        "LET START() BE $( WRITEN(7 NEQV 7) $)\n",
+        "0",
+    );
+}
+
+// ─── Address-of round-trip ────────────────────────────────────────
+
+#[test]
+fn address_of_round_trips_through_indirection() {
+    // `@x` returns the address of `x`; `!p` reads through a pointer.
+    // The round trip should yield the original value.
+    expect(
+        "address_of_round_trips_through_indirection",
+        "LET START() BE $( LET x = 99\n  LET p = @x\n  WRITEN(!p) $)\n",
+        "99",
+    );
+}
