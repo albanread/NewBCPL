@@ -164,13 +164,17 @@ fn main() -> ExitCode {
             Some(folder_arg) => {
                 let folder = PathBuf::from(folder_arg);
                 // Remaining args: `start=N`, `stop=N`, `grep=text`,
-                // or a bare path becomes the report path. `grep`
-                // pre-filters to files whose source contains the
-                // literal substring (case-sensitive); `start` /
-                // `stop` then index into the filtered list.
+                // `skip=text`, or a bare path becomes the report
+                // path. `grep` keeps only files whose source
+                // contains the substring; `skip` (which may repeat)
+                // drops files whose source contains it. Use `skip`
+                // to quarantine out-of-scope tests like SDL2 — they
+                // exit the corpus's denominator before the sweep
+                // even starts.
                 let mut start: Option<usize> = None;
                 let mut stop: Option<usize> = None;
                 let mut grep: Option<String> = None;
+                let mut skip: Vec<String> = Vec::new();
                 let mut report: Option<PathBuf> = None;
                 for arg in args {
                     if let Some(v) = arg.strip_prefix("start=") {
@@ -191,13 +195,15 @@ fn main() -> ExitCode {
                         }
                     } else if let Some(v) = arg.strip_prefix("grep=") {
                         grep = Some(v.to_string());
+                    } else if let Some(v) = arg.strip_prefix("skip=") {
+                        skip.push(v.to_string());
                     } else {
                         report = Some(PathBuf::from(arg));
                     }
                 }
                 let report =
                     report.unwrap_or_else(|| PathBuf::from("test-results.txt"));
-                run_test_folder(&folder, &report, start, stop, grep.as_deref())
+                run_test_folder(&folder, &report, start, stop, grep.as_deref(), &skip)
             }
             None => {
                 eprintln!("test-folder: missing folder path");
@@ -514,6 +520,7 @@ fn run_test_folder(
     start: Option<usize>,
     stop: Option<usize>,
     grep: Option<&str>,
+    skip_needles: &[String],
 ) -> ExitCode {
     use std::fs;
     use std::process::Command;
@@ -542,6 +549,25 @@ fn run_test_folder(
                 .is_some_and(|s| s.contains(needle))
         });
     }
+
+    // Drop files whose source contains any `skip=` substring. Used
+    // to quarantine out-of-scope tests like the SDL2 family — they
+    // never run on this dialect's Direct2D path, so excluding them
+    // from the denominator gives a cleaner effective-pass-rate
+    // number.
+    let skipped_count = if !skip_needles.is_empty() {
+        let before = files.len();
+        files.retain(|p| {
+            let body = match fs::read_to_string(p) {
+                Ok(s) => s,
+                Err(_) => return true,
+            };
+            !skip_needles.iter().any(|n| body.contains(n.as_str()))
+        });
+        before - files.len()
+    } else {
+        0
+    };
 
     if files.is_empty() {
         let scope = grep
@@ -637,7 +663,7 @@ fn run_test_folder(
     let passed = outcomes.iter().filter(|o| o.pass).count();
     let failed = outcomes.len() - passed;
 
-    let report = build_report(folder, &outcomes, total_ms);
+    let report = build_report(folder, &outcomes, total_ms, skipped_count, skip_needles);
     if let Err(e) = fs::write(report_path, &report) {
         eprintln!("test-folder: cannot write {}: {e}", report_path.display());
         return ExitCode::from(1);
@@ -662,7 +688,13 @@ fn run_test_folder(
     }
 }
 
-fn build_report(folder: &Path, outcomes: &[TestOutcome], total_ms: u128) -> String {
+fn build_report(
+    folder: &Path,
+    outcomes: &[TestOutcome],
+    total_ms: u128,
+    skipped_count: usize,
+    skip_needles: &[String],
+) -> String {
     use std::collections::BTreeMap;
     use std::fmt::Write as _;
 
@@ -682,6 +714,13 @@ fn build_report(folder: &Path, outcomes: &[TestOutcome], total_ms: u128) -> Stri
     let _ = writeln!(s, "# total:   {total}");
     let _ = writeln!(s, "# passed:  {passed}");
     let _ = writeln!(s, "# failed:  {failed}");
+    if skipped_count > 0 {
+        let needles = skip_needles.join("`, `");
+        let _ = writeln!(
+            s,
+            "# skipped: {skipped_count}  (source contained `{needles}`)"
+        );
+    }
     let _ = writeln!(s, "# elapsed: {:.2}s", total_ms as f64 / 1000.0);
     let _ = writeln!(s);
     let _ = writeln!(s, "## failures by phase");

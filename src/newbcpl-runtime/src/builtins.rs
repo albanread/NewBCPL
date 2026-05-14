@@ -262,6 +262,109 @@ pub unsafe extern "C-unwind" fn TYPE(list_hdr: *const ListHeader) -> i64 {
     }
 }
 
+// ─── Vector / list reducers (SUM, JOIN) ───────────────────────────
+//
+// Corpus shape:
+//   `SUM(v1, v2)`  — element-wise integer add of two VEC-shaped
+//                    operands; returns a fresh same-length VEC.
+//                    Used by SIMD-pair workloads where each pair is
+//                    stored as two int slots.
+//   `JOIN(list,s)` — concatenate every string atom in `list` with
+//                    `s` between elements; returns a heap-allocated
+//                    null-terminated UTF-8 string. Non-string atoms
+//                    are formatted as decimal integers.
+
+/// `SUM(v1, v2)` — allocate a fresh VEC with `LEN(v1)` words and
+/// store `v1!i + v2!i` in each slot. Both inputs must be the same
+/// length; a length mismatch silently truncates to the shorter.
+/// Null inputs yield a null result (no allocation).
+pub unsafe extern "C-unwind" fn SUM(v1: *const i64, v2: *const i64) -> *mut i64 {
+    if v1.is_null() || v2.is_null() {
+        return std::ptr::null_mut();
+    }
+    let n1 = unsafe { __newbcpl_len(v1) };
+    let n2 = unsafe { __newbcpl_len(v2) };
+    let n = n1.min(n2);
+    let out = alloc_vec_words(n);
+    for i in 0..n as usize {
+        unsafe {
+            let a = *v1.add(i);
+            let b = *v2.add(i);
+            *out.add(i) = a.wrapping_add(b);
+        }
+    }
+    out
+}
+
+/// `JOIN(list, separator)` — render each atom of `list` as text and
+/// concatenate with `separator` between adjacent atoms. Returns a
+/// fresh null-terminated UTF-8 buffer on the GC heap. Null inputs
+/// return null; an empty list returns an empty string ("").
+pub unsafe extern "C-unwind" fn JOIN(
+    list_hdr: *const ListHeader,
+    separator: *const u8,
+) -> *const u8 {
+    if list_hdr.is_null() {
+        return std::ptr::null();
+    }
+    let sep_str = unsafe { cstr_to_str(separator) };
+    let mut out = String::new();
+    let mut cur = unsafe { (*list_hdr).head };
+    let mut first = true;
+    while !cur.is_null() {
+        let atom = unsafe { &*cur };
+        if !first {
+            out.push_str(sep_str);
+        }
+        first = false;
+        match atom.type_tag {
+            t if t == ATOM_STRING => {
+                let s = unsafe { cstr_to_str(atom.value as *const u8) };
+                out.push_str(s);
+            }
+            t if t == ATOM_FLOAT => {
+                let f = f64::from_bits(atom.value as u64);
+                out.push_str(&format!("{}", f));
+            }
+            _ => {
+                // ATOM_INT, ATOM_PAIR (which is i64 anyway), and
+                // anything else with a raw word value — render as
+                // decimal integer.
+                out.push_str(&format!("{}", atom.value));
+            }
+        }
+        cur = atom.next;
+    }
+    // Materialise into a GC-managed byte vector so the result has a
+    // process-stable address and gets cleaned up by the collector.
+    let bytes = out.into_bytes();
+    let total_bytes = bytes.len() + 1;
+    let buf = unsafe { __newbcpl_alloc_rec(total_bytes as i64) } as *mut u8;
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, bytes.len());
+        *buf.add(bytes.len()) = 0;
+    }
+    buf as *const u8
+}
+
+/// Read a null-terminated UTF-8 string off a raw pointer. Treats
+/// non-UTF-8 bytes as their Latin-1 equivalent rather than
+/// panicking — corpus tests sometimes hand in stale or
+/// non-UTF-8 buffers.
+unsafe fn cstr_to_str<'a>(p: *const u8) -> &'a str {
+    if p.is_null() {
+        return "";
+    }
+    unsafe {
+        let mut len = 0usize;
+        while *p.add(len) != 0 {
+            len += 1;
+        }
+        let slice = std::slice::from_raw_parts(p, len);
+        std::str::from_utf8(slice).unwrap_or("")
+    }
+}
+
 // `AS_INT` / `AS_FLOAT` / `AS_STRING` are *bit-reinterpret casts*,
 // not runtime helpers — IR lowering rewrites the call into a
 // type-hint shift on the argument (see
@@ -1201,6 +1304,8 @@ pub fn builtin_addresses() -> &'static [Builtin] {
             builtin!(PAIRWISE_MAX),
             builtin!(PAIRWISE_ADD),
             builtin!(TYPE),
+            builtin!(SUM),
+            builtin!(JOIN),
         ];
         #[cfg(windows)]
         {

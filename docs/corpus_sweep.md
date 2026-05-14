@@ -347,3 +347,75 @@ into:
 None of these is a 50-file win. The corpus sweep has done its job
 as a coverage signal; further investment is targeted bug-fixing,
 not bulk unblock.
+
+---
+
+## Iteration 4 — SDL2 quarantined, SUM / JOIN landed
+
+```
+total:    835   (corpus minus 21 SDL2 files)
+passed:   531   (63.6 %)
+failed:   304
+skipped:   21   (source contained `SDL2_`)
+elapsed: 116.6 s
+```
+
+Two pieces:
+
+* **`SUM(v1, v2)`** — word-by-word integer addition into a fresh
+  VEC of the same length. Used by SIMD-pair workloads where each
+  pair is stored as two consecutive int slots; the function is
+  agnostic of the pair shape and just walks words.
+
+* **`JOIN(list, separator)`** — concatenate every atom in `list`
+  with `separator` between elements. Returns a fresh
+  null-terminated UTF-8 buffer on the GC heap. Atom dispatch:
+  strings copy verbatim, floats use Rust's default formatting,
+  everything else (ints, packed pairs) renders as decimal i64.
+
+Plus a driver knob:
+
+* **`test-folder skip=SUBSTR ...`** — drops files whose source
+  contains the substring before the sweep runs. Multiple `skip=`
+  flags compose. We use `skip=SDL2_` for the standard corpus
+  sweep — NewBCPL's GUI surface is Direct2D / DirectWrite (manifesto
+  §3); the SDL2 path was never in scope, and those 21 files were
+  cluttering the failure landscape without telling us anything
+  actionable. They're reported separately in the `# skipped:`
+  line so the count isn't lost.
+
+### Top remaining failure buckets
+
+Top missing-builtin names after iteration 4:
+
+```
+4 × __newbcpl_indirect        # internal stub; indirect-call fallback
+3 × IGETVEC / PGETVEC / QGETVEC / SGETVEC   # typed-allocator variants
+3 × BCPL_FREE_LIST
+3 × vec1 / vec2               # likely undefined user functions
+2 × MAKEPAIR / FLTOFX / FILE_OPEN_*  # misc
+```
+
+No bucket above 4. The dominant failure shape is now small
+individual problems — parser syntactic gaps and runtime
+mismatches one file at a time — not systematic gaps.
+
+### Where things stand
+
+Across five sweep iterations the journey is:
+
+| Sweep | Pass | % raw | Effective % * |
+|-------|------|-------|---------------|
+| 1     | 451  | 52.7  | 59.3          |
+| 2     | 508  | 59.3  | 66.8          |
+| 3     | 524  | 61.2  | 68.9          |
+| 4     | 524  | 61.2  | 68.9          |
+| 5     | 531  | 63.6  | **69.9**      |
+
+\* Effective denominator = 856 − 28 GLOBALS − 45 no-START − 2
+visibility-violation − 21 SDL2 = 760.
+
+The corpus sweep has done its job: it surfaced systematic gaps,
+each of which got addressed with a focused patch. What's left is
+a long tail of one-off bugs that need targeted investigation,
+not bulk unblock.
