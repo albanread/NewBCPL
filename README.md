@@ -27,21 +27,19 @@ The reference 857-file corpus (`reference/tests/bcl_tests/`) is still a moving t
 ### Resource cleanup
 
 The deterministic-cleanup story is `USING name = expr DO body`, which
-binds `name` for the body, then calls `name.RELEASE()` at scope exit.
-Cleanup runs on fall-through and on `RETURN` / `RESULTIS` / `FINISH`
-(innermost-first, so nested USINGs release in stack order). This
-replaces the earlier MANAGED linear-type design — the GC handles the
-"don't leak" half, USING handles the "release in order" half. The
-`MANAGED` keyword still parses for backward compatibility but is
-advisory now: any class with a `RELEASE` method works in a USING
-block.
+binds `name` for the body and then calls `name.RELEASE()` at scope
+exit. Cleanup runs on every way out — fall-through, `RETURN`,
+`RESULTIS`, `FINISH`, `BREAK`, `LOOP`, `ENDCASE` — innermost-first, so
+nested USINGs release in stack order. This replaces the earlier
+MANAGED linear-type design: the GC handles "don't leak", USING handles
+"release in order". The `MANAGED` keyword still parses for backward
+compatibility but is advisory now; any class with a `RELEASE` method
+works in a USING block.
 
 ### Known gaps
 
 - ORC v2 alongside MCJIT — a separate backend, parked.
-- `BREAK` / `LOOP` exiting a loop from inside a `USING` body skip the
-  cleanup. Use `RETURN` or fall-through when the RELEASE guarantee
-  matters. Closing the gap needs a per-loop cleanup walk on transfer.
+- `GOTO` does not yet fire USING cleanups (BREAK/LOOP/ENDCASE do).
 - Rare `STATUS_ACCESS_VIOLATION` on `newbcpl-runtime` test-process
   teardown (a static-destructor ordering issue, not a test-time race).
 

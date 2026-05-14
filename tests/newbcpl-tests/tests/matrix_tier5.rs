@@ -334,6 +334,61 @@ fn using_binding_supports_method_calls_in_body() {
     );
 }
 
+// ─── USING cleanup on control transfer ────────────────────────────
+//
+// `BREAK` / `LOOP` / `ENDCASE` that escape a USING scope must fire
+// RELEASE just like RETURN does. The probes above pinned the
+// function-exit case (RETURN, FINISH); these pin the loop-exit and
+// switchon-exit cases.
+
+#[test]
+fn break_out_of_using_runs_release() {
+    // BREAK exits the surrounding loop. The USING inside the loop
+    // body must still run RELEASE before the branch fires.
+    expect(
+        "break_out_of_using_runs_release",
+        "CLASS R $(\n  ROUTINE CREATE() BE WRITES(\"open*N\")\n  ROUTINE RELEASE() BE WRITES(\"close*N\")\n$)\nLET START() BE $(\n  FOR i = 1 TO 3 DO $(\n    USING r = NEW R DO $(\n      WRITES(\"work*N\")\n      BREAK\n    $)\n  $)\n  WRITES(\"after*N\")\n$)\n",
+        "open\nwork\nclose\nafter\n",
+    );
+}
+
+#[test]
+fn loop_through_using_runs_release_each_iteration() {
+    // LOOP jumps back to the loop header. The USING inside the body
+    // must release on each iteration where LOOP fires, then a fresh
+    // one is created on the next iteration.
+    expect(
+        "loop_through_using_runs_release_each_iteration",
+        "CLASS R $(\n  DECL n\n  ROUTINE CREATE(i) BE $( SELF.n := i\n WRITEN(i)\n WRITES(\"-open*N\") $)\n  ROUTINE RELEASE() BE $( WRITEN(SELF.n)\n WRITES(\"-close*N\") $)\n$)\nLET START() BE $(\n  FOR i = 1 TO 2 DO $(\n    USING r = NEW R(i) DO LOOP\n  $)\n$)\n",
+        "1-open\n1-close\n2-open\n2-close\n",
+    );
+}
+
+#[test]
+fn endcase_through_using_runs_release() {
+    // ENDCASE exits the enclosing SWITCHON. A USING inside a case
+    // body must run RELEASE before the branch to the switchon exit.
+    expect(
+        "endcase_through_using_runs_release",
+        "CLASS R $(\n  ROUTINE CREATE() BE WRITES(\"open*N\")\n  ROUTINE RELEASE() BE WRITES(\"close*N\")\n$)\nLET START() BE $(\n  LET k = 1\n  SWITCHON k INTO $(\n    CASE 1:\n      USING r = NEW R DO $(\n        WRITES(\"work*N\")\n        ENDCASE\n      $)\n    DEFAULT:\n      WRITES(\"default*N\")\n      ENDCASE\n  $)\n  WRITES(\"after*N\")\n$)\n",
+        "open\nwork\nclose\nafter\n",
+    );
+}
+
+#[test]
+fn break_releases_inner_using_only() {
+    // Two nested USINGs, BREAK from the inner — the inner releases
+    // (it's inside the loop frame), the outer is *outside* the
+    // loop frame and stays alive until its own fall-through. Order
+    // of events: open-outer, open-inner, work, close-inner (BREAK),
+    // after, close-outer (fall-through).
+    expect(
+        "break_releases_inner_using_only",
+        "CLASS A $(\n  ROUTINE CREATE() BE WRITES(\"open-A*N\")\n  ROUTINE RELEASE() BE WRITES(\"close-A*N\")\n$)\nCLASS B $(\n  ROUTINE CREATE() BE WRITES(\"open-B*N\")\n  ROUTINE RELEASE() BE WRITES(\"close-B*N\")\n$)\nLET START() BE $(\n  USING a = NEW A DO $(\n    FOR i = 1 TO 3 DO $(\n      USING b = NEW B DO $(\n        WRITES(\"work*N\")\n        BREAK\n      $)\n    $)\n    WRITES(\"after-loop*N\")\n  $)\n$)\n",
+        "open-A\nopen-B\nwork\nclose-B\nafter-loop\nclose-A\n",
+    );
+}
+
 // ─── Two-field accessors / setters ────────────────────────────────
 
 #[test]

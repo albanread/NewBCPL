@@ -135,6 +135,14 @@ struct Frame {
     /// for SWITCHON frames — `LOOP` walks past to the enclosing
     /// loop (or sema has already warned).
     continue_block: Option<BlockId>,
+    /// `Lowerer::using_cleanups.len()` at the moment this frame was
+    /// pushed. A `BREAK` / `LOOP` / `ENDCASE` that targets this frame
+    /// must fire every USING cleanup added since — that's the slice
+    /// `[cleanups_at_entry..]`. Lets control-transfer statements
+    /// release every scope they're escaping without popping anything
+    /// from the stack itself (the structural USING block will pop on
+    /// its own way out).
+    cleanups_at_entry: usize,
 }
 
 impl Builder {
@@ -176,15 +184,21 @@ impl Builder {
         id
     }
 
-    fn innermost_break(&self) -> Option<BlockId> {
-        self.frames.last().map(|f| f.break_block)
+    fn innermost_break_frame(&self) -> Option<Frame> {
+        self.frames.last().copied()
     }
 
-    fn innermost_continue(&self) -> Option<BlockId> {
+    /// Innermost frame whose `continue_block` is set — i.e. the
+    /// closest enclosing loop. SWITCHON frames have `continue_block`
+    /// = None and `LOOP` walks past them, so this can return a
+    /// further-out frame than `innermost_break_frame`. Used for
+    /// cleanup-walk on `LOOP`.
+    fn innermost_continue_frame(&self) -> Option<Frame> {
         self.frames
             .iter()
             .rev()
-            .find_map(|f| f.continue_block)
+            .find(|f| f.continue_block.is_some())
+            .copied()
     }
 
     fn current_block_terminator(&self) -> Option<&Terminator> {
@@ -514,26 +528,33 @@ impl<'a> Lowerer<'a> {
                 ..
             } => self.lower_foreach(names, annotation.as_deref(), iter, body),
             Stmt::Break(_) => {
-                if let Some(target) = self.b().innermost_break() {
-                    self.b().terminate(Terminator::Branch(target));
+                if let Some(frame) = self.b().innermost_break_frame() {
+                    // Fire every USING cleanup pushed since this
+                    // frame was entered — innermost-first.
+                    self.emit_using_cleanups_from(frame.cleanups_at_entry);
+                    self.b().terminate(Terminator::Branch(frame.break_block));
                     let dead = self.b().alloc_block("after.break");
                     self.b().switch_to(dead);
                 }
                 // BREAK outside any frame is sema-flagged; emit nothing.
             }
             Stmt::Loop(_) => {
-                if let Some(target) = self.b().innermost_continue() {
-                    self.b().terminate(Terminator::Branch(target));
-                    let dead = self.b().alloc_block("after.loop");
-                    self.b().switch_to(dead);
+                if let Some(frame) = self.b().innermost_continue_frame() {
+                    self.emit_using_cleanups_from(frame.cleanups_at_entry);
+                    if let Some(target) = frame.continue_block {
+                        self.b().terminate(Terminator::Branch(target));
+                        let dead = self.b().alloc_block("after.loop");
+                        self.b().switch_to(dead);
+                    }
                 }
             }
             Stmt::Endcase(_) => {
                 // ENDCASE jumps out of the enclosing SWITCHON. We
                 // reuse the same `break_block` slot — sema has
                 // already verified this only fires inside SWITCHON.
-                if let Some(target) = self.b().innermost_break() {
-                    self.b().terminate(Terminator::Branch(target));
+                if let Some(frame) = self.b().innermost_break_frame() {
+                    self.emit_using_cleanups_from(frame.cleanups_at_entry);
+                    self.b().terminate(Terminator::Branch(frame.break_block));
                     let dead = self.b().alloc_block("after.endcase");
                     self.b().switch_to(dead);
                 }
@@ -658,11 +679,25 @@ impl<'a> Lowerer<'a> {
     /// first. Called from RETURN / RESULTIS / FINISH lowering so an
     /// early function exit still releases.
     fn emit_using_cleanups_to_function_exit(&mut self) {
-        // Clone the list so the iteration is independent of mutations
-        // (emit_release_call doesn't push or pop, but cleaner to be
-        // defensive). Innermost-last order means we iterate in
-        // reverse for innermost-first cleanup.
-        let cleanups: Vec<UsingCleanup> = self.using_cleanups.iter().rev().cloned().collect();
+        self.emit_using_cleanups_from(0);
+    }
+
+    /// Emit RELEASE for every cleanup in
+    /// `using_cleanups[start..]`, innermost-first. Used by control
+    /// transfers (BREAK / LOOP / ENDCASE) that escape some frames but
+    /// not all — `start` is the target frame's `cleanups_at_entry`.
+    /// Function-exit terminators pass `0` to fire everything.
+    fn emit_using_cleanups_from(&mut self, start: usize) {
+        // Clone the slice so iteration is independent of any mutation
+        // emit_release_call could trigger. Reverse so innermost-first
+        // (the slice ends with the innermost cleanup).
+        let cleanups: Vec<UsingCleanup> = self
+            .using_cleanups
+            .iter()
+            .skip(start)
+            .rev()
+            .cloned()
+            .collect();
         for c in cleanups {
             self.emit_release_call(&c);
         }
@@ -698,9 +733,11 @@ impl<'a> Lowerer<'a> {
         });
 
         self.b().switch_to(body_block);
+        let cleanups_at_entry = self.using_cleanups.len();
         self.b().frames.push(Frame {
             break_block: exit,
             continue_block: Some(header),
+            cleanups_at_entry,
         });
         self.lower_stmt(body);
         self.b().frames.pop();
@@ -718,9 +755,11 @@ impl<'a> Lowerer<'a> {
 
         self.b().terminate(Terminator::Branch(body_block));
         self.b().switch_to(body_block);
+        let cleanups_at_entry = self.using_cleanups.len();
         self.b().frames.push(Frame {
             break_block: exit,
             continue_block: Some(body_block),
+            cleanups_at_entry,
         });
         self.lower_stmt(body);
         self.b().frames.pop();
@@ -742,9 +781,11 @@ impl<'a> Lowerer<'a> {
         self.b().switch_to(body_block);
         // LOOP inside a do-while jumps to the test (next iteration's
         // condition); BREAK exits.
+        let cleanups_at_entry = self.using_cleanups.len();
         self.b().frames.push(Frame {
             break_block: exit,
             continue_block: Some(test),
+            cleanups_at_entry,
         });
         self.lower_stmt(body);
         self.b().frames.pop();
@@ -840,9 +881,11 @@ impl<'a> Lowerer<'a> {
         });
 
         self.b().switch_to(body_block);
+        let cleanups_at_entry = self.using_cleanups.len();
         self.b().frames.push(Frame {
             break_block: exit,
             continue_block: Some(incr),
+            cleanups_at_entry,
         });
         self.lower_stmt(body);
         self.b().frames.pop();
@@ -1018,9 +1061,11 @@ impl<'a> Lowerer<'a> {
             self.unpack_lanes(names, Value::Local(elem));
         }
 
+        let cleanups_at_entry = self.using_cleanups.len();
         self.b().frames.push(Frame {
             break_block: exit,
             continue_block: Some(incr),
+            cleanups_at_entry,
         });
         self.lower_stmt(body);
         self.b().frames.pop();
@@ -1178,9 +1223,11 @@ impl<'a> Lowerer<'a> {
             self.unpack_lanes(names, Value::Local(elem));
         }
 
+        let cleanups_at_entry = self.using_cleanups.len();
         self.b().frames.push(Frame {
             break_block: exit,
             continue_block: Some(incr),
+            cleanups_at_entry,
         });
         self.lower_stmt(body);
         self.b().frames.pop();
@@ -1320,9 +1367,11 @@ impl<'a> Lowerer<'a> {
         });
 
         // Push a SWITCHON frame so ENDCASE / BREAK target `exit`.
+        let cleanups_at_entry = self.using_cleanups.len();
         self.b().frames.push(Frame {
             break_block: exit,
             continue_block: None,
+            cleanups_at_entry,
         });
 
         // Lower each case body. If a case falls through (no terminator

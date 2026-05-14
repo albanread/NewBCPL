@@ -593,9 +593,9 @@ $)
 
 `USING name = expr DO body` binds the value of `expr` to `name` for
 the duration of `body`, then calls `name.RELEASE()` exactly once at
-scope exit. The cleanup runs whether the body falls through, executes
-`RETURN`, or hits `FINISH` — every exit from the surrounding function
-releases every still-active `USING` scope, innermost first.
+scope exit. The cleanup runs on every way out of `body` —
+fall-through, `RETURN`, `RESULTIS`, `FINISH`, `BREAK`, `LOOP`, and
+`ENDCASE` all release every USING they escape, innermost first.
 
 Nesting works the way you'd expect:
 
@@ -611,10 +611,6 @@ The `MANAGED` keyword on a class declaration is accepted but advisory
 — it documents intent ("this class should usually be inside a USING")
 without enforcing it. Plain classes work in `USING` too; any class
 with a `RELEASE` method is eligible.
-
-(Current limitation: `BREAK` and `LOOP` exiting an inner loop from
-inside a `USING` body skip the cleanup. Use `RETURN` or fall-through
-when you need the RELEASE guarantee.)
 
 ---
 
