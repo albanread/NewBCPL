@@ -421,6 +421,13 @@ fn pretty_print_stmt(stmt: &Stmt, level: usize, out: &mut String) {
                 writeln!(out, "retain {name}").unwrap();
             }
         },
+        Stmt::Using { name, value, body, .. } => {
+            writeln!(out, "using {name} =").unwrap();
+            pretty_print_expr(value, level + 1, out);
+            indent(level, out);
+            writeln!(out, "do:").unwrap();
+            pretty_print_stmt(body, level + 1, out);
+        }
     }
 }
 

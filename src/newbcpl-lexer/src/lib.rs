@@ -135,6 +135,7 @@ const KEYWORDS: &[&str] = &[
     "PUBLIC", "PRIVATE", "PROTECTED",
     "SELF", "SUPER",
     "RETAIN", "FREEVEC", "FREELIST",
+    "USING",
     "FLOAT", "TRUNC", "FIX", "FSQRT", "ENTIER",
     "FOREACH", "IN",
     "LIST", "MANIFESTLIST",

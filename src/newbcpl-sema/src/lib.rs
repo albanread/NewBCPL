@@ -647,21 +647,6 @@ impl Sema {
                             Expr::New { class_name, .. } => Some(class_name.clone()),
                             _ => None,
                         };
-                        // Manifesto §5: a non-MANAGED class capturing a
-                        // MANAGED value as a field initialiser is the
-                        // same escape problem as `non_managed.x := NEW
-                        // ManagedThing()` — flag it at the declaration
-                        // site since that's the closest source location.
-                        if !c.managed {
-                            if let Expr::New { class_name: cn, .. } = expr {
-                                if self.class_is_managed(cn) {
-                                    self.warn(
-                                        "MANAGED instance captured as field initialiser in non-MANAGED class — the holder is GC-managed and will never invoke RELEASE on the captured value (manifesto §5)",
-                                        expr.span(),
-                                    );
-                                }
-                            }
-                        }
                         fields.push(ClassFieldInfo {
                             name: name.clone(),
                             hint: literal_hint(expr),
@@ -842,18 +827,6 @@ impl Sema {
                         class_name = Some(annotated_class);
                     }
                 }
-            }
-            // Manifesto §5: a MANAGED instance cannot be aliased.
-            // A bare `NEW Foo()` is the original construction and is
-            // fine; anything else that resolves to a MANAGED value
-            // (an Ident referring to an existing MANAGED binding, a
-            // method call returning MANAGED, …) creates a second
-            // binding with shared ownership and is flagged.
-            if !matches!(expr, Expr::New { .. }) && self.expr_is_managed(expr) {
-                self.warn(
-                    "MANAGED instance cannot be aliased — this binding shares ownership with the source (manifesto §5)",
-                    expr.span(),
-                );
             }
             self.declare(name, hint, class_name, l.span);
         }
@@ -1203,6 +1176,23 @@ impl Sema {
                 let class_name = self.class_name_of(v);
                 self.declare(name, hint, class_name, *span);
             }
+            Stmt::Using {
+                name,
+                value,
+                body,
+                span,
+            } => {
+                let hint = self.type_of(value);
+                let class_name = self.class_name_of(value);
+                // The USING binding is visible only inside `body`,
+                // mirroring how `LET x = ...` inside a block scopes
+                // to that block. We push a scope so the name doesn't
+                // leak.
+                self.push_scope();
+                self.declare(name, hint, class_name, *span);
+                self.analyze_stmt(body);
+                self.pop_scope();
+            }
             Stmt::Break(span) => {
                 if self.loop_depth == 0 {
                     self.warn("BREAK outside any loop body — has no effect", *span);
@@ -1257,62 +1247,11 @@ impl Sema {
             // `outer.inner.method()` once codegen consumes
             // ClassFieldInfo::class_name through layouts.
             self.back_fill_field_class_from_self_assign(t, v);
-            // Manifesto §5, capture form: a MANAGED instance stored
-            // into a non-MANAGED's field would outlive its original
-            // scope — the holder is GC-collected and never invokes
-            // RELEASE on the captured MANAGED. Warn whether the RHS is
-            // a fresh `NEW` or an aliased binding; the alias check
-            // below only catches the aliased case.
-            if self.is_non_managed_field_capture(t, v) {
-                self.warn(
-                    "MANAGED instance stored in non-MANAGED field — the holder is GC-managed and will never invoke RELEASE on the captured value (manifesto §5)",
-                    v.span(),
-                );
-            }
-            // Manifesto §5: MANAGED instance assignment-aliasing.
-            // A fresh NEW is fine (transfer of ownership into the
-            // target slot). An existing MANAGED binding being copied
-            // to another binding is the alias case we want to catch.
-            if !matches!(v, Expr::New { .. }) && self.expr_is_managed(v) {
-                self.warn(
-                    "MANAGED instance cannot be aliased via assignment — RHS would share ownership with the source (manifesto §5)",
-                    v.span(),
-                );
-            }
         }
     }
 
     /// True when an assignment `obj.field := value` would store a
     /// MANAGED instance into a non-MANAGED holder's field. Both the
-    /// `NEW Window`-on-the-RHS form and the aliased-binding form are
-    /// flagged; storing into a *MANAGED* holder's field is fine
-    /// because RELEASE chains.
-    fn is_non_managed_field_capture(&self, target: &Expr, value: &Expr) -> bool {
-        let Expr::Binary {
-            op: BinaryOp::Dot,
-            lhs,
-            ..
-        } = target
-        else {
-            return false;
-        };
-        // Receiver class must be known and not MANAGED. SELF inside a
-        // MANAGED class's method has its receiver_class set to the
-        // MANAGED class, so this naturally skips that case.
-        let Some(receiver_class) = self.class_of_expr(lhs) else {
-            return false;
-        };
-        if self.class_is_managed(&receiver_class) {
-            return false;
-        }
-        // Value must be MANAGED — either a binding that was created
-        // MANAGED, or a fresh `NEW ManagedClass(...)`.
-        match value {
-            Expr::New { class_name, .. } => self.class_is_managed(class_name),
-            _ => self.expr_is_managed(value),
-        }
-    }
-
     /// If `target` is `SELF.field` and `value` has a known class
     /// identity, write that class onto the field's `ClassFieldInfo`
     /// (and the parallel `class_log` entry sema uses for dump-sema).
@@ -1599,19 +1538,6 @@ impl Sema {
             Expr::TypedConstruct { kind, args, .. } => {
                 for a in args {
                     let _ = self.type_of(a);
-                    // Manifesto §5: MANAGED instances cannot be
-                    // stored in a container — their lifetime would
-                    // escape the original scope and the deterministic
-                    // RELEASE on scope-exit guarantee would be lost.
-                    if self.expr_is_managed(a) {
-                        self.warn(
-                            format!(
-                                "MANAGED instance stored in {} — ownership would escape the original scope (manifesto §5)",
-                                kind.as_str()
-                            ),
-                            a.span(),
-                        );
-                    }
                 }
                 match kind {
                     TypeConstructorKind::Vec => TypeHint::Vec,
@@ -2347,163 +2273,14 @@ mod tests {
         assert_eq!(callee.hint(), TypeHint::Function);
     }
 
-    // ─── MANAGED linear-type checks (manifesto §5) ─────────────
-
-    #[test]
-    fn fresh_new_managed_is_fine() {
-        let out = analyze_str(
-            "CLASS Window MANAGED $( DECL h $)\nLET S() BE { LET w = NEW Window }",
-        );
-        assert_eq!(warning_count_matching(&out, "MANAGED"), 0);
-    }
-
-    #[test]
-    fn aliasing_managed_via_let_warns() {
-        let out = analyze_str(
-            "CLASS Window MANAGED $( DECL h $)\nLET S() BE {\n LET a = NEW Window\n LET b = a\n}",
-        );
-        assert_eq!(warning_count_matching(&out, "cannot be aliased"), 1);
-    }
-
-    #[test]
-    fn aliasing_managed_via_assign_warns() {
-        let out = analyze_str(
-            "CLASS Window MANAGED $( DECL h $)\nLET S() BE {\n LET a = NEW Window\n LET b = ?\n b := a\n}",
-        );
-        assert_eq!(
-            warning_count_matching(&out, "aliased via assignment"),
-            1,
-            "expected aliased-via-assignment warning, got: {:?}",
-            out.warnings
-        );
-    }
-
-    #[test]
-    fn chained_alias_propagates_through_idents() {
-        // `c = b` should also warn — b carries the managed class
-        // through `class_name_of`'s Ident propagation.
-        let out = analyze_str(
-            "CLASS Window MANAGED $( DECL h $)\nLET S() BE {\n LET a = NEW Window\n LET b = a\n LET c = b\n}",
-        );
-        // Two LETs that copy, two warnings.
-        assert_eq!(warning_count_matching(&out, "cannot be aliased"), 2);
-    }
-
-    #[test]
-    fn managed_in_list_warns() {
-        let out = analyze_str(
-            "CLASS Window MANAGED $( DECL h $)\nLET S() BE {\n LET a = NEW Window\n LET xs = LIST(a)\n}",
-        );
-        assert_eq!(
-            warning_count_matching(&out, "stored in LIST"),
-            1,
-            "expected LIST-storage warning, got: {:?}",
-            out.warnings
-        );
-    }
-
-    #[test]
-    fn managed_in_pair_warns() {
-        let out = analyze_str(
-            "CLASS Window MANAGED $( DECL h $)\nLET S() BE {\n LET a = NEW Window\n LET p = PAIR(a, a)\n}",
-        );
-        // Two args, both aliased uses of `a` — two storage warnings,
-        // plus PAIR's intrinsic check stamps two warnings.
-        assert!(
-            warning_count_matching(&out, "stored in PAIR") >= 1,
-            "expected PAIR-storage warning, got: {:?}",
-            out.warnings
-        );
-    }
-
-    #[test]
-    fn ordinary_class_not_flagged_in_container() {
-        // Plain (non-MANAGED) classes can be stored anywhere — the
-        // GC handles their lifetime.
-        let out = analyze_str(
-            "CLASS Point $( DECL x $)\nLET S() BE {\n LET p = NEW Point\n LET xs = LIST(p)\n}",
-        );
-        assert_eq!(warning_count_matching(&out, "MANAGED"), 0);
-    }
-
-    #[test]
-    fn fresh_managed_into_non_managed_field_warns() {
-        // `p.x := NEW Window` — Point is not MANAGED, so when its GC
-        // cycle reclaims it, the Window's RELEASE will never run. The
-        // existing alias check skips fresh-NEW RHSs; the field-capture
-        // check catches them.
-        let out = analyze_str(
-            "CLASS Window MANAGED $( DECL h $)\nCLASS Point $( DECL x $)\nLET S() BE {\n LET p = NEW Point\n p.x := NEW Window\n}",
-        );
-        assert!(
-            warning_count_matching(&out, "stored in non-MANAGED field") >= 1,
-            "expected field-capture warning, got: {:?}",
-            out.warnings
-        );
-    }
-
-    #[test]
-    fn managed_var_into_non_managed_field_warns() {
-        // Aliased form — a previously-bound MANAGED stored into a
-        // non-MANAGED's field. Already covered by the alias check, but
-        // pin it here so future refactors don't regress the more
-        // specific signal.
-        let out = analyze_str(
-            "CLASS Window MANAGED $( DECL h $)\nCLASS Point $( DECL x $)\nLET S() BE {\n LET w = NEW Window\n LET p = NEW Point\n p.x := w\n}",
-        );
-        // At least one MANAGED warning fires (alias or capture).
-        assert!(
-            warning_count_matching(&out, "MANAGED") >= 1,
-            "expected MANAGED warning, got: {:?}",
-            out.warnings
-        );
-    }
-
-    #[test]
-    fn managed_field_initialiser_in_non_managed_class_warns() {
-        // `LET held = NEW Window` inside a plain `CLASS Holder $(...)$`
-        // — the holder is GC-managed and never invokes RELEASE on the
-        // Window. Flag at the declaration site.
-        let out = analyze_str(
-            "CLASS Window MANAGED $( DECL h $)\nCLASS Holder $( LET held = NEW Window $)",
-        );
-        assert!(
-            warning_count_matching(&out, "captured as field initialiser") >= 1,
-            "expected field-initialiser capture warning, got: {:?}",
-            out.warnings
-        );
-    }
-
-    #[test]
-    fn managed_field_initialiser_in_managed_class_is_fine() {
-        // A MANAGED holder's field initialiser captures into the
-        // owner's RELEASE chain — no warning.
-        let out = analyze_str(
-            "CLASS Window MANAGED $( DECL h $)\nCLASS Frame MANAGED $( LET win = NEW Window $)",
-        );
-        assert_eq!(
-            warning_count_matching(&out, "captured as field initialiser"),
-            0,
-            "did not expect capture warning for MANAGED holder, got: {:?}",
-            out.warnings
-        );
-    }
-
-    #[test]
-    fn managed_into_managed_field_is_fine() {
-        // Storing a MANAGED into another MANAGED's field is OK: the
-        // outer's RELEASE chains, deterministic destruction is
-        // preserved. No warning expected.
-        let out = analyze_str(
-            "CLASS Window MANAGED $( DECL h $)\nCLASS Frame MANAGED $( DECL win $)\nLET S() BE {\n LET f = NEW Frame\n f.win := NEW Window\n}",
-        );
-        assert_eq!(
-            warning_count_matching(&out, "stored in non-MANAGED field"),
-            0,
-            "did not expect non-managed-field warning, got: {:?}",
-            out.warnings
-        );
-    }
+    // ─── MANAGED keyword (advisory only post-USING) ────────────
+    //
+    // The linearity / no-aliasing / no-capture checks that used to
+    // live here were retired when `USING name = expr DO body` landed.
+    // The keyword still parses, the class still flags `managed` in
+    // its layout, but sema no longer emits warnings for aliasing or
+    // container capture — the deterministic-cleanup story is now at
+    // the use site (`USING`) rather than the declaration site.
 
     #[test]
     fn binding_info_records_is_managed_flag() {

@@ -562,31 +562,59 @@ A `FINAL` method may not be overridden. Visibility headers `PUBLIC:`,
 `PRIVATE:`, and `PROTECTED:` switch the access level of subsequent
 members until the next header; the default is `PUBLIC`.
 
-### 4.2 Managed Classes
+### 4.2 Deterministic Cleanup with `USING`
 
-A `MANAGED` class is for resources that require *deterministic*
-release: file handles, OS windows, GPU buffers. The compiler enforces
-linear use — no aliasing, no storage in lists or fields — and inserts
-a `RELEASE` call when the binding leaves its scope.
+The garbage collector handles ordinary memory: an unreachable object's
+storage is reclaimed at some later collect, and if the class defines
+a `RELEASE` method the collector runs it as a finaliser. That suffices
+for things like windows where "released a moment later" is fine.
+
+For resources where ordering matters — file handles, locks,
+transactions, prepared statements — `RELEASE` needs to run *now*, not
+whenever the GC next runs. The construct for that is `USING`:
 
 ```bcpl
-CLASS WindowHandle MANAGED $(
-    DECL hwnd
+CLASS File $(
+    DECL handle
 
-    ROUTINE CREATE(title) BE $( hwnd := iGui_OpenChild(title) $)
-    ROUTINE RELEASE() BE $( iGui_CloseChild(hwnd) $)
+    ROUTINE CREATE(path) BE $( handle := host_open(path) $)
+    ROUTINE RELEASE()    BE $( host_close(handle) $)
+
+    ROUTINE writeLine(s) BE $( host_write(handle, s) $)
 $)
 
 LET render() BE $(
-    LET w = NEW WindowHandle("Preview")
-    paint(w)
-    // w.RELEASE() runs here, at scope exit
+    USING f = NEW File("log.txt") DO $(
+        f.writeLine("hello")
+    $)
+    // f.RELEASE() has already run here.
 $)
 ```
 
-For ordinary classes there is no `RELEASE` ceremony. The garbage
-collector reclaims unreachable instances; if a class supplies a
-`RELEASE` method it is run as a best-effort finaliser.
+`USING name = expr DO body` binds the value of `expr` to `name` for
+the duration of `body`, then calls `name.RELEASE()` exactly once at
+scope exit. The cleanup runs whether the body falls through, executes
+`RETURN`, or hits `FINISH` — every exit from the surrounding function
+releases every still-active `USING` scope, innermost first.
+
+Nesting works the way you'd expect:
+
+```bcpl
+USING tx = NEW Transaction(db) DO
+    USING stmt = tx.prepare("INSERT INTO …") DO
+        stmt.bind(args)
+// stmt.RELEASE() runs first, then tx.RELEASE(); both before falling
+// out of the surrounding scope.
+```
+
+The `MANAGED` keyword on a class declaration is accepted but advisory
+— it documents intent ("this class should usually be inside a USING")
+without enforcing it. Plain classes work in `USING` too; any class
+with a `RELEASE` method is eligible.
+
+(Current limitation: `BREAK` and `LOOP` exiting an inner loop from
+inside a `USING` body skip the cleanup. Use `RETURN` or fall-through
+when you need the RELEASE guarantee.)
 
 ---
 
@@ -779,7 +807,7 @@ used as variable names.
     VIRTUAL   FINAL   MANAGED
     PUBLIC   PRIVATE   PROTECTED
     SELF   SUPER
-    RETAIN   FREEVEC   FREELIST
+    RETAIN   FREEVEC   FREELIST   USING
     FLOAT   TRUNC   FIX   FSQRT   ENTIER
     FOREACH   IN
     LIST   MANIFESTLIST
@@ -831,6 +859,7 @@ stmt           ::= block
                  | "BREAK"   | "LOOP"   | "ENDCASE"   | "BRK"
                  | "GOTO" name | name ":"
                  | "RETAIN" name ("=" expr)?
+                 | "USING" name "=" expr ("DO"|"THEN")? stmt
                  | lvalue ("," lvalue)* ":=" expr ("," expr)*
                  | expr
                  | stmt "REPEAT"

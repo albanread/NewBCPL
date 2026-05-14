@@ -24,11 +24,26 @@ End-to-end pipeline. Source → lex → parse → sema → IR → LLVM emit → 
 
 The reference 857-file corpus (`reference/tests/bcl_tests/`) is still a moving target — pass count there is a coverage signal, not a regression gate.
 
+### Resource cleanup
+
+The deterministic-cleanup story is `USING name = expr DO body`, which
+binds `name` for the body, then calls `name.RELEASE()` at scope exit.
+Cleanup runs on fall-through and on `RETURN` / `RESULTIS` / `FINISH`
+(innermost-first, so nested USINGs release in stack order). This
+replaces the earlier MANAGED linear-type design — the GC handles the
+"don't leak" half, USING handles the "release in order" half. The
+`MANAGED` keyword still parses for backward compatibility but is
+advisory now: any class with a `RELEASE` method works in a USING
+block.
+
 ### Known gaps
 
-- ORC v2 alongside MCJIT, in step with NewCP's migration.
-- `MANAGED` linear-type checks cover the storage-escape surface (aliasing via `LET` / `:=`, container capture in LIST / PAIR / VEC, field capture in non-MANAGED holders). Still soft warnings only — sema never rejects. Argument-passing and function-return forms of escape are not yet flagged.
-- (Nothing language-side currently on the short list — the manifesto's surface is implemented end-to-end. Recent gaps: ORC v2 backend, MANAGED argument-passing/return-escape diagnostics, the residual newbcpl-runtime parallel-test teardown crash.)
+- ORC v2 alongside MCJIT — a separate backend, parked.
+- `BREAK` / `LOOP` exiting a loop from inside a `USING` body skip the
+  cleanup. Use `RETURN` or fall-through when the RELEASE guarantee
+  matters. Closing the gap needs a per-loop cleanup walk on transfer.
+- Rare `STATUS_ACCESS_VIOLATION` on `newbcpl-runtime` test-process
+  teardown (a static-destructor ordering issue, not a test-time race).
 
 ## Workspace layout
 

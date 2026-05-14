@@ -380,6 +380,20 @@ pub enum Stmt {
         value: Option<Expr>,
         span: Span,
     },
+    /// `USING name = expr DO stmt` — scope-deterministic resource form.
+    /// Binds `name` to the value of `expr`, runs `body`, and then calls
+    /// `name.RELEASE()` exactly once at scope exit. Mirrors Python's
+    /// `with`, C#'s `using`, Java's try-with-resources. RELEASE runs
+    /// on fall-through and on `RETURN` / `RESULTIS` / `FINISH` exits
+    /// from within `body`; cleanup-around-`BREAK`/`LOOP` is a
+    /// follow-up (today they bypass it — sema warns when it sees one
+    /// inside a USING body).
+    Using {
+        name: String,
+        value: Expr,
+        body: Box<Stmt>,
+        span: Span,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -737,7 +751,8 @@ impl Stmt {
             | Stmt::Brk(s) => *s,
             Stmt::Goto { span, .. }
             | Stmt::Label { span, .. }
-            | Stmt::Retain { span, .. } => *span,
+            | Stmt::Retain { span, .. }
+            | Stmt::Using { span, .. } => *span,
         }
     }
 }

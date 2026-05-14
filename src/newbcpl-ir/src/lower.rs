@@ -16,7 +16,8 @@ use std::collections::HashMap;
 
 use newbcpl_parser::{
     BinaryOp, Block, ClassDecl, ClassMemberKind, ClassMethod, ClassMethodBody, Decl, Expr,
-    FunctionDecl, LetDecl, Program, RoutineDecl, Stmt, SwitchCase, TypeConstructorKind, UnaryOp,
+    FunctionDecl, LetDecl, Program, RoutineDecl, Span, Stmt, SwitchCase, TypeConstructorKind,
+    UnaryOp,
 };
 use newbcpl_sema::{ClassLayout, SemaOutput, TypeHint};
 
@@ -57,6 +58,21 @@ struct Lowerer<'a> {
     /// SELF-relative field accesses, and lets `class_name_of_expr`
     /// recognise SELF and SUPER as having the surrounding class.
     current_class: Option<String>,
+    /// Stack of active USING cleanups, innermost last. Each entry
+    /// records what to call on scope exit. Function-exit terminators
+    /// (RETURN / RESULTIS / FINISH) walk this stack and emit a
+    /// RELEASE method call for every active scope they're escaping.
+    /// Fall-through cleanup is handled by the USING statement itself
+    /// without consulting this stack. BREAK / LOOP do not currently
+    /// fire cleanups; this is a known v1 limitation.
+    using_cleanups: Vec<UsingCleanup>,
+}
+
+#[derive(Debug, Clone)]
+struct UsingCleanup {
+    name: String,
+    class_name: String,
+    span: Span,
 }
 
 /// Per-function state during lowering.
@@ -283,6 +299,7 @@ impl<'a> Lowerer<'a> {
             layouts,
             manifests,
             current_class: None,
+            using_cleanups: Vec::new(),
         }
     }
 
@@ -433,6 +450,8 @@ impl<'a> Lowerer<'a> {
                     // value. Treat as null/zero.
                     Some(Value::Const(Const::Int(0)))
                 };
+                // RELEASE every active USING binding before exiting.
+                self.emit_using_cleanups_to_function_exit();
                 self.b().terminate(Terminator::Return(ret_value));
                 let dead = self.b().alloc_block("after.return");
                 self.b().switch_to(dead);
@@ -443,7 +462,12 @@ impl<'a> Lowerer<'a> {
                     // RESULTIS inside a VALOF: stash the value in
                     // the result slot and branch to the VALOF's
                     // exit block. Subsequent statements lower into
-                    // a fresh dead block.
+                    // a fresh dead block. We don't run USING cleanups
+                    // here because RESULTIS-inside-VALOF stays in the
+                    // same function frame; the USING in question is
+                    // either inside the VALOF body (cleaned by the
+                    // structural fall-through path) or outside it
+                    // (still live afterwards).
                     self.b().emit(Instr::Store {
                         slot: frame.result_slot,
                         value,
@@ -452,14 +476,15 @@ impl<'a> Lowerer<'a> {
                         .terminate(Terminator::Branch(frame.exit_block));
                 } else {
                     // Fallback: outside any VALOF, treat RESULTIS
-                    // like a function-return. Sema has already
-                    // warned about this shape.
+                    // like a function-return — release everything.
+                    self.emit_using_cleanups_to_function_exit();
                     self.b().terminate(Terminator::Return(Some(value)));
                 }
                 let dead = self.b().alloc_block("after.resultis");
                 self.b().switch_to(dead);
             }
             Stmt::Finish(_) => {
+                self.emit_using_cleanups_to_function_exit();
                 self.b().terminate(Terminator::Return(None));
                 let dead = self.b().alloc_block("after.finish");
                 self.b().switch_to(dead);
@@ -535,9 +560,111 @@ impl<'a> Lowerer<'a> {
                 }
                 self.b().switch_to(target);
             }
+            Stmt::Using {
+                name,
+                value,
+                body,
+                span,
+            } => self.lower_using(name, value, body, *span),
             // SWITCHON / FOREACH / labels / RETAIN etc. — subsequent
             // IR-grow chunks lower these.
             _ => {}
+        }
+    }
+
+    /// Lower `USING name = expr DO body` as:
+    ///
+    ///   LET name = expr       (alloca + Store + declare_local)
+    ///   <body>
+    ///   name.RELEASE()        (synthesised method call)
+    ///
+    /// Plus a cleanup record on `self.using_cleanups` while body is
+    /// being lowered — function-exit terminators (RETURN / RESULTIS /
+    /// FINISH) consult that stack so an early exit still releases
+    /// every active scope. The cleanup record is popped before the
+    /// fall-through RELEASE so we don't double-fire.
+    fn lower_using(&mut self, name: &str, value: &Expr, body: &Stmt, span: Span) {
+        // Resolve the value's class up front — the receiver of the
+        // synthesised RELEASE call needs it. If we can't determine
+        // the class (sema couldn't see through the expression), the
+        // RELEASE call has no vtable slot to dispatch through and
+        // we emit the binding without cleanup. Sema's job to warn.
+        let class_name = self.class_name_of_expr(value);
+        let v = self.lower_expr(value);
+        let slot_hint = value.hint();
+        let slot = self.b().alloca(name, slot_hint);
+        self.b().emit(Instr::Store { slot, value: v });
+        self.b().declare_local(name, slot, class_name.clone());
+
+        let cleanup = class_name.map(|class_name| UsingCleanup {
+            name: name.to_string(),
+            class_name,
+            span,
+        });
+        if let Some(c) = cleanup.clone() {
+            self.using_cleanups.push(c);
+        }
+        self.lower_stmt(body);
+        if cleanup.is_some() {
+            self.using_cleanups.pop();
+        }
+        // Fall-through cleanup: only emit if the body did not already
+        // terminate the block (e.g. through RETURN). `current_open()`
+        // distinguishes a still-live insertion point from a dead one.
+        if let Some(c) = cleanup {
+            if self.b().current_open() {
+                self.emit_release_call(&c);
+            }
+        }
+    }
+
+    /// Synthesise `name.RELEASE()` as an IR method call. Mirrors
+    /// what `lower_call` would emit for an explicit source-level call.
+    fn emit_release_call(&mut self, cleanup: &UsingCleanup) {
+        let Some(slot_hint_slot) = self.b().lookup_local_slot(&cleanup.name) else {
+            return;
+        };
+        // Load the binding's current value (the heap pointer) and
+        // dispatch RELEASE through the class's vtable. Slot 1 is the
+        // reserved RELEASE slot; classes without an explicit RELEASE
+        // get the runtime's no-op default-method stub bound there at
+        // module-load time, so this is always safe.
+        let receiver_value = {
+            let dst = self.b().alloc_value();
+            self.b().emit(Instr::Load {
+                dst,
+                slot: slot_hint_slot,
+                hint: TypeHint::Object,
+            });
+            Value::Local(dst)
+        };
+        let Some(slot) = self.lookup_method_slot(&cleanup.class_name, "RELEASE") else {
+            return;
+        };
+        let dst = self.b().alloc_value();
+        self.b().emit(Instr::MethodCall {
+            dst: Some(dst),
+            receiver: receiver_value,
+            class_name: cleanup.class_name.clone(),
+            vtable_slot: slot,
+            method_name: "RELEASE".to_string(),
+            args: Vec::new(),
+            hint: TypeHint::Word,
+        });
+        let _ = cleanup.span;
+    }
+
+    /// Emit RELEASE calls for every active USING scope, innermost
+    /// first. Called from RETURN / RESULTIS / FINISH lowering so an
+    /// early function exit still releases.
+    fn emit_using_cleanups_to_function_exit(&mut self) {
+        // Clone the list so the iteration is independent of mutations
+        // (emit_release_call doesn't push or pop, but cleaner to be
+        // defensive). Innermost-last order means we iterate in
+        // reverse for innermost-first cleanup.
+        let cleanups: Vec<UsingCleanup> = self.using_cleanups.iter().rev().cloned().collect();
+        for c in cleanups {
+            self.emit_release_call(&c);
         }
     }
 

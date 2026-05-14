@@ -265,6 +265,75 @@ fn chain_via_as_class_annotation() {
     );
 }
 
+// ─── USING (scope-deterministic RELEASE) ─────────────────────────
+//
+// `USING name = expr DO body` binds the value of `expr` to `name`,
+// runs `body`, and then calls `name.RELEASE()` at scope exit. This
+// replaces the linear-type MANAGED machinery from earlier in the
+// project history. The probes here pin the surface behaviour:
+//
+//   - fall-through cleanup runs the RELEASE method,
+//   - RETURN / RESULTIS / FINISH from inside the body still release,
+//   - nested USINGs release innermost-first,
+//   - a method call on the binding inside the body sees the right
+//     receiver class.
+
+#[test]
+fn using_fall_through_runs_release() {
+    // RELEASE is called when the body falls off the end. Visible
+    // because the RELEASE method prints a marker the test asserts on.
+    expect(
+        "using_fall_through_runs_release",
+        "CLASS R $(\n  ROUTINE CREATE() BE WRITES(\"open*N\")\n  ROUTINE RELEASE() BE WRITES(\"close*N\")\n$)\nLET START() BE $(\n  USING r = NEW R DO WRITES(\"work*N\")\n  WRITES(\"after*N\")\n$)\n",
+        "open\nwork\nclose\nafter\n",
+    );
+}
+
+#[test]
+fn using_release_runs_before_early_return() {
+    // A RETURN from inside the body must still close the resource.
+    // The expected output ends with `close` from RELEASE, then nothing
+    // — `after` would only print on fall-through.
+    expect(
+        "using_release_runs_before_early_return",
+        "CLASS R $(\n  ROUTINE CREATE() BE WRITES(\"open*N\")\n  ROUTINE RELEASE() BE WRITES(\"close*N\")\n$)\nLET START() BE $(\n  USING r = NEW R DO $(\n    WRITES(\"work*N\")\n    RETURN\n  $)\n  WRITES(\"after*N\")\n$)\n",
+        "open\nwork\nclose\n",
+    );
+}
+
+#[test]
+fn using_release_runs_before_finish() {
+    // FINISH terminates the program; cleanup still runs first so the
+    // user sees `close` before the program exits.
+    expect(
+        "using_release_runs_before_finish",
+        "CLASS R $(\n  ROUTINE CREATE() BE WRITES(\"open*N\")\n  ROUTINE RELEASE() BE WRITES(\"close*N\")\n$)\nLET START() BE $(\n  USING r = NEW R DO $(\n    WRITES(\"work*N\")\n    FINISH\n  $)\n$)\n",
+        "open\nwork\nclose\n",
+    );
+}
+
+#[test]
+fn nested_using_releases_innermost_first() {
+    // Two nested USINGs: the inner resource is closed before the
+    // outer one. Mirrors how Python's `with` / C#'s `using` nest.
+    expect(
+        "nested_using_releases_innermost_first",
+        "CLASS A $(\n  ROUTINE CREATE() BE WRITES(\"open-A*N\")\n  ROUTINE RELEASE() BE WRITES(\"close-A*N\")\n$)\nCLASS B $(\n  ROUTINE CREATE() BE WRITES(\"open-B*N\")\n  ROUTINE RELEASE() BE WRITES(\"close-B*N\")\n$)\nLET START() BE $(\n  USING a = NEW A DO\n    USING b = NEW B DO\n      WRITES(\"work*N\")\n$)\n",
+        "open-A\nopen-B\nwork\nclose-B\nclose-A\n",
+    );
+}
+
+#[test]
+fn using_binding_supports_method_calls_in_body() {
+    // The USING binding is just a normal local — methods on it work,
+    // class identity propagates, and RELEASE fires on exit.
+    expect(
+        "using_binding_supports_method_calls_in_body",
+        "CLASS R $(\n  DECL x\n  ROUTINE CREATE(v) BE SELF.x := v\n  FUNCTION value() = SELF.x\n  ROUTINE RELEASE() BE $( $)\n$)\nLET START() BE $(\n  USING r = NEW R(42) DO WRITEN(r.value())\n$)\n",
+        "42",
+    );
+}
+
 // ─── Two-field accessors / setters ────────────────────────────────
 
 #[test]

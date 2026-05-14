@@ -1154,6 +1154,34 @@ impl Parser {
                 },
             });
         }
+        if self.check_kw("USING") {
+            // `USING name = expr DO stmt`
+            // Scope-deterministic resource form. The RELEASE method
+            // on the bound value is called at scope exit; this binds
+            // tightly enough to read like an ordinary statement
+            // declarator, no `BE` ceremony required.
+            let kw = self.eat();
+            let name_tok = self.eat_identifier()?;
+            self.expect_sym("=")?;
+            let value = self.parse_expr()?;
+            // `DO` is the keyword between expression and body. We
+            // accept `THEN` too for symmetry with the rest of the
+            // language, but `DO` is the documented spelling.
+            if self.check_kw("DO") || self.check_kw("THEN") {
+                self.eat();
+            }
+            let body = self.parse_stmt()?;
+            let end = body.span().end;
+            return Ok(Stmt::Using {
+                name: name_tok.lexeme,
+                value,
+                body: Box::new(body),
+                span: SourceSpan {
+                    start: kw.span.start,
+                    end,
+                },
+            });
+        }
 
         // Expression-or-assignment fall-through.
         let first = self.parse_expr()?;
