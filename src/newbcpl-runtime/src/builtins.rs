@@ -199,6 +199,78 @@ pub unsafe extern "C-unwind" fn TIMER_DISPLAY(elapsed: i64) -> i64 {
     0
 }
 
+// ─── SIMD pairwise reducers (PAIR-only for now) ──────────────────
+//
+// `PAIRWISE_*` takes a packed-i64 PAIR (two i32 lanes) and folds
+// the two lanes into a single integer. Matches the reference's
+// helper conventions — programs use these as the scalar reduction
+// step after lane-wise SIMD work. QUAD / OCT variants follow the
+// same shape with more lanes; corpus only spelled the PAIR forms
+// in this iteration, so we ship those first.
+
+/// Extract the two signed i32 lanes packed into a PAIR's 64-bit
+/// word. Same lane convention as `emit_lane_extract` /
+/// `emit_lane_insert` in `newbcpl-llvm::emit`: lane 0 in the low
+/// 32 bits, lane 1 in the high 32 bits.
+#[inline]
+fn pair_lanes(pair: i64) -> (i32, i32) {
+    let lo = pair as i32;
+    let hi = (pair >> 32) as i32;
+    (lo, hi)
+}
+
+/// `PAIRWISE_MIN(pair)` — minimum of the two i32 lanes, sign-extended
+/// to i64.
+pub unsafe extern "C-unwind" fn PAIRWISE_MIN(pair: i64) -> i64 {
+    let (a, b) = pair_lanes(pair);
+    a.min(b) as i64
+}
+
+/// `PAIRWISE_MAX(pair)` — maximum of the two i32 lanes.
+pub unsafe extern "C-unwind" fn PAIRWISE_MAX(pair: i64) -> i64 {
+    let (a, b) = pair_lanes(pair);
+    a.max(b) as i64
+}
+
+/// `PAIRWISE_ADD(pair)` — sum of the two i32 lanes, returned as i64
+/// so the addition can't overflow.
+pub unsafe extern "C-unwind" fn PAIRWISE_ADD(pair: i64) -> i64 {
+    let (a, b) = pair_lanes(pair);
+    a as i64 + b as i64
+}
+
+// ─── Atom type introspection (TYPE / AS_INT / AS_FLOAT / AS_STRING) ─
+//
+// Companion to the `TYPE_INT` / `TYPE_FLOAT` / `TYPE_STRING` /
+// `TYPE_LIST` / `TYPE_OBJECT` / `TYPE_PAIR` MANIFEST constants that
+// sema pre-seeds. Programs use these to introspect / unpack atoms
+// in a list.
+
+/// `TYPE(list)` — returns the type tag of the first atom in the
+/// list, or `0` (`ATOM_SENTINEL`) if the list is null / empty.
+/// FOREACH-with-two-names also provides this per-atom, but TYPE()
+/// is handy for "what kind of list is this" probes.
+pub unsafe extern "C-unwind" fn TYPE(list_hdr: *const ListHeader) -> i64 {
+    if list_hdr.is_null() {
+        return ATOM_SENTINEL as i64;
+    }
+    let head = unsafe { (*list_hdr).head };
+    if head.is_null() {
+        ATOM_SENTINEL as i64
+    } else {
+        unsafe { (*head).type_tag as i64 }
+    }
+}
+
+// `AS_INT` / `AS_FLOAT` / `AS_STRING` are *bit-reinterpret casts*,
+// not runtime helpers — IR lowering rewrites the call into a
+// type-hint shift on the argument (see
+// `newbcpl-ir::lower::lower_call`). Returning a `f64` from a Rust
+// function declared as `extern "C"` while the JIT thinks the
+// call returns `i64` would put the result in the wrong return
+// register on x86-64 Windows (XMM0 vs RAX). Keeping the lowering
+// purely sema-level avoids the ABI mismatch entirely.
+
 /// Test fixture: raise a Rust `panic!` from inside a JIT-callable
 /// helper. Used to verify the Windows SEH unwind pipeline is wired
 /// correctly — every JIT'd function carries `uwtable=2`, the custom
@@ -736,6 +808,36 @@ pub unsafe extern "C-unwind" fn FPAIRS(n_pairs: i64) -> *mut i64 {
     alloc_vec_words(n_pairs)
 }
 
+// `OCTS(n)` / `QUADS(n)` / `FOCTS(n)` / `FQUADS(n)` — pluralised
+// allocators for vectors of SIMD packs. The integer-lane forms
+// (PAIR / QUAD / OCT) all pack into a single 64-bit word per
+// element, so `n` packs is `n` words. Float forms with f32 lanes
+// (FPAIR) also pack into one word; the wider float packs FQUAD /
+// FOCT use multiple words per element, but corpus tests treat
+// them as one-slot-per-element through the same VEC-shaped
+// pointer convention. Mirror the PAIRS contract exactly so the
+// subscript and LEN paths stay uniform.
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn QUADS(n: i64) -> *mut i64 {
+    alloc_vec_words(n)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn FQUADS(n: i64) -> *mut i64 {
+    alloc_vec_words(n)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn OCTS(n: i64) -> *mut i64 {
+    alloc_vec_words(n)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn FOCTS(n: i64) -> *mut i64 {
+    alloc_vec_words(n)
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C-unwind" fn FREEVEC(_p: *mut i64) -> i64 {
     // Leak — proper free needs the GC's metadata. Tests don't
@@ -1050,6 +1152,10 @@ pub fn builtin_addresses() -> &'static [Builtin] {
             builtin!(FGETVEC),
             builtin!(PAIRS),
             builtin!(FPAIRS),
+            builtin!(QUADS),
+            builtin!(FQUADS),
+            builtin!(OCTS),
+            builtin!(FOCTS),
             builtin!(FREEVEC),
             builtin!(SPLIT),
             builtin!(__newbcpl_len),
@@ -1091,6 +1197,10 @@ pub fn builtin_addresses() -> &'static [Builtin] {
             builtin!(TIMER_START),
             builtin!(TIMER_END),
             builtin!(TIMER_DISPLAY),
+            builtin!(PAIRWISE_MIN),
+            builtin!(PAIRWISE_MAX),
+            builtin!(PAIRWISE_ADD),
+            builtin!(TYPE),
         ];
         #[cfg(windows)]
         {

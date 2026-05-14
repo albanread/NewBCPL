@@ -600,7 +600,30 @@ impl Sema {
         );
     }
 
+    /// Built-in MANIFEST constants that sema pre-seeds before
+    /// analysing the program. Used for atom-type tags (`TYPE_INT`,
+    /// `TYPE_STRING`, …) so SWITCHON case labels resolve to integer
+    /// literals — code can't write `CASE atom_type:` against a
+    /// runtime call, the case discriminant must be compile-time.
+    /// Values mirror `newbcpl-runtime::builtins::ATOM_*`. If the
+    /// program redefines one its `Decl::Manifest` handler wins
+    /// (overwrites the prelude entry).
+    fn seed_builtin_manifests(&mut self) {
+        const PRELUDE: &[(&str, i64)] = &[
+            ("TYPE_INT", 1),
+            ("TYPE_FLOAT", 2),
+            ("TYPE_STRING", 3),
+            ("TYPE_LIST", 4),
+            ("TYPE_OBJECT", 5),
+            ("TYPE_PAIR", 6),
+        ];
+        for (name, value) in PRELUDE {
+            self.manifests.insert((*name).to_string(), *value);
+        }
+    }
+
     fn analyze_program(&mut self, program: &Program) {
+        self.seed_builtin_manifests();
         // Pre-pass 1: register classes so any LET that does
         // `NEW Foo()` can resolve the name even if Foo is declared
         // later in the file.

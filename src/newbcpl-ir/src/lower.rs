@@ -2561,6 +2561,27 @@ impl<'a> Lowerer<'a> {
     }
 
     fn lower_call(&mut self, callee: &Expr, args: &[Expr], hint: TypeHint) -> Value {
+        // `AS_INT(x)` / `AS_FLOAT(x)` / `AS_STRING(x)` are
+        // bit-reinterpretation casts, not runtime helpers. BCPL is
+        // typeless on the wire — every value is a 64-bit word — so
+        // the cast doesn't change the bits, just sema's idea of the
+        // value's TypeHint. We rewrite the call into the argument
+        // directly; downstream codegen reads the surrounding
+        // context (e.g. `FWRITE(AS_FLOAT(s))`) for the float-vs-int
+        // load. Routing through a real `extern "C"` runtime function
+        // would have an x86-64 ABI mismatch on AS_FLOAT (XMM0 return
+        // vs RAX) — sidestepping the call entirely keeps the
+        // semantics correct without ABI gymnastics.
+        if let Expr::Ident { name, .. } = callee {
+            if matches!(name.as_str(), "AS_INT" | "AS_FLOAT" | "AS_STRING") {
+                if let Some(arg) = args.first() {
+                    return self.lower_expr(arg);
+                }
+                // Zero-arg `AS_*()` shouldn't happen in real code;
+                // give it a sensible zero.
+                return Value::Const(Const::Int(0));
+            }
+        }
         // SUPER.method(args) — static dispatch to the *parent*'s
         // implementation, bypassing the vtable. C++-style semantics:
         // even if the dynamic class overrides `method`, a SUPER call

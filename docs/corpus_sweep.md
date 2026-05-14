@@ -265,3 +265,85 @@ The highest-leverage adds for a third round:
 
 Estimated land: ~80 more files would push us toward 67 % raw / 80 %
 effective.
+
+---
+
+## Iteration 3 — pluralised SIMD allocators, pairwise reducers, atom-introspection casts
+
+```
+total:   856
+passed:  524   (61.2 %)   ↑ from 508 (59.3 %)  →  +16 unblocks
+failed:  332             ↓ from 348
+elapsed: 99.8 s
+```
+
+Six runtime adds + one IR rewrite:
+
+* **`OCTS(n)` / `QUADS(n)` / `FOCTS(n)` / `FQUADS(n)`.** Pluralised
+  allocators for vectors of SIMD packs — corpus convention is the
+  plural keyword, matching the existing `PAIRS` / `FPAIRS`. Same
+  contract: one 64-bit slot per pack, length-prefixed.
+
+* **`PAIRWISE_MIN` / `PAIRWISE_MAX` / `PAIRWISE_ADD`.** Fold the two
+  i32 lanes of a PAIR into a single scalar. The natural reduction
+  step after lane-wise SIMD work.
+
+* **TYPE-tag MANIFEST prelude.** `TYPE_INT` = 1, `TYPE_FLOAT` = 2,
+  `TYPE_STRING` = 3, `TYPE_LIST` = 4, `TYPE_OBJECT` = 5,
+  `TYPE_PAIR` = 6. Pre-seeded into `sema.manifests` so
+  `SWITCHON T INTO $( CASE TYPE_STRING: ... $)` resolves at
+  compile time. Values mirror the runtime's `ATOM_*` tags.
+
+* **`TYPE(list)` runtime helper.** Returns the head atom's type tag
+  for "what kind of list is this" probes.
+
+* **`AS_INT` / `AS_FLOAT` / `AS_STRING` as compile-time casts.**
+  These are bit-reinterpretation operations, not runtime helpers —
+  BCPL is typeless on the wire so the cast doesn't change bits,
+  just sema's TypeHint. IR rewrites `AS_T(x)` calls into the
+  argument directly; codegen reads the surrounding context for
+  load shape. Avoids the x86-64 ABI mismatch that would have
+  occurred declaring `AS_FLOAT` as `extern "C" fn(i64) -> f64`
+  (return value would land in XMM0 but the JIT thinks i64 in RAX).
+
+### Remaining failure buckets
+
+```
+70 × SDL2_*  — out-of-scope graphics
+16 × JOIN / SUM  — list-with-separator and pair-vector add (real work)
+ 9 × SGETVEC / QGETVEC / PGETVEC / IGETVEC  — typed allocator variants
+~135 × misc parse + run gaps
+```
+
+### Effective pass rate
+
+```
+effective = 524 / (856 - 28 - 45 - 2 - 70) = 524 / 711 = 73.7 %
+```
+
+### Where things stand
+
+Across the three iterations we've gone from **451 → 524** raw passes
+(52.7 % → 61.2 %), or **54.7 % → 73.7 %** on the effective denominator.
+The dominant remaining bucket is SDL2_* (out of scope by design;
+candidate for explicit quarantine). After that the residual is
+small individual implementation tasks (`JOIN`, `SUM`, typed
+`*GETVEC`, parser syntactic gaps) — each its own focused piece of
+work, no big systematic wins left in the sweep.
+
+### Conclusion
+
+The "easy unblocks" path has plateaued. To push further we'd be
+into:
+
+1. **SDL2 quarantine** — pure classification work, gets us a
+   cleaner effective-rate number.
+2. **`JOIN` / `SUM`** — real implementations; ~16 files but
+   non-trivial.
+3. **Parser syntactic gaps** — investigated case-by-case; 60+
+   files but each is its own pattern.
+4. **5 timeout-crashes** — focused bug hunt in loop lowering.
+
+None of these is a 50-file win. The corpus sweep has done its job
+as a coverage signal; further investment is targeted bug-fixing,
+not bulk unblock.
