@@ -28,7 +28,7 @@ The reference 857-file corpus (`reference/tests/bcl_tests/`) is still a moving t
 
 - ORC v2 alongside MCJIT, in step with NewCP's migration.
 - `MANAGED` linear-type enforcement (no aliasing, no list storage) — discovery in sema works; the verifier pass is still to come.
-- Class-aware member typing — `obj.field` is currently `Word` in sema; codegen has the layouts it needs but sema does not yet propagate field types back into hints.
+- Class identity through `AS Class` annotations on class members — fields and methods carry class identity from `LET f = NEW Foo()` initialisers and SELF-assignment back-fills, but `AS Class` on a class member is not yet promoted into the field's `class_name`. Workaround: assign through CREATE with `NEW Class(...)`.
 
 ## Workspace layout
 

@@ -68,6 +68,11 @@ pub struct FieldLayout {
     /// The class that owns this field — either the current class or
     /// an ancestor it was inherited from.
     pub defining_class: String,
+    /// For class-typed fields, the class the field's value belongs to,
+    /// when sema can prove it (propagated from `ClassFieldInfo`).
+    /// Lets IR lower chained access (`obj.inner.method()`) resolve
+    /// without re-running sema's resolver.
+    pub class_name: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -78,6 +83,10 @@ pub struct VtableEntry {
     /// means synthesize a default no-op (slot 0 / 1 only — for
     /// classes that don't declare CREATE / RELEASE).
     pub defining_class: Option<String>,
+    /// For methods that return a class instance, the class name
+    /// (propagated from `ClassMethodInfo::result_class_name`). Lets
+    /// IR lower resolve `obj.getInner().method()`.
+    pub result_class: Option<String>,
 }
 
 /// Slot 0 is reserved for `CREATE`, slot 1 for `RELEASE`. These are
@@ -172,11 +181,13 @@ fn compute_one(
                 slot: SLOT_CREATE,
                 method_name: "CREATE".to_string(),
                 defining_class: None,
+                result_class: None,
             },
             VtableEntry {
                 slot: SLOT_RELEASE,
                 method_name: "RELEASE".to_string(),
                 defining_class: None,
+                result_class: None,
             },
         ];
         ptr_offsets = Vec::new();
@@ -188,7 +199,11 @@ fn compute_one(
     // the way. Each field is exactly one word.
     for f in &class.fields {
         let offset = next_offset;
-        if hint_is_pointer(f.hint) {
+        if hint_is_pointer(f.hint) || f.class_name.is_some() {
+            // Class-typed fields hold a pointer to a heap-allocated
+            // instance — the GC must trace them even when the
+            // declared hint is bare Word (DECL fields back-filled
+            // with class identity from CREATE assignments).
             ptr_offsets.push(offset);
         }
         fields.push(FieldLayout {
@@ -196,6 +211,7 @@ fn compute_one(
             hint: f.hint,
             offset,
             defining_class: class.name.clone(),
+            class_name: f.class_name.clone(),
         });
         next_offset += WORD_BYTES;
     }
@@ -217,8 +233,13 @@ fn compute_one(
         match slot_by_method.get(&m.name) {
             Some(&existing_slot) => {
                 // Override: keep the slot, update defining_class.
+                // The override gets to refine result_class (a subclass
+                // may return a more-specific class than the parent).
                 if let Some(entry) = vtable.iter_mut().find(|v| v.slot == existing_slot) {
                     entry.defining_class = Some(class.name.clone());
+                    if m.result_class_name.is_some() {
+                        entry.result_class = m.result_class_name.clone();
+                    }
                 }
             }
             None => {
@@ -226,6 +247,7 @@ fn compute_one(
                     slot: next_slot,
                     method_name: m.name.clone(),
                     defining_class: Some(class.name.clone()),
+                    result_class: m.result_class_name.clone(),
                 });
                 slot_by_method.insert(m.name.clone(), next_slot);
                 next_slot += 1;

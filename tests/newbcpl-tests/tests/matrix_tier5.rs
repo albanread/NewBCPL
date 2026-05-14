@@ -206,6 +206,36 @@ fn multiple_instances_isolate_state() {
     );
 }
 
+// ─── Class-typed chains ───────────────────────────────────────────
+//
+// Sema must propagate class identity through `.field` and `.method()`
+// hops so the next hop can dispatch correctly. Until this landed,
+// `o.inner.getValue()` lost the class of `o.inner` at the second
+// hop, type_of() returned WORD, codegen dispatched via the wrong
+// builtin path, and the program crashed at runtime.
+
+#[test]
+fn chain_field_then_method() {
+    // `o.inner.getValue()` — field access returning an object,
+    // then method call on the returned object.
+    expect(
+        "chain_field_then_method",
+        "CLASS Inner $(\n  DECL value\n  ROUTINE CREATE(v) BE SELF.value := v\n  FUNCTION getValue() = SELF.value\n$)\nCLASS Outer $(\n  DECL inner\n  ROUTINE CREATE(v) BE SELF.inner := NEW Inner(v)\n$)\nLET START() BE $(\n  LET o = NEW Outer(42)\n  WRITEN(o.inner.getValue())\n$)\n",
+        "42",
+    );
+}
+
+#[test]
+fn chain_method_then_method() {
+    // `o.getInner().getValue()` — method returning an object,
+    // then method call on the result.
+    expect(
+        "chain_method_then_method",
+        "CLASS Inner $(\n  DECL value\n  ROUTINE CREATE(v) BE SELF.value := v\n  FUNCTION getValue() = SELF.value\n$)\nCLASS Outer $(\n  DECL inner\n  ROUTINE CREATE(v) BE SELF.inner := NEW Inner(v)\n  FUNCTION getInner() = SELF.inner\n$)\nLET START() BE $(\n  LET o = NEW Outer(99)\n  WRITEN(o.getInner().getValue())\n$)\n",
+        "99",
+    );
+}
+
 // ─── Two-field accessors / setters ────────────────────────────────
 
 #[test]

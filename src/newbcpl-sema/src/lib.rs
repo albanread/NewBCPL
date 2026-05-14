@@ -97,6 +97,12 @@ pub struct ClassInfo {
 pub struct ClassFieldInfo {
     pub name: String,
     pub hint: TypeHint,
+    /// For class-typed fields, the class this field's value belongs
+    /// to (when sema can prove it). Populated from `LET f = NEW Foo()`
+    /// initialisers, `AS Class` annotations, and a second pass over
+    /// CREATE-body assignments. Lets chained member access such as
+    /// `obj.inner.getValue()` resolve through the second hop.
+    pub class_name: Option<String>,
     pub visibility: Visibility,
     pub span: Span,
 }
@@ -107,6 +113,10 @@ pub struct ClassMethodInfo {
     pub kind: FunctionKind,
     pub params: Vec<String>,
     pub result: TypeHint,
+    /// For methods that return a class instance (`FUNCTION m() = SELF.inner`
+    /// where `inner` is class-typed, or `= NEW Foo()`), the class name.
+    /// Enables chained dispatch like `obj.getInner().method()`.
+    pub result_class_name: Option<String>,
     pub is_virtual: bool,
     pub is_final: bool,
     pub visibility: Visibility,
@@ -161,6 +171,10 @@ pub struct FunctionInfo {
     /// hint of the body expression, threading through any VALOF /
     /// RESULTIS chain.
     pub result: TypeHint,
+    /// For functions that return a class instance, the class name.
+    /// Lets callers of the function reason about the result's class
+    /// the same way they would for a `NEW Foo()` expression.
+    pub result_class_name: Option<String>,
     pub span: Span,
 }
 
@@ -499,6 +513,7 @@ impl Sema {
                     kind: FunctionKind::Function,
                     params: f.params.clone(),
                     result: TypeHint::Unknown,
+                    result_class_name: None,
                     span: f.span,
                 };
                 self.functions.insert(f.name.clone(), info);
@@ -509,6 +524,7 @@ impl Sema {
                     kind: FunctionKind::Routine,
                     params: r.params.clone(),
                     result: TypeHint::Word,
+                    result_class_name: None,
                     span: r.span,
                 };
                 self.functions.insert(r.name.clone(), info);
@@ -531,6 +547,10 @@ impl Sema {
                             name: n.clone(),
                             // DECL has no initialiser — bag-of-bits Word.
                             hint: TypeHint::Word,
+                            // Class identity (if any) is inferred in a
+                            // second pass over CREATE assignments —
+                            // see `infer_field_classes_from_create`.
+                            class_name: None,
                             visibility: m.visibility,
                             span: m.span,
                         });
@@ -538,9 +558,19 @@ impl Sema {
                 }
                 ClassMemberKind::Let(let_decl) => {
                     for (name, expr) in &let_decl.bindings {
+                        // Direct evidence only at this stage: `LET f = NEW
+                        // Foo()`. Annotation- and assignment-based
+                        // inference happen post-hoc in
+                        // `refine_class_field_identities` once the full
+                        // class table is built.
+                        let class_name = match expr {
+                            Expr::New { class_name, .. } => Some(class_name.clone()),
+                            _ => None,
+                        };
                         fields.push(ClassFieldInfo {
                             name: name.clone(),
                             hint: literal_hint(expr),
+                            class_name,
                             visibility: m.visibility,
                             span: m.span,
                         });
@@ -559,6 +589,8 @@ impl Sema {
                         } else {
                             hint
                         },
+                        // FLET fields are always FLOAT — no class identity.
+                        class_name: None,
                         visibility: m.visibility,
                         span: m.span,
                     });
@@ -574,6 +606,7 @@ impl Sema {
                         params: method.params.clone(),
                         // Refined later in analyze_class_member.
                         result: TypeHint::Unknown,
+                        result_class_name: None,
                         is_virtual: method.is_virtual,
                         is_final: method.is_final,
                         visibility: m.visibility,
@@ -603,12 +636,14 @@ impl Sema {
                     self.declare(p, TypeHint::Word, None, f.span);
                 }
                 let body_hint = self.type_of(&f.body);
+                let body_class = self.class_of_expr(&f.body);
                 self.pop_scope();
                 let info = FunctionInfo {
                     name: f.name.clone(),
                     kind: FunctionKind::Function,
                     params: f.params.clone(),
                     result: body_hint,
+                    result_class_name: body_class,
                     span: f.span,
                 };
                 self.functions.insert(f.name.clone(), info.clone());
@@ -627,6 +662,7 @@ impl Sema {
                     kind: FunctionKind::Routine,
                     params: r.params.clone(),
                     result: TypeHint::Word,
+                    result_class_name: None,
                     span: r.span,
                 };
                 self.functions.insert(r.name.clone(), info.clone());
@@ -728,17 +764,11 @@ impl Sema {
         }
     }
 
+    /// Convenience wrapper for `class_of_expr` — kept under its
+    /// original name because the manifesto §5 aliasing checks
+    /// (`is_managed` propagation) read better that way.
     fn class_name_of(&self, expr: &Expr) -> Option<String> {
-        match expr {
-            Expr::New { class_name, .. } => Some(class_name.clone()),
-            // Propagate through identifiers so `LET b = a` carries
-            // `a`'s class — keeps the MANAGED-aliasing chain visible
-            // to the manifesto §5 checks below.
-            Expr::Ident { name, .. } => {
-                self.lookup(name).and_then(|info| info.class_name.clone())
-            }
-            _ => None,
-        }
+        self.class_of_expr(expr)
     }
 
     /// If an `AS Type` annotation strips down to a name that matches
@@ -795,19 +825,26 @@ impl Sema {
                 for p in &method.params {
                     self.declare(p, TypeHint::Word, None, method.span);
                 }
-                let result_hint = match &method.body {
+                let (result_hint, result_class) = match &method.body {
                     ClassMethodBody::Routine(s) => {
                         self.analyze_stmt(s);
-                        TypeHint::Word
+                        (TypeHint::Word, None)
                     }
-                    ClassMethodBody::Function(e) => self.type_of(e),
+                    ClassMethodBody::Function(e) => {
+                        let hint = self.type_of(e);
+                        let class_name = self.class_of_expr(e);
+                        (hint, class_name)
+                    }
                 };
                 self.pop_scope();
-                // Refine the previously-recorded method's result hint.
+                // Refine the previously-recorded method's result hint
+                // and result class identity (the latter lets chained
+                // dispatch like `obj.getInner().method()` resolve).
                 if let Some(class_info) = self.classes.get_mut(&c.name) {
                     for mi in class_info.methods.iter_mut() {
                         if mi.name == method.name && mi.span == method.span {
                             mi.result = result_hint;
+                            mi.result_class_name = result_class.clone();
                             break;
                         }
                     }
@@ -820,6 +857,7 @@ impl Sema {
                     for mi in class_log_entry.methods.iter_mut() {
                         if mi.name == method.name && mi.span == method.span {
                             mi.result = result_hint;
+                            mi.result_class_name = result_class.clone();
                             break;
                         }
                     }
@@ -862,12 +900,74 @@ impl Sema {
         None
     }
 
+    /// Look up a field's *class identity* on a class (walks the
+    /// inheritance chain). Returns the class name the field's value
+    /// belongs to, when sema has proof — populated from
+    /// `LET f = NEW Foo()`, `AS Class` annotations on class members, or
+    /// SELF-assignment back-fills. Returns `None` for fields of
+    /// non-class type (Word, Int, Float, …) and for class-typed fields
+    /// where sema couldn't determine the class.
+    fn lookup_field_class(&self, class_name: &str, field: &str) -> Option<String> {
+        let mut current = Some(class_name.to_string());
+        while let Some(name) = current {
+            if let Some(class) = self.classes.get(&name) {
+                if let Some(f) = class.fields.iter().find(|f| f.name == field) {
+                    return f.class_name.clone();
+                }
+                current = class.extends.clone();
+            } else {
+                return None;
+            }
+        }
+        None
+    }
+
     /// Best-effort: return the class name an expression evaluates to,
-    /// when sema knows. Used for `obj.field` resolution.
+    /// when sema knows. Drives `obj.field` / `obj.method()` resolution
+    /// and chained dispatch (`a.b.c.d()`). Recurses through:
+    ///
+    /// - identifier lookup (binding class)
+    /// - `NEW Class(...)`
+    /// - `obj.field` — looks up `field`'s class_name on `class_of(obj)`
+    /// - `obj.method(args)` — looks up `method`'s result_class_name
+    /// - direct call `f(args)` — uses the function's result_class_name
     fn class_of_expr(&self, e: &Expr) -> Option<String> {
         match e {
             Expr::Ident { name, .. } => self.lookup(name).and_then(|info| info.class_name.clone()),
             Expr::New { class_name, .. } => Some(class_name.clone()),
+            Expr::Binary {
+                op: BinaryOp::Dot | BinaryOp::Of,
+                lhs,
+                rhs,
+                ..
+            } => {
+                let receiver_class = self.class_of_expr(lhs)?;
+                if let Expr::Ident { name: field, .. } = rhs.as_ref() {
+                    return self.lookup_field_class(&receiver_class, field);
+                }
+                None
+            }
+            Expr::Call { callee, .. } => match callee.as_ref() {
+                Expr::Binary {
+                    op: BinaryOp::Dot,
+                    lhs,
+                    rhs,
+                    ..
+                } => {
+                    let receiver_class = self.class_of_expr(lhs)?;
+                    if let Expr::Ident { name: method, .. } = rhs.as_ref() {
+                        return self
+                            .lookup_method(&receiver_class, method)
+                            .and_then(|m| m.result_class_name);
+                    }
+                    None
+                }
+                Expr::Ident { name, .. } => self
+                    .functions
+                    .get(name)
+                    .and_then(|f| f.result_class_name.clone()),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -1053,6 +1153,15 @@ impl Sema {
             let target_hint = self.type_of(t);
             let value_hint = self.type_of(v);
             self.check_coercion(target_hint, value_hint, v.span());
+            // Back-fill the receiver class's field-class identity for
+            // assignments of the shape `SELF.field := <class-typed-expr>`.
+            // Field types are declared as bag-of-bits Word; their class
+            // identity is discoverable only from the values assigned to
+            // them, and CREATE-time SELF assignments are the canonical
+            // place to look. This unlocks chained access like
+            // `outer.inner.method()` once codegen consumes
+            // ClassFieldInfo::class_name through layouts.
+            self.back_fill_field_class_from_self_assign(t, v);
             // Manifesto §5: MANAGED instance assignment-aliasing.
             // A fresh NEW is fine (transfer of ownership into the
             // target slot). An existing MANAGED binding being copied
@@ -1062,6 +1171,60 @@ impl Sema {
                     "MANAGED instance cannot be aliased via assignment — RHS would share ownership with the source (manifesto §5)",
                     v.span(),
                 );
+            }
+        }
+    }
+
+    /// If `target` is `SELF.field` and `value` has a known class
+    /// identity, write that class onto the field's `ClassFieldInfo`
+    /// (and the parallel `class_log` entry sema uses for dump-sema).
+    /// First write wins — explicit `LET f = NEW Foo()` initialisers
+    /// already populated their slot during `register_class` and we
+    /// don't overwrite. The SELF binding carries the receiver class
+    /// in its `BindingInfo`, so this works without sema tracking
+    /// `current_class` separately.
+    fn back_fill_field_class_from_self_assign(&mut self, target: &Expr, value: &Expr) {
+        let Expr::Binary {
+            op: BinaryOp::Dot,
+            lhs,
+            rhs,
+            ..
+        } = target
+        else {
+            return;
+        };
+        let Expr::Ident { name: receiver_name, .. } = lhs.as_ref() else {
+            return;
+        };
+        if receiver_name != "SELF" {
+            return;
+        }
+        let Expr::Ident { name: field, .. } = rhs.as_ref() else {
+            return;
+        };
+        let Some(class_name) = self.lookup(receiver_name).and_then(|b| b.class_name.clone())
+        else {
+            return;
+        };
+        let Some(value_class) = self.class_of_expr(value) else {
+            return;
+        };
+        if let Some(class) = self.classes.get_mut(&class_name) {
+            if let Some(f) = class.fields.iter_mut().find(|f| f.name == *field) {
+                if f.class_name.is_none() {
+                    f.class_name = Some(value_class.clone());
+                }
+            }
+        }
+        if let Some(class_log_entry) = self.class_log.iter_mut().find(|ci| ci.name == class_name) {
+            if let Some(f) = class_log_entry
+                .fields
+                .iter_mut()
+                .find(|f| f.name == *field)
+            {
+                if f.class_name.is_none() {
+                    f.class_name = Some(value_class);
+                }
             }
         }
     }

@@ -1377,7 +1377,14 @@ impl<'a> Lowerer<'a> {
 
     /// Best-effort: return the class name an AST expression
     /// evaluates to, when lowering knows. Used by LET-binding
-    /// recording and member access resolution.
+    /// recording and member access resolution. Recurses through:
+    ///
+    /// - identifier lookup (SELF / SUPER / LET-binding class)
+    /// - `NEW Class(...)`
+    /// - `obj.field` — looks the field up in `layouts` and returns its
+    ///   `class_name` if sema recorded one
+    /// - `obj.method(args)` — looks the method up in `layouts.vtable`
+    ///   and returns its `result_class` if sema recorded one
     fn class_name_of_expr(&self, expr: &Expr) -> Option<String> {
         match expr {
             Expr::New { class_name, .. } => Some(class_name.clone()),
@@ -1391,6 +1398,51 @@ impl<'a> Lowerer<'a> {
                 self.current
                     .as_ref()
                     .and_then(|b| b.lookup_local_class(name))
+            }
+            Expr::Binary {
+                op: BinaryOp::Dot,
+                lhs,
+                rhs,
+                ..
+            } => {
+                let receiver_class = self.class_name_of_expr(lhs)?;
+                if let Expr::Ident { name: field, .. } = rhs.as_ref() {
+                    let layout = self
+                        .layouts
+                        .iter()
+                        .find(|l| l.class_name == receiver_class)?;
+                    return layout
+                        .fields
+                        .iter()
+                        .find(|f| f.name == *field)?
+                        .class_name
+                        .clone();
+                }
+                None
+            }
+            Expr::Call { callee, .. } => {
+                if let Expr::Binary {
+                    op: BinaryOp::Dot,
+                    lhs,
+                    rhs,
+                    ..
+                } = callee.as_ref()
+                {
+                    let receiver_class = self.class_name_of_expr(lhs)?;
+                    if let Expr::Ident { name: method, .. } = rhs.as_ref() {
+                        let layout = self
+                            .layouts
+                            .iter()
+                            .find(|l| l.class_name == receiver_class)?;
+                        return layout
+                            .vtable
+                            .iter()
+                            .find(|v| v.method_name == *method)?
+                            .result_class
+                            .clone();
+                    }
+                }
+                None
             }
             _ => None,
         }
