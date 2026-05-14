@@ -73,3 +73,7 @@ path = "tests/sema_smoke.rs"
 [[test]]
 name = "sema_corpus"
 path = "tests/sema_corpus.rs"
+
+[[test]]
+name = "user_guide"
+path = "tests/user_guide.rs"
