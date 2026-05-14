@@ -27,7 +27,7 @@ The reference 857-file corpus (`reference/tests/bcl_tests/`) is still a moving t
 ### Known gaps
 
 - ORC v2 alongside MCJIT, in step with NewCP's migration.
-- `MANAGED` linear-type enforcement (no aliasing, no list storage) — discovery in sema works; the verifier pass is still to come.
+- `MANAGED` linear-type checks cover the storage-escape surface (aliasing via `LET` / `:=`, container capture in LIST / PAIR / VEC, field capture in non-MANAGED holders). Still soft warnings only — sema never rejects. Argument-passing and function-return forms of escape are not yet flagged.
 - Class identity through `AS Class` annotations on class members — fields and methods carry class identity from `LET f = NEW Foo()` initialisers and SELF-assignment back-fills, but `AS Class` on a class member is not yet promoted into the field's `class_name`. Workaround: assign through CREATE with `NEW Class(...)`.
 
 ## Workspace layout
