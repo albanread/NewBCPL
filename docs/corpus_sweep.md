@@ -183,3 +183,85 @@ In order of leverage-per-hour:
 
 After 1–3 land we'd be at ~78 % effective pass rate. After 4 the
 quarantine clears the SDL2 noise. Then 5 is a focused bug hunt.
+
+---
+
+## Iteration 2 — May 2026, after first unblocks landed
+
+After landing the three easy-unblock tracks:
+
+* Lowercase aliases on every builtin (`writef` resolves to
+  `WRITEF`).
+* `modules-active/libhdr.bcl` adapter + `.h → .bcl` path fallback.
+* `MIN` / `MAX` / `ABS` / `LENGTH` / `TIMER_START` / `TIMER_END` /
+  `TIMER_DISPLAY` builtins.
+* Sema fold for `-N` in MANIFEST initialisers (discovered while
+  wiring `ENDSTREAMCH = -1`).
+
+The sweep landed at:
+
+```
+total:   856
+passed:  508   (59.3 %)   ↑ from 451 (52.7 %)  →  +57 unblocks
+failed:  348             ↓ from 405
+elapsed: 100.6 s
+```
+
+Failures by phase:
+
+| Phase  | Before | After |
+|--------|--------|-------|
+| parse  | 88     | 88    |
+| sema   | 2      | 2     |
+| run    | 310    | 250   |
+| crash  | 5      | 8     |
+
+The parse total didn't move (we didn't touch parser gaps), `run`
+fell by 60 (the unblock), and `crash` ticked up by 3 — files that
+previously failed at parse now get further and time out on
+infinite-loop bugs in specific loop shapes.
+
+`no START function declared` jumped from 29 to 45 — the libhdr
+adapter let more "library" files parse through to the
+load-check, where they fail because they aren't programs.
+
+### Remaining failure buckets
+
+Top missing-builtin names after iteration 2:
+
+```
+25 × PAIRWISE_MIN / MAX / ADD  — SIMD lane-fold reducers
+22 × TYPE / TYPE_STRING / AS_STRING  — list atom introspection
+18 × OCTS / QUADS  — SIMD pack constructors (different spelling than our keywords)
+16 × JOIN / SUM  — list reducers
+70 × SDL2_*  — out of scope, Direct2D path instead
+```
+
+### Effective pass rate
+
+Subtracting deliberate rejections (28 GLOBALS), library files
+without START (45), the 2 visibility-violation tests, and the
+out-of-scope SDL2 family (~50 files distinguished by missing
+SDL2_* builtins):
+
+```
+effective = 508 / (856 - 28 - 45 - 2 - 50) = 508 / 731 = 69.5 %
+```
+
+### Next iteration
+
+The highest-leverage adds for a third round:
+
+1. **PAIRWISE_MIN / MAX / ADD** — 25 files. We have lane operators;
+   pairwise fold of a SIMD pack into a scalar is a thin codegen
+   addition.
+2. **TYPE / TYPE_STRING / AS_STRING** — 22 files. List atom tags
+   are already encoded in the runtime; expose introspection +
+   converters.
+3. **OCTS / QUADS as builtin functions** — 18 files. Probably
+   either alias to OCT/QUAD or add as separate builtins. Needs
+   investigation of corpus usage.
+4. **JOIN / SUM list reducers** — 16 files. Walk + accumulate.
+
+Estimated land: ~80 more files would push us toward 67 % raw / 80 %
+effective.

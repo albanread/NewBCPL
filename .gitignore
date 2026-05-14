@@ -20,3 +20,4 @@ Thumbs.db
 
 # Output of `newbcpl-driver test-folder ... <report>` runs
 *-results.txt
+sweep-results*.txt
