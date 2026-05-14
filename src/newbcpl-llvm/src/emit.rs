@@ -2022,19 +2022,26 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
     fn resolve_callee(&mut self, callee: &Value, arg_count: usize) -> FunctionValue<'ctx> {
         match callee {
             Value::Function(name) => {
-                // The IR always names the printf-family builtin
-                // `WRITEF`. The runtime exposes seven arity-specific
-                // entry points (`WRITEF`, `WRITEF1`, ..., `WRITEF7`)
-                // because we can't declare a real C-variadic function
-                // in stable Rust. Pick the right symbol here so each
-                // call site lands on a fixed-arity declaration that
-                // both LLVM verifier and JIT linker can resolve.
-                let resolved: String = if name == "WRITEF" {
+                // The printf-family builtin needs arity-aware
+                // dispatch: the runtime exposes seven fixed-arity
+                // entry points (`WRITEF`, `WRITEF1`, …, `WRITEF7`)
+                // because we can't declare a real C-variadic in
+                // stable Rust. Source uses either spelling per the
+                // case convention — `WRITEF("hi")` or
+                // `writef("hi, %s", who)` — so we match the
+                // canonical name case-insensitively, then resolve to
+                // the right arity-suffixed symbol. The runtime's
+                // alias registration exposes both UPPERCASE and
+                // lowercase forms of every builtin, so the resolved
+                // name links cleanly either way.
+                let resolved: String = if name.eq_ignore_ascii_case("WRITEF") {
                     let extras = arg_count.saturating_sub(1).min(7);
+                    let lowercase = name.chars().next().map(|c| c.is_lowercase()).unwrap_or(false);
+                    let stem = if lowercase { "writef" } else { "WRITEF" };
                     if extras == 0 {
-                        "WRITEF".to_string()
+                        stem.to_string()
                     } else {
-                        format!("WRITEF{extras}")
+                        format!("{stem}{extras}")
                     }
                 } else {
                     name.clone()

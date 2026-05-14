@@ -668,7 +668,11 @@ fn resolve_get(
     if req.is_absolute() && req.is_file() {
         return Ok(req.to_path_buf());
     }
-    // Helper: try `dir/name` and `dir/name.bcl`.
+    // Helper: try `dir/name`, `dir/name.bcl`, and (if `name` had a
+    // different extension like `.h`) `dir/<stem>.bcl`. Classic BCPL
+    // programs write `GET "libhdr.h"`; our adapter file is
+    // `libhdr.bcl`, and the `.h → .bcl` swap lets the corpus
+    // resolve to it without rewriting the source.
     let try_in = |dir: &Path| -> Option<std::path::PathBuf> {
         let direct = dir.join(req);
         if direct.is_file() {
@@ -678,6 +682,12 @@ fn resolve_get(
             let with_ext = dir.join(format!("{requested}.bcl"));
             if with_ext.is_file() {
                 return Some(with_ext);
+            }
+        } else if let Some(stem) = req.file_stem().and_then(|s| s.to_str()) {
+            // Strip any existing extension and try .bcl.
+            let swapped = dir.join(format!("{stem}.bcl"));
+            if swapped.is_file() {
+                return Some(swapped);
             }
         }
         None

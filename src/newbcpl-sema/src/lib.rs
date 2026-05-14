@@ -904,11 +904,15 @@ impl Sema {
                         .unwrap_or(TypeHint::Int);
                     self.declare(&b.name, hint, None, b.span);
                     // Record the literal value so lowering can
-                    // substitute it inline. Only integer literals
-                    // are recognised today — float manifests would
-                    // need a parallel `manifest_floats` table.
-                    if let Some(Expr::IntLit { value, .. }) = &b.value {
-                        self.manifests.insert(b.name.clone(), *value);
+                    // substitute it inline. The parser emits `-1`
+                    // as `Unary { Neg, IntLit 1 }` rather than a
+                    // negative literal token, so we fold the
+                    // common `-N` / `+N` shapes back to a single
+                    // integer here. Anything more complex (`1+2`)
+                    // would need full const-evaluation; not worth
+                    // it until the corpus demands it.
+                    if let Some(folded) = b.value.as_ref().and_then(fold_int_literal) {
+                        self.manifests.insert(b.name.clone(), folded);
                     }
                 }
             }
@@ -1856,6 +1860,27 @@ impl Sema {
 /// constructors get a precise hint; anything else falls back to
 /// `Word` and is refined later if class members ever participate in
 /// flow inference.
+/// Constant-fold the common compile-time integer shapes used in
+/// `MANIFEST $( name = expr $)` initialisers: bare `IntLit`, an
+/// unary `-N` (which the parser emits as `Unary { Neg, IntLit N }`,
+/// not as a negative literal), `+N`, and bool literals (which BCPL
+/// treats as 0 / 1). Anything more complex returns `None`; the
+/// MANIFEST then falls through to its runtime-binding path and
+/// produces a `missing builtin: <name>` diagnostic at JIT time —
+/// the right outcome when sema can't see through the initialiser.
+fn fold_int_literal(e: &Expr) -> Option<i64> {
+    match e {
+        Expr::IntLit { value, .. } => Some(*value),
+        Expr::BoolLit { value, .. } => Some(if *value { 1 } else { 0 }),
+        Expr::Unary {
+            op: UnaryOp::Neg,
+            operand,
+            ..
+        } => fold_int_literal(operand).map(|v| -v),
+        _ => None,
+    }
+}
+
 fn literal_hint(e: &Expr) -> TypeHint {
     match e {
         Expr::IntLit { .. } => TypeHint::Int,

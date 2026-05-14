@@ -1,0 +1,23 @@
+// NewBCPL-flavoured `libhdr` — the modern stand-in for the
+// classic BCPL library header.
+//
+// The reference distribution ships a `libhdr.h` that uses the
+// `GLOBAL $( name : slot $)` form to pin every standard library
+// function to a fixed offset in a shared pointer vector. NewBCPL's
+// loader resolves those names symbolically (no slot vector), so
+// the legacy file's GLOBALS block is redundant — the corpus tests'
+// references to `WRITES`, `WRITEF`, `FINISH`, etc. already resolve
+// through the runtime's builtin table.
+//
+// What programs actually pull from `libhdr` is the small set of
+// MANIFEST constants below. Putting them here means that any
+// `GET "libhdr.h"` or `GET "libhdr"` from a corpus test gets the
+// values it expects via the .h → .bcl resolution fallback in
+// `newbcpl_llvm::resolve_get`.
+
+// `TRUE` and `FALSE` are language-level literal keywords in
+// NewBCPL — already 1 / 0 — so they aren't redefined here.
+// `ENDSTREAMCH` is the classic BCPL EOF sentinel.
+MANIFEST $(
+    ENDSTREAMCH = -1
+$)

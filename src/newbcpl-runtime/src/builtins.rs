@@ -129,6 +129,76 @@ pub unsafe extern "C-unwind" fn __newbcpl_default_method() -> i64 {
     0
 }
 
+// ─── Simple scalar / utility builtins ────────────────────────────
+//
+// Things every BCPL programmer reaches for: integer MIN / MAX / ABS,
+// timing helpers (`TIMER_*`), an `ABS` for signed words. These were
+// missing per the May 2026 corpus sweep — adding them is purely
+// additive runtime work; the JIT picks them up through the regular
+// builtin-address table.
+
+/// `MIN(a, b)` — signed integer minimum.
+pub unsafe extern "C-unwind" fn MIN(a: i64, b: i64) -> i64 {
+    if a < b { a } else { b }
+}
+
+/// `MAX(a, b)` — signed integer maximum.
+pub unsafe extern "C-unwind" fn MAX(a: i64, b: i64) -> i64 {
+    if a > b { a } else { b }
+}
+
+/// `ABS(x)` — signed integer absolute value. Wraps on `i64::MIN` to
+/// `i64::MIN`, matching what `x.wrapping_abs()` does — preserves the
+/// "no panics from a runtime helper unless a real bug" rule. Programs
+/// that care can guard the input themselves.
+pub unsafe extern "C-unwind" fn ABS(x: i64) -> i64 {
+    x.wrapping_abs()
+}
+
+/// `LENGTH(x)` — alias for `LEN` / `__newbcpl_len`. Reference corpus
+/// programs spell it both ways.
+pub unsafe extern "C-unwind" fn LENGTH(v: *const i64) -> i64 {
+    unsafe { __newbcpl_len(v) }
+}
+
+// ─── Wall-clock timing ────────────────────────────────────────────
+//
+// `TIMER_START` returns a monotonic timestamp in nanoseconds.
+// `TIMER_END` returns elapsed nanoseconds since that start.
+// `TIMER_DISPLAY` formats an elapsed-ns value as `"<seconds>s"`
+// followed by a newline — matches the reference's output shape.
+
+/// Monotonic now() in nanoseconds — used as the basis for elapsed
+/// readings via `TIMER_END`. The clock source is whatever
+/// `std::time::Instant` resolves to (QueryPerformanceCounter on
+/// Windows, clock_gettime(MONOTONIC) on Unix).
+fn monotonic_ns() -> i64 {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    let epoch = EPOCH.get_or_init(Instant::now);
+    epoch.elapsed().as_nanos().min(i64::MAX as u128) as i64
+}
+
+/// `TIMER_START()` — capture a "now" reading.
+pub unsafe extern "C-unwind" fn TIMER_START() -> i64 {
+    monotonic_ns()
+}
+
+/// `TIMER_END(start)` — return elapsed nanoseconds since `start`.
+pub unsafe extern "C-unwind" fn TIMER_END(start: i64) -> i64 {
+    let now = monotonic_ns();
+    now.saturating_sub(start)
+}
+
+/// `TIMER_DISPLAY(elapsed_ns)` — print the duration as `Xs` to
+/// stdout, using fractional seconds with millisecond precision.
+pub unsafe extern "C-unwind" fn TIMER_DISPLAY(elapsed: i64) -> i64 {
+    let seconds = (elapsed as f64) / 1_000_000_000.0;
+    println!("{:.3}s", seconds);
+    0
+}
+
 /// Test fixture: raise a Rust `panic!` from inside a JIT-callable
 /// helper. Used to verify the Windows SEH unwind pipeline is wired
 /// correctly — every JIT'd function carries `uwtable=2`, the custom
@@ -1013,6 +1083,14 @@ pub fn builtin_addresses() -> &'static [Builtin] {
             builtin!(HEAP_INFO),
             builtin!(__newbcpl_default_method),
             builtin!(__newbcpl_test_panic),
+            // Simple scalar / utility builtins — corpus expectations.
+            builtin!(MIN),
+            builtin!(MAX),
+            builtin!(ABS),
+            builtin!(LENGTH),
+            builtin!(TIMER_START),
+            builtin!(TIMER_END),
+            builtin!(TIMER_DISPLAY),
         ];
         #[cfg(windows)]
         {
@@ -1137,6 +1215,31 @@ pub fn builtin_addresses() -> &'static [Builtin] {
             v.push(Builtin {
                 name: "iGui_TextShowCaret",
                 address: g::iGui_TextShowCaret as *const () as usize,
+            });
+        }
+        // Lowercase aliases: every builtin whose name has at least
+        // one uppercase letter gets a parallel registration under
+        // its lowercased form pointing at the same address. The
+        // user guide §1.1 says identifiers may be either case but
+        // lower-case is the usual style — so source like
+        // `writef("hi")` should resolve to `WRITEF` without the
+        // user knowing about the case convention. Internal
+        // `__newbcpl_*` symbols are already all lowercase and skip
+        // themselves; mixed-case `iGui_*` names alias to `igui_*`.
+        let len_before_aliases = v.len();
+        for i in 0..len_before_aliases {
+            let upper = v[i].name;
+            let lower = upper.to_lowercase();
+            if lower == upper {
+                continue;
+            }
+            // Box-leak the new String into a `&'static str`. One
+            // small allocation per builtin; happens once per
+            // process at first `builtin_addresses()` call.
+            let leaked: &'static str = Box::leak(lower.into_boxed_str());
+            v.push(Builtin {
+                name: leaked,
+                address: v[i].address,
             });
         }
         v

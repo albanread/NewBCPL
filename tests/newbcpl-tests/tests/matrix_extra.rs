@@ -227,3 +227,42 @@ reject!(
     "LET START() BE $(\n  LET x = 0\n  x :=\n$)\n" =>
     "parse"
 );
+
+// ─── Lowercase builtin spellings ──────────────────────────────────
+//
+// The user guide §1.1 says identifiers may be either case but
+// "lower-case is the usual style". The runtime registers every
+// builtin under both UPPERCASE and lowercase, so source written in
+// the natural lowercase style resolves without the user knowing
+// about a casing convention.
+
+#[test]
+fn lowercase_writes_resolves() {
+    newbcpl_tests::expect_stdout(
+        "lowercase_writes_resolves",
+        "LET START() BE $( writes(\"ok\") $)\n",
+        "ok",
+    );
+}
+
+#[test]
+fn lowercase_writen_resolves() {
+    newbcpl_tests::expect_stdout(
+        "lowercase_writen_resolves",
+        "LET START() BE $( writen(42) $)\n",
+        "42",
+    );
+}
+
+#[test]
+fn lowercase_writef_arity_dispatch() {
+    // `writef` needs the arity-aware WRITEF1..7 trick to work
+    // through the lowercase alias. The IR-side resolver matches
+    // the name case-insensitively and picks the correct
+    // arity-suffixed entry point.
+    newbcpl_tests::expect_stdout(
+        "lowercase_writef_arity_dispatch",
+        "LET START() BE $( writef(\"%d %d*N\", 7, 11) $)\n",
+        "7 11\n",
+    );
+}
