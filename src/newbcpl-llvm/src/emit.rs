@@ -685,6 +685,16 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
                 let elem = self.emit_lane_extract(vector, lane, *kind, *hint);
                 self.value_map.insert(*dst, elem);
             }
+            Instr::LaneInsert {
+                dst,
+                vector,
+                lane,
+                value,
+                kind,
+            } => {
+                let new_pack = self.emit_lane_insert(vector, lane, value, *kind);
+                self.value_map.insert(*dst, new_pack);
+            }
             Instr::TypedConstruct {
                 dst,
                 kind,
@@ -1478,6 +1488,127 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
         }
         let _ = hint;
         extracted.into()
+    }
+
+    /// Mirror of `emit_lane_extract`: produce a SIMD value identical
+    /// to `vector` except lane `lane` is replaced by `value`. Used
+    /// to lower `pair.|i| := v`. Two code paths:
+    ///
+    ///   - **FQUAD / FOCT** — real LLVM vector. `insertelement`
+    ///     directly. Float values arrive as f64; we narrow to f32
+    ///     to match the in-vector lane type.
+    ///   - **PAIR / FPAIR / QUAD / OCT** — packed i64. Build the
+    ///     replacement word as `(old & ~mask) | (new << shift)`
+    ///     where `mask = ((1 << lane_bits) - 1) << shift` and
+    ///     `shift = lane_idx * lane_bits`. For FPAIR the f64 value
+    ///     gets fptrunc'd to f32, bitcast to i32, then masked into
+    ///     the low 32 bits of its lane.
+    fn emit_lane_insert(
+        &mut self,
+        vector: &Value,
+        lane: &Value,
+        value: &Value,
+        kind: TypedKind,
+    ) -> BasicValueEnum<'ctx> {
+        let v = self.lower_value(vector);
+        let lane_v = self.lower_value(lane);
+        let new_v = self.lower_value(value);
+        let lane_idx = self.as_int_word(lane_v);
+        let i64_t = self.context.i64_type();
+        let i32_t = self.context.i32_type();
+        let f32_t = self.context.f32_type();
+        // Per-kind lane width and float-ness — must match emit_lane_extract.
+        let (lane_bits, float) = match kind {
+            TypedKind::Pair => (32u32, false),
+            TypedKind::FPair => (32, true),
+            TypedKind::Quad => (16, false),
+            TypedKind::Oct => (8, false),
+            TypedKind::FQuad => (32, true),
+            TypedKind::FOct => (32, true),
+            _ => (32, false),
+        };
+        // FQUAD / FOCT live in real LLVM vectors. Narrow f64 → f32
+        // to match the vector element type, then insertelement.
+        if matches!(kind, TypedKind::FQuad | TypedKind::FOct) {
+            let vec = match v {
+                BasicValueEnum::VectorValue(vv) => vv,
+                _ => panic!("FQUAD / FOCT lane insert: expected vector value"),
+            };
+            let elem_basic = match new_v {
+                BasicValueEnum::FloatValue(fv) => {
+                    let narrow = self
+                        .builder
+                        .build_float_trunc(fv, f32_t, "lane.fptrunc")
+                        .expect("fptrunc");
+                    narrow.into()
+                }
+                other => other,
+            };
+            let inserted = self
+                .builder
+                .build_insert_element(vec, elem_basic, lane_idx, "lane.ins")
+                .expect("insertelement");
+            return inserted.into();
+        }
+        // Packed-i64 path. Build mask = ((1 << lane_bits) - 1) << shift.
+        let packed = self.as_int_word(v);
+        let lane_bits_v = i64_t.const_int(lane_bits as u64, false);
+        let shift = self
+            .builder
+            .build_int_mul(lane_idx, lane_bits_v, "lane.shift")
+            .expect("imul lane bits");
+        let lane_mask = if lane_bits >= 64 {
+            i64_t.const_int(u64::MAX, false)
+        } else {
+            i64_t.const_int((1u64 << lane_bits) - 1, false)
+        };
+        let mask_shifted = self
+            .builder
+            .build_left_shift(lane_mask, shift, "lane.mask")
+            .expect("shl mask");
+        let not_mask = self
+            .builder
+            .build_not(mask_shifted, "lane.nmask")
+            .expect("not");
+        let cleared = self
+            .builder
+            .build_and(packed, not_mask, "lane.cleared")
+            .expect("and");
+        // Coerce the incoming value to an i64 holding only the lane's
+        // payload bits. Float lanes (FPAIR): f64 → f32 → bitcast i32.
+        let value_as_word: inkwell::values::IntValue<'ctx> = if float {
+            let fv = match new_v {
+                BasicValueEnum::FloatValue(f) => f,
+                _ => panic!("FPair lane insert: value must be a float"),
+            };
+            let narrow = self
+                .builder
+                .build_float_trunc(fv, f32_t, "lane.fptrunc")
+                .expect("fptrunc");
+            let bits = self
+                .builder
+                .build_bit_cast(narrow, i32_t, "lane.bits")
+                .expect("bitcast f32→i32")
+                .into_int_value();
+            self.builder
+                .build_int_z_extend(bits, i64_t, "lane.zext")
+                .expect("zext")
+        } else {
+            self.as_int_word(new_v)
+        };
+        let value_masked = self
+            .builder
+            .build_and(value_as_word, lane_mask, "lane.payload")
+            .expect("and payload");
+        let value_positioned = self
+            .builder
+            .build_left_shift(value_masked, shift, "lane.shifted")
+            .expect("shl new");
+        let merged = self
+            .builder
+            .build_or(cleared, value_positioned, "lane.merged")
+            .expect("or");
+        merged.into()
     }
 
     /// PAIR / FPAIR / QUAD / OCT constructor — pack `args.len()`

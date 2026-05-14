@@ -212,6 +212,18 @@ pub enum Instr {
         kind: TypedKind,
         hint: TypeHint,
     },
+    /// `pair.|n| := value` — produce a new SIMD value identical to
+    /// `vector` except lane `lane` is replaced by `value`. The IR
+    /// shape mirrors `LaneExtract`; the lowerer is responsible for
+    /// storing the result back into the original lvalue when the
+    /// source-level lhs of the lane access is a binding.
+    LaneInsert {
+        dst: ValueId,
+        vector: Value,
+        lane: Value,
+        value: Value,
+        kind: TypedKind,
+    },
 }
 
 /// IR-level constructor kinds, mirroring the parser's

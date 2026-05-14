@@ -180,3 +180,62 @@ fn pair_runtime_lane_index_one() {
         "84",
     );
 }
+
+// ─── Lane writes ───────────────────────────────────────────────────
+//
+// `pair.|i| := value` produces a new packed value identical to the
+// old one except lane `i` is replaced. The lvalue can be a binding
+// (write back to the slot) or a SELF-relative class field.
+
+#[test]
+fn pair_lane_write_constant_index() {
+    expect(
+        "pair_lane_write_constant_index",
+        "LET START() BE $(\n  LET p = PAIR(10, 20)\n  p.|0| := 33\n  WRITEN(p.|0|) WRITES(\"*S\") WRITEN(p.|1|)\n$)\n",
+        "33 20",
+    );
+}
+
+#[test]
+fn pair_lane_write_high_lane() {
+    expect(
+        "pair_lane_write_high_lane",
+        "LET START() BE $(\n  LET p = PAIR(10, 20)\n  p.|1| := 99\n  WRITEN(p.|0|) WRITES(\"*S\") WRITEN(p.|1|)\n$)\n",
+        "10 99",
+    );
+}
+
+#[test]
+fn pair_lane_write_runtime_index() {
+    // Lane index is a runtime value. The mask/shift codegen path
+    // builds the shift dynamically; this pins that it works.
+    expect(
+        "pair_lane_write_runtime_index",
+        "LET START() BE $(\n  LET p = PAIR(10, 20)\n  LET i = 1\n  p.|i| := 77\n  WRITEN(p.|0|) WRITES(\"*S\") WRITEN(p.|1|)\n$)\n",
+        "10 77",
+    );
+}
+
+#[test]
+fn pair_lane_write_into_field() {
+    // The lvalue is `SELF.p.|0|` — write through a class field
+    // rather than a local binding. Tests the SELF.field branch of
+    // `write_back_simd_lvalue`.
+    expect(
+        "pair_lane_write_into_field",
+        "CLASS Box $(\n  DECL p\n  ROUTINE CREATE(ip) BE SELF.p := ip\n  ROUTINE setLane0(v) BE SELF.p.|0| := v\n  FUNCTION lane0() = SELF.p.|0|\n  FUNCTION lane1() = SELF.p.|1|\n$)\nLET START() BE $(\n  LET b = NEW Box(PAIR(1, 2))\n  b.setLane0(50)\n  WRITEN(b.lane0()) WRITES(\"*S\") WRITEN(b.lane1())\n$)\n",
+        "50 2",
+    );
+}
+
+#[test]
+fn quad_lane_write_preserves_other_lanes() {
+    // QUAD is 4 × i16 packed. Writing one lane must not affect the
+    // others. With 16-bit lanes, the mask/shift arithmetic is
+    // different per lane index — pin that all lanes work.
+    expect(
+        "quad_lane_write_preserves_other_lanes",
+        "LET START() BE $(\n  LET q = QUAD(1, 2, 3, 4)\n  q.|2| := 99\n  WRITEN(q.|0|) WRITES(\"*S\") WRITEN(q.|1|) WRITES(\"*S\") WRITEN(q.|2|) WRITES(\"*S\") WRITEN(q.|3|)\n$)\n",
+        "1 2 99 4",
+    );
+}

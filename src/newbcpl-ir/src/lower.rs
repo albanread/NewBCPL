@@ -1623,6 +1623,36 @@ impl<'a> Lowerer<'a> {
                     let addr = self.lower_expr(operand);
                     self.b().emit(Instr::IndirectStore { addr, value: v });
                 }
+                Expr::Binary {
+                    op: BinaryOp::LaneAccess,
+                    lhs,
+                    rhs,
+                    ..
+                } => {
+                    // `pair.|i| := v` — SIMD packs are values, not
+                    // pointers, so writing a lane means: load the
+                    // packed value, build a new packed value with
+                    // that lane replaced, and store the result back
+                    // into the original lvalue. For v1 we only
+                    // support the case where the SIMD value lives in
+                    // an Ident's slot or a SELF-relative field — the
+                    // common cases that show up in source.
+                    let kind = simd_kind_from_hint(lhs.hint())
+                        .unwrap_or(crate::ir::TypedKind::Pair);
+                    let vector = self.lower_expr(lhs);
+                    let lane = self.lower_expr(rhs);
+                    let dst = self.b().alloc_value();
+                    self.b().emit(Instr::LaneInsert {
+                        dst,
+                        vector,
+                        lane,
+                        value: v,
+                        kind,
+                    });
+                    let new_pack = Value::Local(dst);
+                    // Store the rebuilt pack back where lhs lived.
+                    self.write_back_simd_lvalue(lhs, new_pack);
+                }
                 _ => {
                     // Other lvalue forms (lane access, bitfield write)
                     // not yet lowered.
@@ -1924,6 +1954,59 @@ impl<'a> Lowerer<'a> {
         // Unknown name — assume it's a function reference that
         // will be resolved at link time.
         Value::Function(name.to_string())
+    }
+
+    /// Store a rebuilt SIMD pack back where the lane-write's lhs
+    /// lived. The lhs of `pair.|i|` is the SIMD value-producing
+    /// expression — to make lane writes work the source must be an
+    /// lvalue we can write back to. Currently supported lvalues:
+    ///   - `Ident name` — store to the binding's slot.
+    ///   - `SELF.field` / class-receiver `obj.field` — emit a
+    ///     `FieldStore` through the receiver pointer.
+    /// Anything else is silently ignored: sema doesn't currently
+    /// reject `(a + b).|0| := v` and codegen can't recover the
+    /// lvalue. Real source rarely hits this case; we can sharpen
+    /// the diagnostic later.
+    fn write_back_simd_lvalue(&mut self, lhs: &Expr, new_pack: Value) {
+        match lhs {
+            Expr::Ident { name, .. } => {
+                if let Some(slot) = self.b().lookup_local_slot(name) {
+                    self.b().emit(Instr::Store {
+                        slot,
+                        value: new_pack,
+                    });
+                } else if let Some(class_name) = self.current_class.clone() {
+                    if let Some(offset) = self.lookup_field_offset(&class_name, name) {
+                        let base = self.load_self();
+                        self.b().emit(Instr::FieldStore {
+                            base,
+                            byte_offset: offset,
+                            value: new_pack,
+                        });
+                    }
+                }
+            }
+            Expr::Binary {
+                op: BinaryOp::Dot,
+                lhs: receiver,
+                rhs,
+                ..
+            } => {
+                if let (Some(class_name), Expr::Ident { name: field, .. }) =
+                    (self.class_name_of_expr(receiver), rhs.as_ref())
+                {
+                    let base = self.lower_expr(receiver);
+                    if let Some(offset) = self.lookup_field_offset(&class_name, field) {
+                        self.b().emit(Instr::FieldStore {
+                            base,
+                            byte_offset: offset,
+                            value: new_pack,
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Emit a `__newbcpl_safepoint()` call with no result. Inserted

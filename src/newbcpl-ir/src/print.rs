@@ -213,6 +213,20 @@ fn render_instr(i: &Instr) -> String {
             render_value(lane),
             hint.as_str()
         ),
+        Instr::LaneInsert {
+            dst,
+            vector,
+            lane,
+            value,
+            kind,
+        } => format!(
+            "%{} = lane_insert {} into {}[{}] := {}",
+            dst.0,
+            kind.as_str(),
+            render_value(vector),
+            render_value(lane),
+            render_value(value)
+        ),
         Instr::MethodCall {
             dst,
             receiver,
