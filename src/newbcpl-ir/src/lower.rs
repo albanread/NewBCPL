@@ -343,18 +343,91 @@ impl<'a> Lowerer<'a> {
     /// Walk a `CLASS` declaration and emit each method as a regular
     /// IR function with name `{class}_{method}`. The implicit
     /// receiver `SELF` becomes the first parameter (typed OBJECT).
-    /// Field initialisers inside the class body are not yet
-    /// lowered as IR — the layout pass already records them; CREATE
-    /// is responsible for explicit initialisation.
+    ///
+    /// Field initialisers (`LET f = expr` / `FLET f = expr` inside
+    /// the class body) are prepended to CREATE's body — every
+    /// initialiser becomes a `SELF.field := expr` store that runs
+    /// before any user CREATE code. If the class has initialisers
+    /// but no user CREATE, we synthesise a `<Class>_CREATE(self)`
+    /// whose only purpose is to run those stores. Sema injects a
+    /// matching synthetic ClassMethodInfo so the layout's vtable
+    /// slot 0 gets wired to the synthesised function.
     fn lower_class(&mut self, c: &ClassDecl) {
+        let initialisers = collect_field_initialisers(c);
+        let mut user_create_present = false;
         for member in &c.members {
             if let ClassMemberKind::Method(m) = &member.kind {
-                self.lower_method(&c.name, m);
+                if m.name == "CREATE" {
+                    user_create_present = true;
+                    self.lower_method(&c.name, m, &initialisers);
+                } else {
+                    self.lower_method(&c.name, m, &[]);
+                }
+            }
+        }
+        if !user_create_present && !initialisers.is_empty() {
+            self.lower_synthetic_create(&c.name, c.span, &initialisers);
+        }
+    }
+
+    /// Emit the IR function `<Class>_CREATE(self)` whose body is just
+    /// the field-initialiser stores. Used when the class declares
+    /// `LET f = expr` members but no explicit `CREATE` routine — sema
+    /// injected a synthetic ClassMethodInfo so the layout treats the
+    /// slot as defined; this is the matching IR function the vtable
+    /// patcher binds it to.
+    fn lower_synthetic_create(
+        &mut self,
+        class_name: &str,
+        class_span: Span,
+        initialisers: &[(String, &Expr)],
+    ) {
+        let mangled = mangle_method(class_name, "CREATE");
+        let params = vec!["SELF".to_string()];
+        self.start_function(&mangled, &params, TypeHint::Word);
+        if let Some(b) = self.current.as_mut() {
+            if let Some(info) = b.scopes.last_mut().and_then(|s| s.get_mut("SELF")) {
+                info.class_name = Some(class_name.to_string());
+            }
+        }
+        self.current_class = Some(class_name.to_string());
+        self.emit_field_initialisers(class_name, initialisers);
+        if self.b().current_open() {
+            self.b().terminate(Terminator::Return(None));
+        }
+        self.current_class = None;
+        let _ = class_span;
+        self.finish_function();
+    }
+
+    /// Emit `SELF.field := expr` for every entry in `initialisers`,
+    /// in source order. The current function must already have a
+    /// SELF binding in scope (set up by `start_function` and tagged
+    /// with the class name).
+    fn emit_field_initialisers(
+        &mut self,
+        class_name: &str,
+        initialisers: &[(String, &Expr)],
+    ) {
+        for (name, init) in initialisers {
+            let value = self.lower_expr(init);
+            if let Some(offset) = self.lookup_field_offset(class_name, name) {
+                let self_v = self.load_self();
+                self.b().emit(Instr::FieldStore {
+                    base: self_v,
+                    byte_offset: offset,
+                    value,
+                });
             }
         }
     }
 
-    fn lower_method(&mut self, class_name: &str, m: &ClassMethod) {
+    fn lower_method(
+        &mut self,
+        class_name: &str,
+        m: &ClassMethod,
+        prepend_initialisers: &[(String, &Expr)],
+    ) {
         let mangled = mangle_method(class_name, &m.name);
         // Build the method's parameter list with SELF as the first
         // implicit param. Real BCPL params follow.
@@ -380,6 +453,13 @@ impl<'a> Lowerer<'a> {
             }
         }
         self.current_class = Some(class_name.to_string());
+
+        // Field initialisers run before the user's CREATE body so the
+        // user can see initialised slots from CREATE. Only CREATE
+        // receives this prepend — see `lower_class`.
+        if !prepend_initialisers.is_empty() {
+            self.emit_field_initialisers(class_name, prepend_initialisers);
+        }
 
         match &m.body {
             ClassMethodBody::Routine(stmt) => {
@@ -2369,6 +2449,33 @@ fn simd_kind_from_hint(h: TypeHint) -> Option<crate::ir::TypedKind> {
 /// when populating the vtable globals.
 pub fn mangle_method(class_name: &str, method_name: &str) -> String {
     format!("{class_name}_{method_name}")
+}
+
+/// Extract every `LET name = expr` and `FLET name = expr` field
+/// initialiser declared in a class body, in source order. The
+/// returned list pairs the field name with a reference to the
+/// initialiser expression. Uninitialised forms (`DECL x`, plain
+/// `LET x, y` field declarations via `ClassMemberKind::Fields`,
+/// or `FLET x` without `=`) are skipped — they have no initial
+/// value to lower.
+fn collect_field_initialisers(c: &ClassDecl) -> Vec<(String, &Expr)> {
+    let mut out: Vec<(String, &Expr)> = Vec::new();
+    for member in &c.members {
+        match &member.kind {
+            ClassMemberKind::Let(let_decl) => {
+                for (name, expr) in &let_decl.bindings {
+                    out.push((name.clone(), expr));
+                }
+            }
+            ClassMemberKind::FLet(b) => {
+                if let Some(expr) = &b.value {
+                    out.push((b.name.clone(), expr));
+                }
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Map a list / vector keyword operator to its runtime helper

@@ -389,6 +389,51 @@ fn break_releases_inner_using_only() {
     );
 }
 
+// ─── Field initialisers run at NEW ────────────────────────────────
+//
+// `CLASS Holder $( LET held = NEW Inner $)` registers `held` in the
+// layout, but the initialiser expression has to be lowered too —
+// otherwise `held` reads zero forever and only an explicit CREATE
+// can populate it. Sema injects a synthetic CREATE entry when
+// initialisers exist; IR lowering emits the matching `<Class>_CREATE`
+// (or prepends stores to a user-written CREATE).
+
+#[test]
+fn field_initialiser_runs_at_new_no_user_create() {
+    // `LET x = 42` inside a class without an explicit CREATE — the
+    // synthesised CREATE runs the initialiser on every `NEW`.
+    expect(
+        "field_initialiser_runs_at_new_no_user_create",
+        "CLASS P $(\n  LET x = 42\n$)\nLET START() BE $(\n  LET p = NEW P\n  WRITEN(p.x)\n$)\n",
+        "42",
+    );
+}
+
+#[test]
+fn field_initialisers_prepended_to_user_create() {
+    // A user CREATE coexisting with field initialisers — the
+    // initialisers must run *before* the user body sees SELF, so
+    // CREATE can override or read them.
+    expect(
+        "field_initialisers_prepended_to_user_create",
+        "CLASS P $(\n  LET x = 7\n  LET y = 3\n  ROUTINE CREATE() BE SELF.y := SELF.y + SELF.x\n$)\nLET START() BE $(\n  LET p = NEW P\n  WRITEN(p.x) WRITES(\"*S\") WRITEN(p.y)\n$)\n",
+        "7 10",
+    );
+}
+
+#[test]
+fn class_typed_field_initialiser_resolves_chain() {
+    // The initialiser allocates a fresh `Inner`. After NEW, the chain
+    // `outer.inner.value` works because (a) the initialiser stored
+    // the Inner, and (b) sema's AS-resolution pass tagged the field
+    // with class identity for the chain dispatch.
+    expect(
+        "class_typed_field_initialiser_resolves_chain",
+        "CLASS Inner $(\n  DECL value\n  ROUTINE CREATE() BE SELF.value := 100\n$)\nCLASS Outer $(\n  LET inner = NEW Inner\n$)\nLET START() BE $(\n  LET o = NEW Outer\n  WRITEN(o.inner.value)\n$)\n",
+        "100",
+    );
+}
+
 // ─── Two-field accessors / setters ────────────────────────────────
 
 #[test]

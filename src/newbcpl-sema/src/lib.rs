@@ -692,6 +692,34 @@ impl Sema {
                 }
             }
         }
+        // If the class has any field initialisers (`LET f = expr` /
+        // `FLET f = expr` members) but the user didn't write CREATE,
+        // inject a synthetic CREATE entry so the layout marks slot 0
+        // as defined. IR lowering will emit the matching synthetic
+        // `<Class>_CREATE(self)` whose body runs the initialisers,
+        // and the vtable patcher will wire slot 0 to it. Without this,
+        // a SUPER.CREATE() in a subclass would dispatch to the no-op
+        // default-method stub.
+        let has_user_create = methods.iter().any(|m| m.name == "CREATE");
+        let has_initialisers = c.members.iter().any(|m| match &m.kind {
+            ClassMemberKind::Let(let_decl) => !let_decl.bindings.is_empty(),
+            ClassMemberKind::FLet(b) => b.value.is_some(),
+            _ => false,
+        });
+        if has_initialisers && !has_user_create {
+            methods.push(ClassMethodInfo {
+                name: "CREATE".to_string(),
+                kind: FunctionKind::Routine,
+                params: Vec::new(),
+                result: TypeHint::Word,
+                result_class_name: None,
+                is_virtual: false,
+                is_final: false,
+                visibility: Visibility::Public,
+                span: c.span,
+            });
+        }
+
         let info = ClassInfo {
             name: c.name.clone(),
             extends: c.extends.clone(),
