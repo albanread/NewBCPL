@@ -472,9 +472,60 @@ fn run_program_ir(ir: &IrModule, modules_dir: Option<&Path>) -> Result<i64, Stri
     // OS by our custom memory manager's `finalize_memory`).
     type StartFn = unsafe extern "C-unwind" fn() -> i64;
     let start: StartFn = unsafe { std::mem::transmute(start_addr as *const ()) };
-    let result = unsafe { start() };
+    // Wrap in `catch_unwind` so a panic from inside the JIT frame is
+    // turned into a clean Err for the host — `newbcpl-driver run`
+    // turns this into a non-zero exit + diagnostic, `gui` lets the
+    // editor keep running. `AssertUnwindSafe` because a function
+    // pointer carries no `UnwindSafe` evidence on its own; we're
+    // promising the JIT'd code doesn't leave shared state in a
+    // logically-broken state (it can't — START is the root call).
+    // Stack state unwinds cleanly thanks to the SEH machinery the
+    // memory manager registers.
+    //
+    // While the catch is in flight we swap in a no-op panic hook so
+    // the default Rust hook doesn't dump a "thread panicked at..."
+    // line to stderr for an *expected* unwind. The original hook is
+    // restored on the way out. Set NEWBCPL_LOG_JIT_PANICS=1 to keep
+    // the default hook for debugging.
+    let outcome = run_with_quiet_panic_hook(|| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { start() }))
+    });
+    match outcome {
+        Ok(value) => Ok(value),
+        Err(payload) => Err(format!("JIT panic: {}", panic_payload_to_string(payload))),
+    }
+}
 
-    Ok(result)
+/// Run `body` with the global panic hook temporarily silenced. Used
+/// around the `catch_unwind` boundary so the default hook doesn't
+/// print "thread … panicked at …" for a panic the host is about to
+/// recover from. `NEWBCPL_LOG_JIT_PANICS=1` keeps the existing hook
+/// so a developer chasing a real bug still sees the message.
+fn run_with_quiet_panic_hook<F, R>(body: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    if std::env::var_os("NEWBCPL_LOG_JIT_PANICS").is_some() {
+        return body();
+    }
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let result = body();
+    std::panic::set_hook(previous);
+    result
+}
+
+/// Best-effort conversion of a `catch_unwind` payload to a human
+/// message. `panic!("…")` and `panic_any(String)` are the common
+/// cases. Other payload types fall through to a generic marker.
+fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        return (*s).to_string();
+    }
+    if let Some(s) = payload.downcast_ref::<String>() {
+        return s.clone();
+    }
+    "<non-string panic payload>".to_string()
 }
 
 fn build_ir(path: &Path) -> Result<IrModule, String> {
