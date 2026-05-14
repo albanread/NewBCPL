@@ -239,12 +239,54 @@ impl Parser {
         Ok(Decl::Static(NamedBindingsDecl { bindings, span }))
     }
 
-    /// `GLOBAL $( name : offset; ... $)` (classic) or
-    /// `GLOBALS $( LET name = expr; ... $)` (dialect). Both forms share
-    /// the same AST node; only the binding values' meaning differs.
+    /// `GLOBAL` declarations. Two surface shapes:
+    ///   `GLOBAL name = expr`                              — single binding
+    ///   `GLOBAL $( name = expr; name = expr; ... $)`      — batch
+    ///
+    /// Each binding becomes a module-scope (scope 0) variable backed
+    /// by an LLVM module-level `@global`. Cross-module references
+    /// resolve through the loader's symbol table — no fixed-offset
+    /// slot vector. The classic `name : K` slot-pinning syntax is
+    /// rejected; users wanting that should know it isn't available
+    /// (it was the *GLOBALS* form, which we don't carry).
+    ///
+    /// `GLOBALS` (plural) is the legacy form: a single shared
+    /// pointer vector indexed by integer offsets. NewBCPL has a real
+    /// loader and doesn't need it, so we reject the keyword with a
+    /// hint pointing at the modern form. The keyword is still
+    /// reserved in the lexer so this diagnostic fires reliably.
     fn parse_global_decl(&mut self) -> Result<Decl, ParseError> {
         let kw = self.eat();
-        let bindings = self.parse_named_bindings_block(false)?;
+        if kw.lexeme == "GLOBALS" {
+            return Err(ParseError::new(
+                "GLOBALS (the classic slot-pinning global-vector form) is \
+                 not supported in NewBCPL — the loader's symbol table \
+                 already provides cross-module name resolution. Use \
+                 `GLOBAL name = expr` (single) or \
+                 `GLOBAL $( name = expr; ... $)` (block) instead.",
+                kw.span,
+            ));
+        }
+        let bindings = if self.check_sym("$(") || self.check_sym("{") {
+            self.parse_named_bindings_block_with_options(
+                /*init_required=*/ true,
+                /*allow_colon=*/ false,
+            )?
+        } else {
+            // Single-line form: `GLOBAL name = expr`.
+            let name_tok = self.eat_identifier()?;
+            self.expect_sym("=")?;
+            let value = self.parse_expr()?;
+            let end = value.span().end;
+            vec![NamedBinding {
+                name: name_tok.lexeme.clone(),
+                value: Some(value),
+                span: SourceSpan {
+                    start: name_tok.span.start,
+                    end,
+                },
+            }]
+        };
         let span = SourceSpan {
             start: kw.span.start,
             end: bindings
@@ -814,6 +856,19 @@ impl Parser {
         &mut self,
         init_required: bool,
     ) -> Result<Vec<NamedBinding>, ParseError> {
+        self.parse_named_bindings_block_with_options(init_required, /*allow_colon=*/ true)
+    }
+
+    /// Like `parse_named_bindings_block` but with a knob for whether
+    /// the slot-pinning `name : K` syntax is allowed. GLOBAL passes
+    /// `allow_colon=false` so that classic-BCPL slot syntax produces
+    /// a clear diagnostic (the slot-vector form is GLOBALS, which we
+    /// don't support).
+    fn parse_named_bindings_block_with_options(
+        &mut self,
+        init_required: bool,
+        allow_colon: bool,
+    ) -> Result<Vec<NamedBinding>, ParseError> {
         let open = self.eat();
         let close_lex = match open.lexeme.as_str() {
             "$(" => "$)",
@@ -848,6 +903,19 @@ impl Parser {
                 self.eat();
             }
             let name_tok = self.eat_identifier()?;
+            if self.check_sym(":") && !allow_colon {
+                let span = self.peek().span;
+                return Err(ParseError::new(
+                    format!(
+                        "`{}: K` slot-pinning is the classic GLOBALS form; \
+                         NewBCPL replaces the global vector with the loader's \
+                         symbol table. Use `{name} = expr` instead.",
+                        name_tok.lexeme,
+                        name = name_tok.lexeme,
+                    ),
+                    span,
+                ));
+            }
             let value = if self.check_sym("=") || self.check_sym(":") {
                 self.eat();
                 Some(self.parse_expr()?)

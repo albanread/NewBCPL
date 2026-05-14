@@ -1177,8 +1177,11 @@ mod tests {
     }
 
     #[test]
-    fn parses_globals_with_let() {
-        let p = parse_ok("GLOBALS $(\n  LET x = 1\n  LET y = 2\n$)");
+    fn parses_global_block_form() {
+        // `GLOBAL $( name = expr; ... $)` is the batch form for
+        // module-scope bindings. Each becomes a single LLVM
+        // `@<name>` global in IR/LLVM emit.
+        let p = parse_ok("GLOBAL $(\n  x = 1\n  y = 2\n$)");
         let Decl::Global(g) = &p.items[0] else {
             panic!();
         };
@@ -1188,13 +1191,42 @@ mod tests {
     }
 
     #[test]
-    fn parses_classic_global_with_offset() {
-        let p = parse_ok("GLOBAL $( frob : 100; quux : 101 $)");
+    fn parses_global_single_form() {
+        // `GLOBAL name = expr` is the single-line form, equivalent
+        // to a one-entry block. Common shape for the typical
+        // "one global per declaration" use.
+        let p = parse_ok("GLOBAL counter = 0");
         let Decl::Global(g) = &p.items[0] else {
             panic!();
         };
-        assert_eq!(g.bindings.len(), 2);
-        assert_eq!(g.bindings[0].name, "frob");
+        assert_eq!(g.bindings.len(), 1);
+        assert_eq!(g.bindings[0].name, "counter");
+    }
+
+    #[test]
+    fn globals_keyword_rejected() {
+        // The plural `GLOBALS` (classic slot-vector form) is not
+        // supported in NewBCPL — the loader's symbol table replaces
+        // it. Parser produces a clear pointer toward `GLOBAL`.
+        let err = parse_err("GLOBALS $( wrch : 8 $)");
+        assert!(
+            err.message.contains("GLOBALS"),
+            "expected GLOBALS-rejection message, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn global_slot_colon_form_rejected() {
+        // `GLOBAL $( name : K $)` is the legacy GLOBALS slot syntax;
+        // under `GLOBAL` it's a category error. The parser points
+        // users at `=`.
+        let err = parse_err("GLOBAL $( frob : 100 $)");
+        assert!(
+            err.message.contains("slot-pinning"),
+            "expected slot-pinning rejection, got: {}",
+            err.message
+        );
     }
 
     #[test]

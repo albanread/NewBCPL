@@ -136,10 +136,36 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
         // first word of every instance.
         self.declare_vtable_globals(&ir.layouts);
         self.declare_typedesc_globals(&ir.layouts);
+        // Pass 2b: emit each `GLOBAL`-declared module-level
+        // variable. They go in as plain `@<name> = global i64
+        // <init>` slots so `GlobalLoad` / `GlobalStore` can
+        // resolve by symbol. External linkage so cross-module
+        // references reach them via the loader's symbol table.
+        self.declare_globals(&ir.globals);
         // Pass 3: emit each body. Per-function maps reset between
         // functions since ValueIds and BlockIds are function-local.
         for f in &ir.functions {
             self.emit_function(f);
+        }
+    }
+
+    /// One LLVM module-level `@<name>` per `GLOBAL` declaration.
+    /// The initializer is the constant integer when sema folded one,
+    /// else zero. External linkage so the loader's symbol table can
+    /// resolve cross-module references against the same address.
+    fn declare_globals(&mut self, globals: &[newbcpl_ir::GlobalDecl]) {
+        use inkwell::module::Linkage;
+        let i64_t = self.context.i64_type();
+        for g in globals {
+            // If the loader has already linked another module that
+            // declared the same name, reuse it — otherwise create.
+            if self.module.get_global(&g.name).is_some() {
+                continue;
+            }
+            let gv = self.module.add_global(i64_t, None, &g.name);
+            gv.set_linkage(Linkage::External);
+            let init = i64_t.const_int(g.initial.unwrap_or(0) as u64, true);
+            gv.set_initializer(&init);
         }
     }
 
@@ -684,6 +710,45 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
                         .expect("indirect load");
                     self.value_map.insert(*dst, loaded);
                 }
+            }
+            Instr::GlobalLoad { dst, name, hint } => {
+                // `GLOBAL <name>` reads — emit `load i64, ptr @<name>`.
+                // If the global doesn't exist in this module
+                // (cross-module reference, loader linked it from
+                // another translation unit), declare an external
+                // stub so the linker can resolve it.
+                let gv = match self.module.get_global(name) {
+                    Some(g) => g,
+                    None => {
+                        let i64_t = self.context.i64_type();
+                        let g = self.module.add_global(i64_t, None, name);
+                        g.set_linkage(inkwell::module::Linkage::External);
+                        g
+                    }
+                };
+                let ty = self.basic_type_for(*hint);
+                let ptr = gv.as_pointer_value();
+                let loaded = self
+                    .builder
+                    .build_load(ty, ptr, "gload")
+                    .expect("global load");
+                self.value_map.insert(*dst, loaded);
+            }
+            Instr::GlobalStore { name, value } => {
+                let gv = match self.module.get_global(name) {
+                    Some(g) => g,
+                    None => {
+                        let i64_t = self.context.i64_type();
+                        let g = self.module.add_global(i64_t, None, name);
+                        g.set_linkage(inkwell::module::Linkage::External);
+                        g
+                    }
+                };
+                let ptr = gv.as_pointer_value();
+                let v = self.lower_value(value);
+                self.builder
+                    .build_store(ptr, v)
+                    .expect("global store");
             }
             Instr::IndirectStore {
                 addr,

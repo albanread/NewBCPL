@@ -26,6 +26,18 @@ pub struct Module {
     pub name: String,
     pub functions: Vec<Function>,
     pub layouts: Vec<ClassLayout>,
+    /// `GLOBAL`-declared bindings — each becomes a module-level
+    /// LLVM `@<name>` global. The optional integer is the
+    /// initializer when sema can constant-fold it; `None` falls
+    /// back to a zero-init slot.
+    pub globals: Vec<GlobalDecl>,
+}
+
+/// One `GLOBAL` binding promoted to a module-level slot.
+#[derive(Debug, Clone)]
+pub struct GlobalDecl {
+    pub name: String,
+    pub initial: Option<i64>,
 }
 
 /// Stable, monotonically-allocated identifier for a value produced
@@ -182,6 +194,19 @@ pub enum Instr {
         addr: Value,
         value: Value,
         byte_width: u32,
+    },
+    /// Read from a `GLOBAL`-declared module-level variable by name.
+    /// Codegen emits `load i64, ptr @<name>`.
+    GlobalLoad {
+        dst: ValueId,
+        name: String,
+        hint: TypeHint,
+    },
+    /// Write to a `GLOBAL`-declared module-level variable by name.
+    /// Codegen emits `store i64 <value>, ptr @<name>`.
+    GlobalStore {
+        name: String,
+        value: Value,
     },
     /// `base + index * element_bytes` — pointer arithmetic for
     /// subscripts. `element_bytes` is 8 for word vectors (`v!i`),

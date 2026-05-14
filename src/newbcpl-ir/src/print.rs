@@ -179,6 +179,17 @@ fn render_instr(i: &Instr) -> String {
             render_value(addr),
             render_value(value)
         ),
+        Instr::GlobalLoad { dst, name, hint } => format!(
+            "%{} = gload @{} : {}",
+            dst.0,
+            name,
+            hint.as_str()
+        ),
+        Instr::GlobalStore { name, value } => format!(
+            "gstore @{}, {}",
+            name,
+            render_value(value)
+        ),
         Instr::Gep {
             dst,
             base,

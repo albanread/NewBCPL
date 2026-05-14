@@ -27,21 +27,35 @@ use crate::ir::*;
 /// caller must have run `newbcpl_sema::analyze(&program)` first so
 /// expressions carry their hints.
 pub fn lower(program: &Program, sema: &SemaOutput, module_name: &str) -> Module {
-    let mut lowerer = Lowerer::new(&sema.layouts, &sema.manifests);
+    let mut lowerer = Lowerer::new(&sema.layouts, &sema.manifests, &sema.globals);
     for decl in &program.items {
         match decl {
             Decl::Routine(r) => lowerer.lower_routine(r),
             Decl::Function(f) => lowerer.lower_function(f),
             Decl::Class(c) => lowerer.lower_class(c),
             // Top-level decls that don't produce IR functions
-            // (GET / MANIFEST / STATIC / GLOBAL) are skipped.
+            // (GET / MANIFEST / STATIC / GLOBAL) are skipped — GLOBALs
+            // are surfaced as `Module::globals` (collected below) for
+            // codegen to emit as LLVM module-level variables.
             _ => {}
         }
     }
+    let mut globals: Vec<GlobalDecl> = sema
+        .globals
+        .iter()
+        .map(|(name, init)| GlobalDecl {
+            name: name.clone(),
+            initial: *init,
+        })
+        .collect();
+    // Deterministic order — `cargo test` outputs and `dump-llvm`
+    // both benefit from a stable sort.
+    globals.sort_by(|a, b| a.name.cmp(&b.name));
     Module {
         name: module_name.to_string(),
         functions: lowerer.functions,
         layouts: sema.layouts.clone(),
+        globals,
     }
 }
 
@@ -53,6 +67,11 @@ struct Lowerer<'a> {
     /// inline substitution — the BCPL convention treats a MANIFEST
     /// as a compile-time integer, not a runtime binding.
     manifests: &'a std::collections::HashMap<String, i64>,
+    /// `GLOBAL` bindings from sema. When an identifier hits this
+    /// set, lowering emits `GlobalLoad` / `GlobalStore` against the
+    /// module-level `@<name>` slot instead of treating it as a
+    /// stack-local or an unbound extern.
+    globals: &'a std::collections::HashMap<String, Option<i64>>,
     /// Set while lowering a class method body. Allows bare-field
     /// identifiers (`x` inside `Point.set`) to resolve as
     /// SELF-relative field accesses, and lets `class_name_of_expr`
@@ -306,12 +325,14 @@ impl<'a> Lowerer<'a> {
     fn new(
         layouts: &'a [ClassLayout],
         manifests: &'a std::collections::HashMap<String, i64>,
+        globals: &'a std::collections::HashMap<String, Option<i64>>,
     ) -> Self {
         Self {
             functions: Vec::new(),
             current: None,
             layouts,
             manifests,
+            globals,
             current_class: None,
             using_cleanups: Vec::new(),
         }
@@ -1584,6 +1605,16 @@ impl<'a> Lowerer<'a> {
                 Expr::Ident { name, .. } => {
                     if let Some(slot) = self.b().lookup_local_slot(name) {
                         self.b().emit(Instr::Store { slot, value: v });
+                    } else if self.globals.contains_key(name) {
+                        // GLOBAL binding: store to the module-level
+                        // slot via `@<name>`. The symbol must already
+                        // exist in the LLVM module — codegen emits
+                        // it once per Module::globals entry up
+                        // front, before any function lowering.
+                        self.b().emit(Instr::GlobalStore {
+                            name: name.clone(),
+                            value: v,
+                        });
                     } else if let Some(class_name) = self.current_class.clone() {
                         // Bare-field assignment inside a class
                         // method: `x := initialX` → field store
@@ -2006,6 +2037,19 @@ impl<'a> Lowerer<'a> {
         // rather than a function reference.
         if let Some(&v) = self.manifests.get(name) {
             return Value::Const(Const::Int(v));
+        }
+        // GLOBAL bindings: read from the module-level slot. Sema
+        // populated `self.globals` from every `GLOBAL <name> = expr`
+        // / `GLOBAL $( name = expr; ... $)` declaration. Codegen
+        // emits `load i64, ptr @<name>`.
+        if self.globals.contains_key(name) {
+            let dst = self.b().alloc_value();
+            self.b().emit(Instr::GlobalLoad {
+                dst,
+                name: name.to_string(),
+                hint,
+            });
+            return Value::Local(dst);
         }
         // Inside a class method body, an unrecognised bare name may
         // be a field on `SELF`. Resolve through the surrounding

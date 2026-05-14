@@ -156,6 +156,14 @@ pub struct SemaOutput {
     /// (BCPL convention: a MANIFEST is a compile-time constant, not
     /// a real binding with a runtime address).
     pub manifests: std::collections::HashMap<String, i64>,
+    /// Names declared with `GLOBAL`. Each becomes an LLVM
+    /// module-level `@<name>` global with the given initialiser.
+    /// IR lowering consults this set so reads/writes of a global
+    /// emit `GlobalLoad` / `GlobalStore` instead of falling through
+    /// to the unbound-extern path. Maps name → initial integer
+    /// value when the initialiser is a compile-time constant; `None`
+    /// otherwise (codegen leaves the slot zero-initialised then).
+    pub globals: std::collections::HashMap<String, Option<i64>>,
     /// Non-fatal diagnostics. Sema never fails on type grounds, so
     /// every interesting observation lands here.
     pub warnings: Vec<SemaWarning>,
@@ -196,6 +204,7 @@ pub fn analyze(program: &Program) -> SemaOutput {
         functions: sema.function_log,
         layouts,
         manifests: sema.manifests,
+        globals: sema.globals,
         warnings: sema.warnings,
     }
 }
@@ -380,6 +389,11 @@ struct Sema {
     /// `MANIFEST` constants — name → integer value. Lowering uses
     /// this to substitute the literal value at every reference site.
     manifests: HashMap<String, i64>,
+    /// `GLOBAL` bindings — name → optional compile-time int
+    /// initialiser. IR lowering emits an LLVM module-level global
+    /// for each entry; reads/writes route through it instead of
+    /// trying to resolve a local slot.
+    globals: HashMap<String, Option<i64>>,
     /// How many loop bodies (WHILE / UNTIL / FOR / FOREACH / REPEAT
     /// family) are currently open. `BREAK` / `LOOP` warn when 0.
     loop_depth: u32,
@@ -401,6 +415,7 @@ impl Sema {
             function_log: Vec::new(),
             valof_results: Vec::new(),
             manifests: HashMap::new(),
+            globals: HashMap::new(),
             loop_depth: 0,
             switchon_depth: 0,
             warnings: Vec::new(),
@@ -810,6 +825,18 @@ impl Sema {
                         .map(|e| self.type_of(e))
                         .unwrap_or(TypeHint::Word);
                     self.declare(&b.name, hint, None, b.span);
+                    // Record the initial value when it's a
+                    // compile-time integer constant — IR lowering
+                    // sets that as the LLVM `@global`'s initializer.
+                    // Anything more complex falls back to a
+                    // zero-initialised slot plus a CREATE-time write
+                    // in lowering (handled by a synthesised entry
+                    // routine if/when we add one).
+                    let init = match &b.value {
+                        Some(Expr::IntLit { value, .. }) => Some(*value),
+                        _ => None,
+                    };
+                    self.globals.insert(b.name.clone(), init);
                 }
             }
             Decl::Class(c) => self.analyze_class_body(c),

@@ -479,10 +479,28 @@ $)
 
 A `MANIFEST` value is substituted at every reference site; it has no
 runtime address. A `STATIC` has a single address whose lifetime is the
-whole program. Inside a `GLOBAL` or `GLOBALS` declaration the same
-shape declares slots in the global indirection vector — the classic
-form `name : 42` pins to slot 42, the modern form `LET name = expr`
-lets the loader pick.
+whole program. A `GLOBAL` introduces a module-scope binding — visible
+from every routine in the file, and from other modules through the
+loader's symbol table:
+
+```bcpl
+GLOBAL counter = 0
+GLOBAL $(
+    cursor = 0
+    flags  = 0
+$)
+```
+
+Each binding becomes a single named slot. Reads and writes route
+through the symbol; cross-module references resolve at link time the
+same way function calls do. The single-line form (`GLOBAL counter = 0`)
+and the block form are interchangeable.
+
+The classic `GLOBALS $( name : 42; ... $)` form — slot-pinning into a
+shared pointer vector — is **not** carried in NewBCPL. The loader's
+symbol table already does the cross-module job, so the global-vector
+machinery would be redundant; the compiler rejects `GLOBALS` and the
+`name : K` slot syntax with a parse error pointing at `GLOBAL` instead.
 
 ### 3.6 `GET` Directives
 

@@ -4,7 +4,7 @@
 //! exercises one shape and asserts on a small output that
 //! identifies which path the runtime actually took.
 
-use newbcpl_tests::expect_stdout as expect;
+use newbcpl_tests::{expect_reject, expect_stdout as expect};
 
 // ─── Conditionals: IF / UNLESS / TEST ─────────────────────────────
 
@@ -305,5 +305,67 @@ fn goto_into_loop_body() {
         "goto_into_loop_body",
         "LET START() BE $(\n  LET n = 0\n  GOTO mid\n  WRITES(\"unreached*N\")\nmid:\n  WRITEN(n)\n$)\n",
         "0",
+    );
+}
+
+// ─── GLOBAL declarations ──────────────────────────────────────────
+//
+// `GLOBAL name = expr` (single) and `GLOBAL $( name = expr; ... $)`
+// (block) declare module-scope bindings backed by LLVM module-level
+// globals. Reads/writes route through `@<name>`; cross-routine
+// visibility is the headline property.
+
+#[test]
+fn global_single_form_writes_visible_in_start() {
+    expect(
+        "global_single_form_writes_visible_in_start",
+        "GLOBAL counter = 0\nLET START() BE $(\n  counter := 42\n  WRITEN(counter)\n$)\n",
+        "42",
+    );
+}
+
+#[test]
+fn global_block_form_writes_visible_in_start() {
+    expect(
+        "global_block_form_writes_visible_in_start",
+        "GLOBAL $(\n  a = 1\n  b = 2\n$)\nLET START() BE $(\n  a := 10\n  b := 20\n  WRITEN(a) WRITES(\"*S\") WRITEN(b)\n$)\n",
+        "10 20",
+    );
+}
+
+#[test]
+fn global_seen_from_separate_routine() {
+    // A GLOBAL is visible from any routine in the module — that's
+    // the point. The increment routine modifies the slot;
+    // START reads it.
+    expect(
+        "global_seen_from_separate_routine",
+        "GLOBAL count = 0\nLET bump() BE count := count + 1\nLET START() BE $(\n  bump()\n  bump()\n  bump()\n  WRITEN(count)\n$)\n",
+        "3",
+    );
+}
+
+#[test]
+fn globals_slot_form_rejected() {
+    // Plural `GLOBALS` (classic slot-vector form) is not supported.
+    // Parse error pointing users at `GLOBAL`.
+    expect_reject(
+        "globals_slot_form_rejected",
+        "run",
+        "GLOBALS $( wrch : 8 $)\nLET START() BE WRITES(\"hi\")\n",
+        "GLOBALS",
+    );
+}
+
+#[test]
+fn global_colon_slot_syntax_rejected() {
+    // The `name : K` slot form is the GLOBALS shape. Even under
+    // `GLOBAL`, we reject `:` so users don't accidentally rely on
+    // unimplemented slot pinning.
+    expect_reject(
+        "global_colon_slot_syntax_rejected",
+        "run",
+        "GLOBAL $( foo : 8 $)\nLET START() BE WRITES(\"hi\")\n",
+        "slot-pinning",
     );
 }

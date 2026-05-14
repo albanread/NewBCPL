@@ -15,8 +15,8 @@ pub mod print;
 use std::path::Path;
 
 pub use ir::{
-    BasicBlock, BlockId, Const, Function, Instr, IrBinOp, IrUnOp, Module, Param, Terminator,
-    TypedKind, Value, ValueId,
+    BasicBlock, BlockId, Const, Function, GlobalDecl, Instr, IrBinOp, IrUnOp, Module, Param,
+    Terminator, TypedKind, Value, ValueId,
 };
 // Re-export sema's `ClassLayout` as a convenience: it travels with
 // every IR `Module` (see `Module.layouts`), so downstream consumers

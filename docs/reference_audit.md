@@ -102,8 +102,9 @@ Reference precedence table (high → low): `()`, `! OF`, `@ !`, `* / REM`,
 | `FLET` float binding | ✓ | Tier 2 |
 | `MANIFEST $( N = K; ... $)` | ✓ | Tier 2; lowering substitutes inline |
 | `STATIC $( N = K; ... $)` | ✓ | Tier 2 |
-| `GLOBAL $( name : offset; ... $)` classic slot-pinning | ✗ | Parses + sema records the binding, but IR lowering doesn't emit a runtime slot → JIT reports `missing builtin: <name>`. Real implementation gap, not a probe gap. |
-| `GLOBALS` modern form | ⚠ | Same shape as `GLOBAL`; needs a behavioural probe |
+| `GLOBAL name = expr` (single) / `GLOBAL $( name = expr; ... $)` (block) | ✓ | Each binding becomes a module-level `@<name>` LLVM global. Cross-routine, cross-module reads/writes work end-to-end. Tier 4 probes. |
+| `GLOBAL name : K` (classic slot-pinning shape) | Δ | Rejected by the parser. The slot-vector form is the legacy GLOBALS shape (see below); under `GLOBAL` it's a category error. |
+| `GLOBALS $( name : slot; ... $)` (classic global-vector) | Δ | Deliberately not supported — the loader's symbol table replaces the global-pointer-vector linker that GLOBALS was designed for. Parser rejects with a hint pointing at `GLOBAL`. |
 | `LET v = VEC k` | ✓ | Tier 6 |
 | `LET v = FVEC k` | ✓ | Tier 6 |
 | `LET F(p) = expr` function | ✓ | Tier 3 |
