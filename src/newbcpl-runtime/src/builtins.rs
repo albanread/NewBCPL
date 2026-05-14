@@ -1145,6 +1145,18 @@ mod heap_tests {
     use super::*;
     use crate::gc;
 
+    /// All heap tests share the global GC state (`gc::HEAP_COUNTERS`,
+    /// the allocator, the live-block list) with `gc::tests::*`. Cargo
+    /// runs `#[test]`s in parallel by default; one test firing a
+    /// stop-the-world collect while another is mid-allocation in an
+    /// unregistered TLAB produced sporadic STATUS_ACCESS_VIOLATION on
+    /// Windows. Serialise through the same `lock_tests_global()`
+    /// guard that `gc::tests` uses so heap_tests and gc::tests can't
+    /// race against each other.
+    fn heap_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::gc::lock_tests_global()
+    }
+
     /// Build a `TypeDesc` for a `size`-byte data block. Allocated
     /// once via `Box::leak` so its address is stable across the
     /// test (the GC stamps every block's tag with this pointer).
@@ -1179,6 +1191,7 @@ mod heap_tests {
 
     #[test]
     fn vector_allocation_writes_and_reads_back() {
+        let _guard = heap_test_lock();
         // Mirrors `test_vector_allocation` — allocate 10 words,
         // fill with a pattern, verify integrity. Our convention
         // puts the length one word *before* the data pointer, so
@@ -1210,6 +1223,7 @@ mod heap_tests {
 
     #[test]
     fn object_allocation_is_zero_initialised_and_holds_data() {
+        let _guard = heap_test_lock();
         // Mirrors `test_object_allocation`: a fresh GC block of
         // 64 bytes should arrive zeroed, accept arbitrary writes,
         // and return them unchanged.
@@ -1240,6 +1254,7 @@ mod heap_tests {
 
     #[test]
     fn alloc_pressure_auto_triggers_collect() {
+        let _guard = heap_test_lock();
         // Lower the auto-trigger threshold so the test doesn't
         // need to allocate the production threshold's worth of
         // memory (4 MB) to fire one cycle. We restore the
@@ -1280,6 +1295,7 @@ mod heap_tests {
 
     #[test]
     fn many_allocations_succeed_and_remain_writeable() {
+        let _guard = heap_test_lock();
         // Mirrors the throughput tests: allocate N blocks of a
         // size that's large enough to exercise both the cluster
         // bump and the BlockHeader bookkeeping, then write a
@@ -1318,6 +1334,7 @@ mod heap_tests {
 
     #[test]
     fn list_append_grows_length_and_preserves_value() {
+        let _guard = heap_test_lock();
         // Spirit of the reference's list-data tests: a fresh
         // `ListHeader` starts empty; each `APND` bumps the
         // length by 1 and links a new `ATOM_INT` atom; `HD`
@@ -1346,6 +1363,7 @@ mod heap_tests {
 
     #[test]
     fn list_tl_shares_tail_nodes() {
+        let _guard = heap_test_lock();
         // `TL` returns a new header that re-uses the existing
         // atom chain — sharing is intentional and O(1). After
         // `TL`, `HD` of the result is the original list's second
@@ -1367,6 +1385,7 @@ mod heap_tests {
 
     #[test]
     fn list_concat_produces_combined_chain() {
+        let _guard = heap_test_lock();
         // `CONCAT` makes a fresh header whose atoms copy from
         // `a` and then `b`. Both inputs survive unchanged.
         let a = unsafe { __newbcpl_list_new_empty() };
@@ -1393,6 +1412,7 @@ mod heap_tests {
 
     #[test]
     fn float_appends_round_trip_through_atom_value() {
+        let _guard = heap_test_lock();
         // `APND_FLOAT` reinterprets the double's bits into the
         // atom's `i64` value slot. Reading them back as `f64`
         // bits must restore the original number — confirms the
