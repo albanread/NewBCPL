@@ -505,14 +505,39 @@ machinery would be redundant; the compiler rejects `GLOBALS` and the
 ### 3.6 `GET` Directives
 
 ```bcpl
-GET "constants.h"
+GET "constants.bcl"
+GET "geom"           // resolves to modules-active/geom.bcl if absent locally
 ```
 
-This is *textual* inclusion, BCPL's traditional mechanism for sharing
-MANIFEST values, helper LETs, or class declarations between files. It
-is **not** required for calling into modules — names from loaded
-modules resolve through the loader's symbol table automatically (see
-Chapter 6).
+`GET "name"` splices the declarations of another source file into the
+current compilation unit. It is the way to share **compile-time
+information** — `MANIFEST` constants, `CLASS` declarations, helper
+`LET` declarations — between files. Runtime function calls don't need
+it: cross-module calls resolve through the loader's symbol table on
+their own (see Chapter 6).
+
+Path resolution tries three places in order:
+
+1. **Absolute path** — used verbatim.
+2. **Sibling file** — relative to the directory of the source file
+   doing the GET. The `.bcl` extension is added if you didn't write
+   one (`GET "constants"` and `GET "constants.bcl"` find the same
+   file).
+3. **Modules-active fallback** — `modules-active/<name>.bcl`. This
+   makes a module file double as a header: `GET "geom"` from any
+   program imports `modules-active/geom.bcl`'s declarations into the
+   current compilation unit, while `geom`'s runtime functions are
+   still linked separately by the module loader.
+
+Cyclic includes are detected by a depth cap; the compiler errors with
+a clear diagnostic rather than recursing forever. Missing files error
+with `GET "..." : file not found` and the search locations tried.
+
+Note that `GET` is for compile-time information, modules-active is
+for runtime linking. The two cover orthogonal axes and you'll often
+use both — `GET "geom"` to see Geom's MANIFEST constants and CLASS
+declarations at compile time, while the running program's `geom_*`
+functions are linked through the module loader.
 
 ---
 

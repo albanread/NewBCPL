@@ -144,7 +144,18 @@ pub fn run_with_active_folder(
     path: &Path,
     modules_dir: Option<&Path>,
 ) -> Result<i64, String> {
-    let ir = build_ir(path)?;
+    let source = std::fs::read_to_string(path).map_err(|e| format!("io: {e}"))?;
+    let module_name = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("module");
+    let base_dir = path.parent().map(|p| p.to_path_buf());
+    let ir = build_ir_from_source_with_base(
+        &source,
+        module_name,
+        base_dir.as_deref(),
+        modules_dir,
+    )?;
     run_program_ir(&ir, modules_dir)
 }
 
@@ -162,7 +173,10 @@ pub fn run_source_with_active_folder(
     module_name: &str,
     modules_dir: Option<&Path>,
 ) -> Result<i64, String> {
-    let ir = build_ir_from_source(source, module_name)?;
+    // No base_dir — the source isn't backed by a file the GUI knows
+    // about. `GET "name"` still works as long as `name` lives in
+    // modules-active.
+    let ir = build_ir_from_source_with_base(source, module_name, None, modules_dir)?;
     run_program_ir(&ir, modules_dir)
 }
 
@@ -534,14 +548,144 @@ fn build_ir(path: &Path) -> Result<IrModule, String> {
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("module");
-    build_ir_from_source(&source, module_name)
+    let base_dir = path.parent().map(|p| p.to_path_buf());
+    build_ir_from_source_with_base(&source, module_name, base_dir.as_deref(), None)
 }
 
 fn build_ir_from_source(source: &str, module_name: &str) -> Result<IrModule, String> {
+    build_ir_from_source_with_base(source, module_name, None, None)
+}
+
+/// As `build_ir_from_source`, plus the base directory `GET` directives
+/// should resolve relative to. `modules_dir` is the secondary search
+/// location — `GET "geom"` first looks for a sibling file, then falls
+/// back to `modules_dir/geom.bcl` so a module file pulls double duty
+/// as both a runtime symbol target and a compile-time header.
+fn build_ir_from_source_with_base(
+    source: &str,
+    module_name: &str,
+    base_dir: Option<&Path>,
+    modules_dir: Option<&Path>,
+) -> Result<IrModule, String> {
     let program = newbcpl_parser::parse_source(source)
         .map_err(|e| format!("parse: {}", e.render()))?;
-    let sema = newbcpl_sema::analyze(&program);
-    Ok(newbcpl_ir::lower(&program, &sema, module_name))
+    let expanded = expand_gets(program, base_dir, modules_dir)?;
+    let sema = newbcpl_sema::analyze(&expanded);
+    Ok(newbcpl_ir::lower(&expanded, &sema, module_name))
+}
+
+/// Walk a `Program` and replace each `Decl::Get { path, .. }` with
+/// the declarations of the file it names, recursing through nested
+/// GETs. Three resolution rules, tried in order:
+///
+///   1. **Absolute path** — used verbatim.
+///   2. **Sibling file** — relative to `base_dir` (the source file's
+///      directory). With the `.bcl` extension added if absent.
+///   3. **Modules-active fallback** — `modules_dir/<name>.bcl`. This
+///      is the bridge that lets a module file pull double duty as a
+///      header. `GET "geom"` from anywhere imports the declarations
+///      of `modules-active/geom.bcl`; `geom`'s runtime functions are
+///      still linked separately by the module loader.
+///
+/// Cycle detection via a depth limit (`MAX_GET_DEPTH`); a circular
+/// include errors with a clear diagnostic rather than recursing
+/// forever.
+fn expand_gets(
+    program: newbcpl_parser::Program,
+    base_dir: Option<&Path>,
+    modules_dir: Option<&Path>,
+) -> Result<newbcpl_parser::Program, String> {
+    fn go(
+        prog: newbcpl_parser::Program,
+        base_dir: Option<&Path>,
+        modules_dir: Option<&Path>,
+        depth: u32,
+    ) -> Result<newbcpl_parser::Program, String> {
+        const MAX_GET_DEPTH: u32 = 32;
+        if depth > MAX_GET_DEPTH {
+            return Err(format!(
+                "GET nesting exceeded {MAX_GET_DEPTH} levels — likely a cyclic include"
+            ));
+        }
+        let mut out_items: Vec<newbcpl_parser::Decl> = Vec::with_capacity(prog.items.len());
+        for item in prog.items {
+            if let newbcpl_parser::Decl::Get(get) = &item {
+                let resolved = resolve_get(&get.path, base_dir, modules_dir)?;
+                let included_source = std::fs::read_to_string(&resolved).map_err(|e| {
+                    format!(
+                        "GET {:?}: io reading {}: {e}",
+                        get.path,
+                        resolved.display()
+                    )
+                })?;
+                let included = newbcpl_parser::parse_source(&included_source).map_err(|e| {
+                    format!(
+                        "GET {:?}: parse {}: {}",
+                        get.path,
+                        resolved.display(),
+                        e.render()
+                    )
+                })?;
+                // Recurse with the new file's directory as the next base.
+                let nested_base = resolved.parent().map(|p| p.to_path_buf());
+                let expanded = go(included, nested_base.as_deref(), modules_dir, depth + 1)?;
+                out_items.extend(expanded.items);
+                continue;
+            }
+            out_items.push(item);
+        }
+        Ok(newbcpl_parser::Program {
+            items: out_items,
+            ..prog
+        })
+    }
+    go(program, base_dir, modules_dir, 0)
+}
+
+/// Resolve a `GET "name"` to a concrete file path. See `expand_gets`
+/// for the resolution order.
+fn resolve_get(
+    requested: &str,
+    base_dir: Option<&Path>,
+    modules_dir: Option<&Path>,
+) -> Result<std::path::PathBuf, String> {
+    let req = Path::new(requested);
+    if req.is_absolute() && req.is_file() {
+        return Ok(req.to_path_buf());
+    }
+    // Helper: try `dir/name` and `dir/name.bcl`.
+    let try_in = |dir: &Path| -> Option<std::path::PathBuf> {
+        let direct = dir.join(req);
+        if direct.is_file() {
+            return Some(direct);
+        }
+        if req.extension().is_none() {
+            let with_ext = dir.join(format!("{requested}.bcl"));
+            if with_ext.is_file() {
+                return Some(with_ext);
+            }
+        }
+        None
+    };
+    if let Some(base) = base_dir {
+        if let Some(p) = try_in(base) {
+            return Ok(p);
+        }
+    }
+    if let Some(modules) = modules_dir {
+        if let Some(p) = try_in(modules) {
+            return Ok(p);
+        }
+    }
+    let where_searched = match (base_dir, modules_dir) {
+        (Some(b), Some(m)) => format!("base={} or modules-active={}", b.display(), m.display()),
+        (Some(b), None) => format!("base={}", b.display()),
+        (None, Some(m)) => format!("modules-active={}", m.display()),
+        (None, None) => "no base or modules-active directory configured".to_string(),
+    };
+    Err(format!(
+        "GET {requested:?}: file not found ({where_searched})"
+    ))
 }
 
 #[cfg(test)]

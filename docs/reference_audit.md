@@ -111,7 +111,7 @@ Reference precedence table (high → low): `()`, `! OF`, `@ !`, `* / REM`,
 | `LET R(p) BE stmt` routine | ✓ | Tier 4 |
 | `FUNCTION` / `ROUTINE` keyword forms | ✓ | Parser tests |
 | `AND` mutual recursion | ✓ | Parser test for `LET ... AND ...`; runtime check thin |
-| `GET "file"` include | ⚠ | Parses; semantic effect (textual inclusion) not implemented end-to-end |
+| `GET "file"` include | ✓ | AST-level splicing: sibling-file first, then modules-active fallback so a module doubles as a header. Cycle detection via depth cap. |
 | `RETAIN name` / `RETAIN x = expr` | ⚠ | Parses; no probe verifying it keeps a value past scope |
 | `FREEVEC` / `FREELIST` | ⚠ | Accepted as no-op (GC owns lifetime); pinned that they don't error |
 
@@ -218,9 +218,7 @@ Per `BCPL Runtime.md`:
 
 6. **Visibility enforcement.** `PRIVATE`/`PROTECTED` are parsed but sema doesn't reject `outsider.private_field`. The reference doesn't *demand* enforcement at compile time but the user guide claims it. *Either implement or soften the doc claim.*
 
-7. **`GET "file"`.** Parser eats it; nothing happens. The corpus uses it heavily for shared MANIFEST definitions. Implementing textual inclusion is a few hours. *Likely worth doing for corpus pass-rate.*
-
-8. **`findinput` / `findoutput` family.** Old-BCPL file I/O. Not in user guide. Skip unless the corpus blocks on it.
+7. **`findinput` / `findoutput` family.** Old-BCPL file I/O. Not in user guide. Skip unless the corpus blocks on it.
 
 ### Low-leverage (cleanup)
 

@@ -369,3 +369,119 @@ fn global_colon_slot_syntax_rejected() {
         "slot-pinning",
     );
 }
+
+// ─── GET directive ────────────────────────────────────────────────
+//
+// `GET "name"` is textual-by-spirit, AST-by-implementation: each
+// declaration in the included file is spliced into the consumer at
+// the GET site. Two resolution paths — sibling file (relative to
+// the GET-issuing source) and modules-active fallback (the same
+// folder runtime symbol resolution uses). Cycle protection via a
+// depth cap.
+
+#[test]
+fn get_pulls_manifest_from_sibling_file() {
+    use std::fs;
+    use std::path::PathBuf;
+    let dir = std::env::temp_dir().join("newbcpl-get-sibling");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("mkdir");
+    let header: PathBuf = dir.join("constants.bcl");
+    fs::write(&header, "MANIFEST $( PI = 314 $)\n").expect("write header");
+    let main: PathBuf = dir.join("main.bcl");
+    fs::write(
+        &main,
+        "GET \"constants.bcl\"\nLET START() BE $( WRITEN(PI) $)\n",
+    )
+    .expect("write main");
+    let output = std::process::Command::new(newbcpl_tests::driver_path())
+        .arg("run")
+        .arg(&main)
+        .output()
+        .expect("spawn");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        output.status.success(),
+        "GET sibling run failed\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+    );
+    assert!(
+        stdout.contains("314"),
+        "expected `314` in stdout, got: {stdout}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn get_pulls_manifest_from_modules_active() {
+    use std::fs;
+    use std::path::PathBuf;
+    let root = std::env::temp_dir().join("newbcpl-get-modules");
+    let _ = fs::remove_dir_all(&root);
+    let modules = root.join("modules-active");
+    fs::create_dir_all(&modules).expect("mkdir modules");
+    let header: PathBuf = modules.join("sharedconstants.bcl");
+    fs::write(&header, "MANIFEST $( ANSWER = 42 $)\n").expect("write header");
+    let main: PathBuf = root.join("main.bcl");
+    fs::write(
+        &main,
+        "GET \"sharedconstants\"\nLET START() BE $( WRITEN(ANSWER) $)\n",
+    )
+    .expect("write main");
+    let output = std::process::Command::new(newbcpl_tests::driver_path())
+        .arg("run")
+        .arg(&main)
+        .env("NEWBCPL_MODULES_ACTIVE", &modules)
+        .output()
+        .expect("spawn");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        output.status.success(),
+        "GET modules-active run failed\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+    );
+    assert!(
+        stdout.contains("42"),
+        "expected `42` in stdout, got: {stdout}"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn get_missing_file_rejected() {
+    expect_reject(
+        "get_missing_file_rejected",
+        "run",
+        "GET \"does_not_exist.bcl\"\nLET START() BE WRITES(\"hi\")\n",
+        "file not found",
+    );
+}
+
+#[test]
+fn get_cycle_rejected() {
+    // Two files that GET each other — the depth cap fires.
+    use std::fs;
+    let dir = std::env::temp_dir().join("newbcpl-get-cycle");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("mkdir");
+    fs::write(dir.join("a.bcl"), "GET \"b.bcl\"\n").expect("write a");
+    fs::write(dir.join("b.bcl"), "GET \"a.bcl\"\n").expect("write b");
+    let main = dir.join("main.bcl");
+    fs::write(&main, "GET \"a.bcl\"\nLET START() BE WRITES(\"unreached\")\n")
+        .expect("write main");
+    let output = std::process::Command::new(newbcpl_tests::driver_path())
+        .arg("run")
+        .arg(&main)
+        .output()
+        .expect("spawn");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        !output.status.success(),
+        "expected cycle to fail; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("cyclic include") || stderr.contains("nesting exceeded"),
+        "expected cycle diagnostic, got: {stderr}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
