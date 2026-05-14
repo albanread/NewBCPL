@@ -1624,6 +1624,16 @@ impl<'a> Lowerer<'a> {
                     self.b().emit(Instr::IndirectStore { addr, value: v });
                 }
                 Expr::Binary {
+                    op: BinaryOp::Bitfield,
+                    lhs,
+                    rhs,
+                    ..
+                } => {
+                    // `v %% (start, width) := payload`
+                    let (start_expr, width_expr) = bitfield_split(rhs);
+                    self.lower_bitfield_write(lhs, start_expr, width_expr, v);
+                }
+                Expr::Binary {
                     op: BinaryOp::LaneAccess,
                     lhs,
                     rhs,
@@ -1956,6 +1966,150 @@ impl<'a> Lowerer<'a> {
         Value::Function(name.to_string())
     }
 
+    /// Lower a bitfield read: `(value >> start) & mask` where
+    /// `mask = (1 << width) - 1`. Width=None defaults to 1 (single
+    /// bit). The implementation composes existing IR BinOps so no
+    /// new instruction variant is needed.
+    fn lower_bitfield_read(
+        &mut self,
+        value_expr: &Expr,
+        start_expr: &Expr,
+        width_expr: Option<&Expr>,
+    ) -> Value {
+        let val = self.lower_expr(value_expr);
+        let start = self.lower_expr(start_expr);
+        let mask = self.compute_bitfield_mask(width_expr);
+        let shifted = self.b().alloc_value();
+        self.b().emit(Instr::BinOp {
+            dst: shifted,
+            op: IrBinOp::Shr,
+            lhs: val,
+            rhs: start,
+            hint: TypeHint::Int,
+        });
+        let masked = self.b().alloc_value();
+        self.b().emit(Instr::BinOp {
+            dst: masked,
+            op: IrBinOp::BitAnd,
+            lhs: Value::Local(shifted),
+            rhs: mask,
+            hint: TypeHint::Int,
+        });
+        Value::Local(masked)
+    }
+
+    /// Lower a bitfield write: `v %% (start, width) := payload`
+    /// becomes `v := (v & ~(mask << start)) | ((payload & mask) << start)`.
+    /// Like lane writes, the lvalue must be an Ident or a SELF /
+    /// receiver field access — anything else is silently ignored.
+    fn lower_bitfield_write(
+        &mut self,
+        value_expr: &Expr,
+        start_expr: &Expr,
+        width_expr: Option<&Expr>,
+        payload: Value,
+    ) {
+        let old = self.lower_expr(value_expr);
+        let start = self.lower_expr(start_expr);
+        let mask = self.compute_bitfield_mask(width_expr);
+        // mask_shifted = mask << start
+        let mask_shifted = self.b().alloc_value();
+        self.b().emit(Instr::BinOp {
+            dst: mask_shifted,
+            op: IrBinOp::Shl,
+            lhs: mask.clone(),
+            rhs: start.clone(),
+            hint: TypeHint::Int,
+        });
+        // not_mask = ~mask_shifted  (XOR with -1 gives bitwise NOT;
+        // we don't have a unary IR-NOT here that takes a Value, so
+        // synthesise via XOR with -1).
+        let not_mask = self.b().alloc_value();
+        self.b().emit(Instr::BinOp {
+            dst: not_mask,
+            op: IrBinOp::BitXor,
+            lhs: Value::Local(mask_shifted),
+            rhs: Value::Const(Const::Int(-1)),
+            hint: TypeHint::Int,
+        });
+        // cleared = old & not_mask
+        let cleared = self.b().alloc_value();
+        self.b().emit(Instr::BinOp {
+            dst: cleared,
+            op: IrBinOp::BitAnd,
+            lhs: old,
+            rhs: Value::Local(not_mask),
+            hint: TypeHint::Int,
+        });
+        // payload_masked = payload & mask
+        let payload_masked = self.b().alloc_value();
+        self.b().emit(Instr::BinOp {
+            dst: payload_masked,
+            op: IrBinOp::BitAnd,
+            lhs: payload,
+            rhs: mask,
+            hint: TypeHint::Int,
+        });
+        // payload_shifted = payload_masked << start
+        let payload_shifted = self.b().alloc_value();
+        self.b().emit(Instr::BinOp {
+            dst: payload_shifted,
+            op: IrBinOp::Shl,
+            lhs: Value::Local(payload_masked),
+            rhs: start,
+            hint: TypeHint::Int,
+        });
+        // merged = cleared | payload_shifted
+        let merged = self.b().alloc_value();
+        self.b().emit(Instr::BinOp {
+            dst: merged,
+            op: IrBinOp::BitOr,
+            lhs: Value::Local(cleared),
+            rhs: Value::Local(payload_shifted),
+            hint: TypeHint::Int,
+        });
+        // Store back. Reuse the SIMD write-back machinery — it
+        // handles the same Ident / SELF.field / obj.field cases.
+        self.write_back_simd_lvalue(value_expr, Value::Local(merged));
+    }
+
+    /// `mask = (1 << width) - 1`. If `width_expr` is a literal we
+    /// constant-fold; otherwise emit the runtime computation.
+    fn compute_bitfield_mask(&mut self, width_expr: Option<&Expr>) -> Value {
+        match width_expr {
+            None => Value::Const(Const::Int(1)),
+            Some(Expr::IntLit { value, .. }) => {
+                let w = (*value).clamp(0, 63) as u32;
+                let mask = if w >= 64 {
+                    -1i64
+                } else {
+                    ((1u64 << w) - 1) as i64
+                };
+                Value::Const(Const::Int(mask))
+            }
+            Some(expr) => {
+                let width = self.lower_expr(expr);
+                let one = self.b().alloc_value();
+                self.b().emit(Instr::BinOp {
+                    dst: one,
+                    op: IrBinOp::Shl,
+                    lhs: Value::Const(Const::Int(1)),
+                    rhs: width,
+                    hint: TypeHint::Int,
+                });
+                let mask = self.b().alloc_value();
+                self.b().emit(Instr::BinOp {
+                    dst: mask,
+                    op: IrBinOp::ISub,
+                    lhs: Value::Local(one),
+                    rhs: Value::Const(Const::Int(1)),
+                    hint: TypeHint::Int,
+                });
+                Value::Local(mask)
+            }
+        }
+    }
+
     /// Store a rebuilt SIMD pack back where the lane-write's lhs
     /// lived. The lhs of `pair.|i|` is the SIMD value-producing
     /// expression — to make lane writes work the source must be an
@@ -2041,6 +2195,16 @@ impl<'a> Lowerer<'a> {
     }
 
     fn lower_binary(&mut self, op: BinaryOp, lhs: &Expr, rhs: &Expr, hint: TypeHint) -> Value {
+        // Bitfield read: `v %% (start, width)` — the parser packed
+        // (start, width) into a nested `Binary { Bitfield, start,
+        // width }` when width was given. A bare `v %% (start)`
+        // collapses to `Binary { Bitfield, v, start }` with no
+        // inner Bitfield. We unwrap and lower as a shift + mask
+        // chain.
+        if matches!(op, BinaryOp::Bitfield) {
+            let (start_expr, width_expr) = bitfield_split(rhs);
+            return self.lower_bitfield_read(lhs, start_expr, width_expr);
+        }
         // SIMD lane access `pair.|n|`.
         if matches!(op, BinaryOp::LaneAccess) {
             let vector = self.lower_expr(lhs);
@@ -2532,6 +2696,26 @@ fn simd_kind_from_hint(h: TypeHint) -> Option<crate::ir::TypedKind> {
 /// when populating the vtable globals.
 pub fn mangle_method(class_name: &str, method_name: &str) -> String {
     format!("{class_name}_{method_name}")
+}
+
+/// Split the rhs of a bitfield expression into (start, width). The
+/// parser packs `(start, width)` into a nested `Binary { Bitfield,
+/// start, width }` when the width is explicit; a bare `(start)`
+/// collapses to just `start`. Returns the inner expressions in
+/// source order; `width` is `None` when omitted (the language
+/// defaults that to one bit).
+fn bitfield_split(rhs: &Expr) -> (&Expr, Option<&Expr>) {
+    if let Expr::Binary {
+        op: BinaryOp::Bitfield,
+        lhs,
+        rhs: inner_rhs,
+        ..
+    } = rhs
+    {
+        (lhs.as_ref(), Some(inner_rhs.as_ref()))
+    } else {
+        (rhs, None)
+    }
 }
 
 /// Extract every `LET name = expr` and `FLET name = expr` field

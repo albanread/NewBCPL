@@ -352,3 +352,58 @@ fn nested_call() {
         "8",
     );
 }
+
+// ─── Bitfield operator (%%(start, width)) ─────────────────────────
+//
+// `v %% (start, width)` reads `width` bits starting at bit `start`.
+// `v %% (start, width) := payload` writes `payload` into those bits.
+// Width defaults to 1 when omitted.
+
+#[test]
+fn bitfield_read_low_byte() {
+    expect(
+        "bitfield_read_low_byte",
+        "LET START() BE $( LET v = #X1234\n  WRITEN(v %% (0, 8)) $)\n",
+        "52",
+    );
+}
+
+#[test]
+fn bitfield_read_high_byte() {
+    expect(
+        "bitfield_read_high_byte",
+        "LET START() BE $( LET v = #X1234\n  WRITEN(v %% (8, 8)) $)\n",
+        "18",
+    );
+}
+
+#[test]
+fn bitfield_read_single_bit_default_width() {
+    // `v %% (i)` — width defaults to 1.
+    expect(
+        "bitfield_read_single_bit_default_width",
+        "LET START() BE $( LET v = 5\n  WRITEN(v %% (0)) WRITES(\"*S\")\n  WRITEN(v %% (1)) WRITES(\"*S\")\n  WRITEN(v %% (2)) $)\n",
+        "1 0 1",
+    );
+}
+
+#[test]
+fn bitfield_write_inserts_field() {
+    // Pack a value into bits [4..8). Other bits stay zero.
+    expect(
+        "bitfield_write_inserts_field",
+        "LET START() BE $( LET v = 0\n  v %% (4, 4) := 9\n  WRITEN(v) $)\n",
+        "144",
+    );
+}
+
+#[test]
+fn bitfield_write_preserves_other_bits() {
+    // Start with 0xFF (8 bits set), clear bits [2..4) by writing 0.
+    // Expected: 11110011b = 243.
+    expect(
+        "bitfield_write_preserves_other_bits",
+        "LET START() BE $( LET v = #XFF\n  v %% (2, 2) := 0\n  WRITEN(v) $)\n",
+        "243",
+    );
+}
