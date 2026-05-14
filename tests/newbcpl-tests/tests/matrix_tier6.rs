@@ -213,6 +213,71 @@ fn vec_of_class_pointers_round_trip() {
     );
 }
 
+// ─── Class-typed field GC tracing ─────────────────────────────────
+//
+// When sema infers the class of a DECL field (via a `SELF.field :=
+// NEW Inner(...)` back-fill, an `AS Class` annotation on a LET form,
+// or a direct `LET f = NEW Foo()` initialiser), that field's byte
+// offset has to land in the layout's `ptr_offsets` so the GC traces
+// through it. If it doesn't, the inner instance is unreachable
+// through the outer's roots and gets swept, leaving outer.field
+// pointing at freed memory.
+
+#[test]
+fn declared_field_back_filled_is_traced() {
+    // `DECL inner` is declared with no class hint at parse time. Sema
+    // back-fills the class identity during method-body analysis when
+    // it sees `SELF.inner := NEW Inner(...)`. The layout pass then
+    // adds the field's offset to `ptr_offsets`. An explicit `GC()`
+    // mid-program proves the trace path: if the field weren't traced,
+    // `inner` would be swept and `o.inner.value` would read freed
+    // (zeroed) memory.
+    expect(
+        "declared_field_back_filled_is_traced",
+        "CLASS Inner $(\n  DECL value\n  ROUTINE CREATE(v) BE SELF.value := v\n$)\nCLASS Outer $(\n  DECL inner\n  ROUTINE CREATE(v) BE SELF.inner := NEW Inner(v)\n$)\nLET START() BE $(\n  LET o = NEW Outer(42)\n  GC()\n  WRITEN(o.inner.value)\n$)\n",
+        "42",
+    );
+}
+
+#[test]
+fn as_annotated_let_field_is_traced() {
+    // The LET-form field with an `AS Class` annotation —
+    // `LET inner AS Inner = ?` — must also reach `ptr_offsets`. The
+    // class_name comes from the AS-resolution pass, not from a NEW
+    // initialiser. Same GC test: collect, then dereference.
+    expect(
+        "as_annotated_let_field_is_traced",
+        "CLASS Outer $(\n  LET inner AS Inner = ?\n  ROUTINE CREATE(v) BE SELF.inner := NEW Inner(v)\n$)\nCLASS Inner $(\n  DECL value\n  ROUTINE CREATE(v) BE SELF.value := v\n$)\nLET START() BE $(\n  LET o = NEW Outer(99)\n  GC()\n  WRITEN(o.inner.value)\n$)\n",
+        "99",
+    );
+}
+
+#[test]
+fn traced_field_survives_alloc_pressure() {
+    // Same as `declared_field_back_filled_is_traced` but with real
+    // alloc pressure between the bind and the GC: a 256-cell VEC of
+    // garbage allocations between the outer and the collect. Forces
+    // the GC to actually walk the mark phase rather than no-op.
+    expect(
+        "traced_field_survives_alloc_pressure",
+        "CLASS Inner $(\n  DECL value\n  ROUTINE CREATE(v) BE SELF.value := v\n$)\nCLASS Outer $(\n  DECL inner\n  ROUTINE CREATE(v) BE SELF.inner := NEW Inner(v)\n$)\nLET START() BE $(\n  LET o = NEW Outer(31415)\n  FOR i = 1 TO 256 DO $(\n    LET garbage = VEC 8\n    garbage!0 := i\n  $)\n  GC()\n  WRITEN(o.inner.value)\n$)\n",
+        "31415",
+    );
+}
+
+#[test]
+fn deep_chain_survives_collection() {
+    // Three-level chain — a → b → c. The middle and innermost
+    // objects are only reachable through their parent's field. If
+    // ptr_offsets is wrong at any level, the chain breaks and the
+    // final WRITEN reads through a dangling pointer.
+    expect(
+        "deep_chain_survives_collection",
+        "CLASS C $(\n  DECL leaf\n  ROUTINE CREATE(v) BE SELF.leaf := v\n$)\nCLASS B $(\n  DECL mid\n  ROUTINE CREATE(v) BE SELF.mid := NEW C(v)\n$)\nCLASS A $(\n  DECL top\n  ROUTINE CREATE(v) BE SELF.top := NEW B(v)\n$)\nLET START() BE $(\n  LET a = NEW A(777)\n  GC()\n  WRITEN(a.top.mid.leaf)\n$)\n",
+        "777",
+    );
+}
+
 // ─── Termination ──────────────────────────────────────────────────
 
 #[test]
