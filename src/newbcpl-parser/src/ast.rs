@@ -168,8 +168,16 @@ pub enum Visibility {
 
 #[derive(Debug, Clone)]
 pub enum ClassMemberKind {
-    /// `DECL x, y, z` — uninitialised member variables.
-    Fields(Vec<String>),
+    /// `DECL x, y, z` — uninitialised member variables. Each name may
+    /// carry an optional `AS Type` annotation, parallel to `names`.
+    /// The annotation strings use the same canonical form as
+    /// `LetDecl::annotations` (`"INTEGER"`, `"^STRING"`, `"Window"`).
+    /// `None` for un-annotated names — still the common case for the
+    /// plain `DECL x, y` form.
+    Fields {
+        names: Vec<String>,
+        annotations: Vec<Option<String>>,
+    },
     /// `LET name = expr` — initialised member variable.
     Let(LetDecl),
     /// `FLET name` — uninitialised float member; `FLET name = expr`

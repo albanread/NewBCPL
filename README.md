@@ -28,7 +28,7 @@ The reference 857-file corpus (`reference/tests/bcl_tests/`) is still a moving t
 
 - ORC v2 alongside MCJIT, in step with NewCP's migration.
 - `MANAGED` linear-type checks cover the storage-escape surface (aliasing via `LET` / `:=`, container capture in LIST / PAIR / VEC, field capture in non-MANAGED holders). Still soft warnings only — sema never rejects. Argument-passing and function-return forms of escape are not yet flagged.
-- `DECL f AS Class` syntax — the parser doesn't yet accept `AS` annotations on bare `DECL` fields; the workaround is the LET form (`LET f AS Class = ?` then assign in CREATE). The LET form does work and resolves forward-declared classes.
+- (Nothing language-side currently on the short list — the manifesto's surface is implemented end-to-end. Recent gaps: ORC v2 backend, MANAGED argument-passing/return-escape diagnostics, the residual newbcpl-runtime parallel-test teardown crash.)
 
 ## Workspace layout
 

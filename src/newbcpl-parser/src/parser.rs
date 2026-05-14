@@ -652,10 +652,14 @@ impl Parser {
         visibility: Visibility,
     ) -> Result<ClassMember, ParseError> {
         let kw = self.eat(); // LET
-        let mut names = vec![self.eat_identifier()?.lexeme];
+        let mut names = Vec::new();
+        let mut annotations: Vec<Option<String>> = Vec::new();
+        names.push(self.eat_identifier()?.lexeme);
+        annotations.push(self.parse_optional_as_annotation());
         while self.check_sym(",") {
             self.eat();
             names.push(self.eat_identifier()?.lexeme);
+            annotations.push(self.parse_optional_as_annotation());
         }
         let span = SourceSpan {
             start: kw.span.start,
@@ -663,17 +667,21 @@ impl Parser {
         };
         Ok(ClassMember {
             visibility,
-            kind: ClassMemberKind::Fields(names),
+            kind: ClassMemberKind::Fields { names, annotations },
             span,
         })
     }
 
     fn parse_class_field(&mut self, visibility: Visibility) -> Result<ClassMember, ParseError> {
         let kw = self.eat(); // DECL
-        let mut names = vec![self.eat_identifier()?.lexeme];
+        let mut names = Vec::new();
+        let mut annotations: Vec<Option<String>> = Vec::new();
+        names.push(self.eat_identifier()?.lexeme);
+        annotations.push(self.parse_optional_as_annotation());
         while self.check_sym(",") {
             self.eat();
             names.push(self.eat_identifier()?.lexeme);
+            annotations.push(self.parse_optional_as_annotation());
         }
         // Use the last identifier's span as a pragmatic end.
         let span = SourceSpan {
@@ -682,7 +690,7 @@ impl Parser {
         };
         Ok(ClassMember {
             visibility,
-            kind: ClassMemberKind::Fields(names),
+            kind: ClassMemberKind::Fields { names, annotations },
             span,
         })
     }

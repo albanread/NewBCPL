@@ -126,8 +126,16 @@ fn pretty_print_class_member(m: &ClassMember, level: usize, out: &mut String) {
         Visibility::Protected => "protected",
     };
     match &m.kind {
-        ClassMemberKind::Fields(names) => {
-            writeln!(out, "{vis} decl {}", names.join(", ")).unwrap();
+        ClassMemberKind::Fields { names, annotations } => {
+            let parts: Vec<String> = names
+                .iter()
+                .zip(annotations.iter())
+                .map(|(n, ann)| match ann {
+                    Some(t) => format!("{n} AS {t}"),
+                    None => n.clone(),
+                })
+                .collect();
+            writeln!(out, "{vis} decl {}", parts.join(", ")).unwrap();
         }
         ClassMemberKind::Let(let_decl) => {
             writeln!(out, "{vis} let ({} bindings)", let_decl.bindings.len()).unwrap();
@@ -1615,7 +1623,7 @@ mod tests {
         assert!(!c.managed);
         assert_eq!(c.members.len(), 3);
         // 0: DECL x, y
-        assert!(matches!(c.members[0].kind, ClassMemberKind::Fields(_)));
+        assert!(matches!(c.members[0].kind, ClassMemberKind::Fields { .. }));
         // 1: ROUTINE CREATE
         assert!(matches!(c.members[1].kind, ClassMemberKind::Method(_)));
         // 2: FUNCTION getX

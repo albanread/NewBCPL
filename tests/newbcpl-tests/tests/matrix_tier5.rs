@@ -237,6 +237,20 @@ fn chain_method_then_method() {
 }
 
 #[test]
+fn chain_via_decl_as_class_annotation() {
+    // `DECL inner AS Inner` — the bare DECL field form with an AS
+    // annotation. The parser used to reject `AS` after a DECL name;
+    // this probe pins the post-fix behaviour. Same forward-reference
+    // shape as `chain_via_as_class_annotation` (Outer above Inner),
+    // resolved by the AS-refinement pass.
+    expect(
+        "chain_via_decl_as_class_annotation",
+        "CLASS Outer $(\n  DECL inner AS Inner\n  ROUTINE CREATE(v) BE SELF.inner := NEW Inner(v)\n$)\nCLASS Inner $(\n  DECL value\n  ROUTINE CREATE(v) BE SELF.value := v\n  FUNCTION getValue() = SELF.value\n$)\nLET START() BE $(\n  LET o = NEW Outer(456)\n  WRITEN(o.inner.getValue())\n$)\n",
+        "456",
+    );
+}
+
+#[test]
 fn chain_via_as_class_annotation() {
     // The field's class identity comes from an explicit `AS Inner`
     // annotation on the class member declaration rather than a

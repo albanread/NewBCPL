@@ -524,40 +524,57 @@ impl Sema {
     /// there.
     fn refine_class_field_annotations(&mut self, c: &ClassDecl) {
         for m in &c.members {
-            let ClassMemberKind::Let(let_decl) = &m.kind else {
-                continue;
-            };
-            for (idx, (field_name, _)) in let_decl.bindings.iter().enumerate() {
-                let Some(Some(annotation)) = let_decl.annotations.get(idx) else {
-                    continue;
-                };
-                let Some(class_name) = self.class_name_from_annotation(annotation) else {
-                    continue;
-                };
-                // First write wins — `LET f AS Foo = NEW Bar()` keeps
-                // the initialiser's class. Reasonable: the initialiser
-                // is the concrete evidence; the annotation is a hint.
-                if let Some(class_info) = self.classes.get_mut(&c.name) {
-                    if let Some(f) =
-                        class_info.fields.iter_mut().find(|f| f.name == *field_name)
-                    {
-                        if f.class_name.is_none() {
-                            f.class_name = Some(class_name.clone());
-                        }
+            match &m.kind {
+                ClassMemberKind::Let(let_decl) => {
+                    for (idx, (field_name, _)) in let_decl.bindings.iter().enumerate() {
+                        let Some(Some(annotation)) = let_decl.annotations.get(idx) else {
+                            continue;
+                        };
+                        let Some(class_name) =
+                            self.class_name_from_annotation(annotation)
+                        else {
+                            continue;
+                        };
+                        self.set_field_class_if_unset(&c.name, field_name, &class_name);
                     }
                 }
-                if let Some(class_log_entry) =
-                    self.class_log.iter_mut().find(|ci| ci.name == c.name)
-                {
-                    if let Some(f) = class_log_entry
-                        .fields
-                        .iter_mut()
-                        .find(|f| f.name == *field_name)
-                    {
-                        if f.class_name.is_none() {
-                            f.class_name = Some(class_name.clone());
-                        }
+                ClassMemberKind::Fields { names, annotations } => {
+                    for (idx, field_name) in names.iter().enumerate() {
+                        let Some(Some(annotation)) = annotations.get(idx) else {
+                            continue;
+                        };
+                        let Some(class_name) =
+                            self.class_name_from_annotation(annotation)
+                        else {
+                            continue;
+                        };
+                        self.set_field_class_if_unset(&c.name, field_name, &class_name);
                     }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// First-write-wins assignment of `class_name` onto a field's
+    /// `ClassFieldInfo`, mirrored into the parallel `class_log` entry
+    /// so dump-sema reflects the refined identity.
+    fn set_field_class_if_unset(&mut self, class_name: &str, field_name: &str, value: &str) {
+        if let Some(class_info) = self.classes.get_mut(class_name) {
+            if let Some(f) = class_info.fields.iter_mut().find(|f| f.name == *field_name) {
+                if f.class_name.is_none() {
+                    f.class_name = Some(value.to_string());
+                }
+            }
+        }
+        if let Some(class_log_entry) = self.class_log.iter_mut().find(|ci| ci.name == class_name) {
+            if let Some(f) = class_log_entry
+                .fields
+                .iter_mut()
+                .find(|f| f.name == *field_name)
+            {
+                if f.class_name.is_none() {
+                    f.class_name = Some(value.to_string());
                 }
             }
         }
@@ -599,15 +616,20 @@ impl Sema {
         let mut methods: Vec<ClassMethodInfo> = Vec::new();
         for m in &c.members {
             match &m.kind {
-                ClassMemberKind::Fields(names) => {
+                ClassMemberKind::Fields { names, annotations: _ } => {
+                    // `DECL x AS Class` carries the annotation, but
+                    // resolving it requires the full class table.
+                    // Defer that to `refine_class_field_annotations`
+                    // (the same post-pass that resolves LET-form
+                    // annotations) — that way forward references like
+                    // `CLASS Outer $( DECL inner AS Inner $)` declared
+                    // above `Inner` still work.
                     for n in names {
                         fields.push(ClassFieldInfo {
                             name: n.clone(),
-                            // DECL has no initialiser — bag-of-bits Word.
+                            // DECL has no initialiser — bag-of-bits Word
+                            // unless a class annotation refines it later.
                             hint: TypeHint::Word,
-                            // Class identity (if any) is inferred in a
-                            // second pass over CREATE assignments —
-                            // see `infer_field_classes_from_create`.
                             class_name: None,
                             visibility: m.visibility,
                             span: m.span,
@@ -879,7 +901,7 @@ impl Sema {
 
     fn analyze_class_member(&mut self, c: &ClassDecl, m: &ClassMember) {
         match &m.kind {
-            ClassMemberKind::Fields(_) | ClassMemberKind::Let(_) | ClassMemberKind::FLet(_) => {
+            ClassMemberKind::Fields { .. } | ClassMemberKind::Let(_) | ClassMemberKind::FLet(_) => {
                 // Field hints were collected during `register_class`.
                 // Nothing to bind in the surrounding scope here.
             }
