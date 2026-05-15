@@ -408,7 +408,13 @@ struct ReditState {
     cell_h: f32,
     ascent: f32,
 
-    buffer: Vec<String>,
+    /// Rope-backed text storage. Replaced `Vec<String>` so insert
+    /// / delete near the start of a long file is O(log n) instead
+    /// of O(n), and the cursor's `(row, col)` is converted to /
+    /// from a single code-point offset via `line_col_to_offset` /
+    /// `offset_to_line_col` whenever an edit operation crosses a
+    /// line boundary.
+    buffer: super::rope_buffer::RopeBuffer,
     cursor_row: usize,
     cursor_col: usize,
     /// Selection anchor. When `(anchor_row, anchor_col) ==
@@ -464,7 +470,7 @@ impl ReditState {
             cell_w: 8.0,
             cell_h: 16.0,
             ascent: 12.0,
-            buffer: vec![String::new()],
+            buffer: super::rope_buffer::RopeBuffer::new(),
             cursor_row: 0,
             cursor_col: 0,
             anchor_row: 0,
@@ -617,117 +623,106 @@ impl ReditState {
         self.invalidate();
     }
 
-    /// Extract the text inside the current selection, line by line.
-    /// Returns an empty string when the selection is empty.
+    // ─── Buffer accessors (rope facade) ──────────────────────────
+    //
+    // Bedit operates in `(row, col)` coordinates (mouse, paint,
+    // cursor). Storage is a rope of UTF-32 code points. These
+    // helpers translate at the boundary so the rest of the editor
+    // stays in the row/col world. `col` is a code-point index
+    // within a line, matching the rope's `line_col_to_offset`
+    // convention.
+
+    /// Number of lines in the buffer. An empty buffer has one
+    /// (empty) line — matches the editor convention and the
+    /// rope's `newline_count() + 1` definition.
+    fn line_count(&self) -> usize {
+        self.buffer.line_count()
+    }
+
+    /// Decode line `row` to a fresh UTF-8 `String`. Trailing
+    /// newline is excluded. Out-of-range `row` yields an empty
+    /// string. Allocates — call once per use; don't hold across
+    /// mutation.
+    fn line_text(&self, row: usize) -> String {
+        super::rope_buffer::codepoints_to_utf8(&self.buffer.get_line(row))
+    }
+
+    /// Code-point count of line `row` (the editor's idea of a
+    /// "column" maximum). Out-of-range `row` yields 0.
+    fn line_char_count(&self, row: usize) -> usize {
+        self.buffer
+            .line_range(row)
+            .map(|(s, e)| e - s)
+            .unwrap_or(0)
+    }
+
+    /// Extract the text inside the current selection.
+    /// Returns an empty string when the selection is empty. The
+    /// rope's contiguous offset space makes this a single slice
+    /// regardless of how many lines the selection spans.
     fn selected_text(&self) -> String {
         let Some((start, end)) = self.selection_range() else {
             return String::new();
         };
-        let (sr, sc) = start;
-        let (er, ec) = end;
-        if sr == er {
-            let line = &self.buffer[sr];
-            let from = char_to_byte(line, sc);
-            let to = char_to_byte(line, ec);
-            return line[from..to].to_string();
+        let lo = self.buffer.line_col_to_offset(start.0, start.1);
+        let hi = self.buffer.line_col_to_offset(end.0, end.1);
+        if hi <= lo {
+            return String::new();
         }
-        let mut out = String::new();
-        let first = &self.buffer[sr];
-        let from = char_to_byte(first, sc);
-        out.push_str(&first[from..]);
-        out.push('\n');
-        for row in (sr + 1)..er {
-            out.push_str(&self.buffer[row]);
-            out.push('\n');
-        }
-        let last = &self.buffer[er];
-        let to = char_to_byte(last, ec);
-        out.push_str(&last[..to]);
-        out
+        super::rope_buffer::codepoints_to_utf8(&self.buffer.slice(lo, hi))
     }
 
     // ─── Mutation primitives (no undo bookkeeping) ───────────────
 
     /// Splice `text` into `buffer` at `pos`, returning the position
     /// just after the inserted text. `text` may contain `\n`s —
-    /// `\r\n` is normalized to `\n` first.
+    /// `\r\n` is normalized to `\n` first. The rope handles the
+    /// multi-line case naturally; we just compute the end position
+    /// from the inserted text's shape (number of newlines + length
+    /// of last segment).
     fn splice_in(&mut self, pos: Pos, text: &str) -> Pos {
         let normalized = text.replace("\r\n", "\n");
-        let (mut row, mut col) = pos;
         if normalized.is_empty() {
             return pos;
         }
         self.tokens_dirty = true;
         self.diagnostics_stale = true;
-        let line = &mut self.buffer[row];
-        let byte_idx = char_to_byte(line, col);
-        let tail = line.split_off(byte_idx);
-        // Pieces of `normalized` separated by '\n'.
-        let mut pieces = normalized.split('\n');
-        // First piece appends to the current line.
-        let first = pieces.next().unwrap_or("");
-        self.buffer[row].push_str(first);
-        col += first.chars().count();
-        // Remaining pieces become new lines after `row`.
-        let rest: Vec<&str> = pieces.collect();
-        if rest.is_empty() {
-            // Single-line insert: re-attach the tail.
-            self.buffer[row].push_str(&tail);
+
+        let offset = self.buffer.line_col_to_offset(pos.0, pos.1);
+        self.buffer.insert_utf8(offset, normalized.as_bytes());
+
+        // Compute end position from the inserted text alone — the
+        // rope's `offset_to_line_col(offset + len_codepoints)` would
+        // be equivalent, but counting locally avoids a tree walk.
+        let added_newlines = normalized.bytes().filter(|&b| b == b'\n').count();
+        let final_segment = normalized.rsplit('\n').next().unwrap_or("");
+        let final_segment_chars = final_segment.chars().count();
+        let end_row = pos.0 + added_newlines;
+        let end_col = if added_newlines == 0 {
+            pos.1 + final_segment_chars
         } else {
-            for (i, piece) in rest.iter().enumerate() {
-                row += 1;
-                let mut new_line = piece.to_string();
-                if i + 1 == rest.len() {
-                    // Last piece carries the original tail.
-                    new_line.push_str(&tail);
-                    col = piece.chars().count();
-                }
-                self.buffer.insert(row, new_line);
-            }
-        }
-        (row, col)
+            final_segment_chars
+        };
+        (end_row, end_col)
     }
 
-    /// Remove the text in `[start, end]` and return it. Lines are
-    /// joined with `\n`.
+    /// Remove the text in `[start, end)` and return it. The rope's
+    /// contiguous offset space means this is two API calls
+    /// (`slice` for the removed text, `delete` for the removal)
+    /// regardless of how many lines the range spans.
     fn splice_out(&mut self, start: Pos, end: Pos) -> String {
-        let (sr, sc) = start;
-        let (er, ec) = end;
         if start == end {
             return String::new();
         }
         self.tokens_dirty = true;
         self.diagnostics_stale = true;
-        if sr == er {
-            let line = &mut self.buffer[sr];
-            let from = char_to_byte(line, sc);
-            let to = char_to_byte(line, ec);
-            let removed = line[from..to].to_string();
-            line.replace_range(from..to, "");
-            return removed;
+        let lo = self.buffer.line_col_to_offset(start.0, start.1);
+        let hi = self.buffer.line_col_to_offset(end.0, end.1);
+        if hi <= lo {
+            return String::new();
         }
-        // Multi-line: keep the prefix of `sr` and the suffix of `er`,
-        // drop everything in between.
-        let first = std::mem::take(&mut self.buffer[sr]);
-        let from = char_to_byte(&first, sc);
-        let (first_keep, first_drop) = first.split_at(from);
-        self.buffer[sr] = first_keep.to_string();
-
-        let mut removed = String::new();
-        removed.push_str(first_drop);
-        removed.push('\n');
-
-        // Drain rows (sr+1)..er, then the prefix of row er.
-        for _ in 0..(er - sr - 1) {
-            removed.push_str(&self.buffer.remove(sr + 1));
-            removed.push('\n');
-        }
-        let last = self.buffer.remove(sr + 1);
-        let to = char_to_byte(&last, ec);
-        let (last_drop, last_keep) = last.split_at(to);
-        removed.push_str(last_drop);
-        // Stitch the suffix of `er` onto the prefix of `sr`.
-        self.buffer[sr].push_str(last_keep);
+        let removed = super::rope_buffer::codepoints_to_utf8(&self.buffer.slice(lo, hi));
+        self.buffer.delete(lo, hi - lo);
         removed
     }
 
@@ -871,13 +866,9 @@ impl ReditState {
     /// useful as a plain editor in environments where the compiler
     /// hasn't been linked in.
     fn run_check(&mut self) {
-        let mut text = String::new();
-        for (i, line) in self.buffer.iter().enumerate() {
-            if i > 0 {
-                text.push('\n');
-            }
-            text.push_str(line);
-        }
+        // Single rope→UTF-8 emit; the rope concatenates lines with
+        // their newlines naturally so there's nothing to splice.
+        let text = self.buffer.to_utf8();
         match run_checker(&text) {
             Some(diags) => {
                 self.diagnostics = diags;
@@ -912,9 +903,9 @@ impl ReditState {
                     .min_by_key(|d| (d.line, d.column))
             });
         if let Some(d) = next {
-            let last = self.buffer.len().saturating_sub(1);
+            let last = self.line_count().saturating_sub(1);
             let r = d.line.saturating_sub(1).min(last);
-            let line_chars = self.buffer[r].chars().count();
+            let line_chars = self.line_char_count(r);
             let c = d.column.saturating_sub(1).min(line_chars);
             self.set_cursor(r, c, false);
             self.pref_col = self.cursor_col;
@@ -1078,14 +1069,14 @@ impl ReditState {
         {
             for screen_row in 0..visible_rows {
                 let line_idx = self.scroll_top + screen_row;
-                if line_idx >= self.buffer.len() {
+                if line_idx >= self.line_count() {
                     break;
                 }
                 if line_idx < s_start.0 || line_idx > s_end.0 {
                     continue;
                 }
-                let line_text = &self.buffer[line_idx];
-                let line_chars = line_text.chars().count();
+                let line_text = self.line_text(line_idx);
+                let line_chars = self.line_char_count(line_idx);
                 let from_col = if line_idx == s_start.0 { s_start.1 } else { 0 };
                 let to_col = if line_idx == s_end.0 {
                     s_end.1
@@ -1095,11 +1086,11 @@ impl ReditState {
                     // is part of the selection.
                     line_chars + 1
                 };
-                let from_display = buffer_col_to_display(line_text, from_col);
+                let from_display = buffer_col_to_display(&line_text, from_col);
                 let to_display = if to_col > line_chars {
-                    buffer_col_to_display(line_text, line_chars) + 1
+                    buffer_col_to_display(&line_text, line_chars) + 1
                 } else {
-                    buffer_col_to_display(line_text, to_col)
+                    buffer_col_to_display(&line_text, to_col)
                 };
                 let y = content_top + (screen_row as f32) * self.cell_h;
                 let x0 = gutter_w + (from_display as f32) * self.cell_w;
@@ -1121,7 +1112,7 @@ impl ReditState {
         // Lines.
         for screen_row in 0..visible_rows {
             let line_idx = self.scroll_top + screen_row;
-            if line_idx >= self.buffer.len() {
+            if line_idx >= self.line_count() {
                 break;
             }
             let y = content_top + (screen_row as f32) * self.cell_h;
@@ -1167,9 +1158,9 @@ impl ReditState {
             // visual columns; tokens recorded in buffer-char indices
             // are mapped through `buffer_col_to_display` before being
             // applied as drawing effects.
-            let line = &self.buffer[line_idx];
+            let line = self.line_text(line_idx);
             if !line.is_empty() {
-                let expanded = expand_line(line);
+                let expanded = expand_line(&line);
                 let max_w = w_dip - gutter_w;
                 if let (Some(brush), Ok(layout)) = (
                     fg.as_ref(),
@@ -1184,8 +1175,8 @@ impl ReditState {
                                 TokenKind::Comment => cmt_brush.as_ref(),
                             };
                             let Some(b) = kind_brush else { continue };
-                            let disp_start = buffer_col_to_display(line, tok.start);
-                            let disp_end = buffer_col_to_display(line, tok.end);
+                            let disp_start = buffer_col_to_display(&line, tok.start);
+                            let disp_end = buffer_col_to_display(&line, tok.end);
                             let range = DWRITE_TEXT_RANGE {
                                 startPosition: disp_start as u32,
                                 length: (disp_end - disp_start) as u32,
@@ -1212,8 +1203,8 @@ impl ReditState {
             && self.cursor_row < self.scroll_top + visible_rows
         {
             let screen_row = self.cursor_row - self.scroll_top;
-            let line = &self.buffer[self.cursor_row];
-            let display_col = buffer_col_to_display(line, self.cursor_col);
+            let line = self.line_text(self.cursor_row);
+            let display_col = buffer_col_to_display(&line, self.cursor_col);
             let cx = gutter_w + (display_col as f32) * self.cell_w;
             let cy = content_top + (screen_row as f32) * self.cell_h;
             if let Some(brush) = cursor_brush.as_ref() {
@@ -1282,7 +1273,7 @@ impl ReditState {
             path = path_str,
             row = self.cursor_row + 1,
             col = self.cursor_col + 1,
-            nlines = self.buffer.len(),
+            nlines = self.line_count(),
             braces = braces_segment,
             diag = diag_segment,
         );
@@ -1309,10 +1300,7 @@ impl ReditState {
     // ─── Editing ─────────────────────────────────────────────────
 
     fn current_line_len(&self) -> usize {
-        self.buffer
-            .get(self.cursor_row)
-            .map(|s| s.chars().count())
-            .unwrap_or(0)
+        self.line_char_count(self.cursor_row)
     }
 
     fn ensure_cursor_visible(&mut self) {
@@ -1363,10 +1351,10 @@ impl ReditState {
     }
 
     fn compute_auto_indent(&self) -> String {
-        if self.cursor_row >= self.buffer.len() {
+        if self.cursor_row >= self.line_count() {
             return String::new();
         }
-        let line = &self.buffer[self.cursor_row];
+        let line = self.line_text(self.cursor_row);
         let leading: String = line
             .chars()
             .take_while(|&c| c == ' ' || c == '\t')
@@ -1471,7 +1459,8 @@ impl ReditState {
         let mut string_quote = '"';
         let mut after_escape = false;
         let mut in_block_comment = false;
-        for line in &self.buffer {
+        for line_idx in 0..self.line_count() {
+            let line = self.line_text(line_idx);
             let chars: Vec<char> = line.chars().collect();
             let mut i = 0usize;
             while i < chars.len() {
@@ -1572,7 +1561,7 @@ impl ReditState {
         let start: Pos = if self.cursor_col > 0 {
             (self.cursor_row, self.cursor_col - 1)
         } else {
-            let prev_len = self.buffer[self.cursor_row - 1].chars().count();
+            let prev_len = self.line_char_count(self.cursor_row - 1);
             (self.cursor_row - 1, prev_len)
         };
         let end = cursor_before;
@@ -1628,7 +1617,7 @@ impl ReditState {
         let start = self.cursor_pos();
         let end: Pos = if self.cursor_col < line_chars {
             (self.cursor_row, self.cursor_col + 1)
-        } else if self.cursor_row + 1 < self.buffer.len() {
+        } else if self.cursor_row + 1 < self.line_count() {
             (self.cursor_row + 1, 0)
         } else {
             return;
@@ -1663,7 +1652,7 @@ impl ReditState {
             c -= 1;
         } else if r > 0 {
             r -= 1;
-            c = self.buffer[r].chars().count();
+            c = self.line_char_count(r);
         }
         self.set_cursor(r, c, extend);
         self.pref_col = self.cursor_col;
@@ -1678,10 +1667,10 @@ impl ReditState {
             }
         }
         let (mut r, mut c) = self.cursor_pos();
-        let n = self.buffer[r].chars().count();
+        let n = self.line_char_count(r);
         if c < n {
             c += 1;
-        } else if r + 1 < self.buffer.len() {
+        } else if r + 1 < self.line_count() {
             r += 1;
             c = 0;
         }
@@ -1695,7 +1684,7 @@ impl ReditState {
             return;
         }
         r -= 1;
-        let n = self.buffer[r].chars().count();
+        let n = self.line_char_count(r);
         let c = self.pref_col.min(n);
         // Don't reset pref_col across vertical moves — that's the
         // whole point of remembering it.
@@ -1706,11 +1695,11 @@ impl ReditState {
 
     fn move_down(&mut self, extend: bool) {
         let mut r = self.cursor_row;
-        if r + 1 >= self.buffer.len() {
+        if r + 1 >= self.line_count() {
             return;
         }
         r += 1;
-        let n = self.buffer[r].chars().count();
+        let n = self.line_char_count(r);
         let c = self.pref_col.min(n);
         let pref = self.pref_col;
         self.set_cursor(r, c, extend);
@@ -1725,7 +1714,7 @@ impl ReditState {
 
     fn move_end(&mut self, extend: bool) {
         let r = self.cursor_row;
-        let n = self.buffer[r].chars().count();
+        let n = self.line_char_count(r);
         self.set_cursor(r, n, extend);
         self.pref_col = self.cursor_col;
     }
@@ -1733,7 +1722,7 @@ impl ReditState {
     fn page_up(&mut self, extend: bool) {
         let visible = self.visible_rows().max(1);
         let r = self.cursor_row.saturating_sub(visible);
-        let n = self.buffer[r].chars().count();
+        let n = self.line_char_count(r);
         let c = self.pref_col.min(n);
         let pref = self.pref_col;
         self.set_cursor(r, c, extend);
@@ -1742,9 +1731,9 @@ impl ReditState {
 
     fn page_down(&mut self, extend: bool) {
         let visible = self.visible_rows().max(1);
-        let last = self.buffer.len().saturating_sub(1);
+        let last = self.line_count().saturating_sub(1);
         let r = (self.cursor_row + visible).min(last);
-        let n = self.buffer[r].chars().count();
+        let n = self.line_char_count(r);
         let c = self.pref_col.min(n);
         let pref = self.pref_col;
         self.set_cursor(r, c, extend);
@@ -1752,8 +1741,8 @@ impl ReditState {
     }
 
     fn select_all(&mut self) {
-        let last_row = self.buffer.len().saturating_sub(1);
-        let last_col = self.buffer[last_row].chars().count();
+        let last_row = self.line_count().saturating_sub(1);
+        let last_col = self.line_char_count(last_row);
         self.anchor_row = 0;
         self.anchor_col = 0;
         self.cursor_row = last_row;
@@ -1833,16 +1822,16 @@ impl ReditState {
         } else {
             self.scroll_top + row_f as usize
         };
-        let row = row.min(self.buffer.len().saturating_sub(1));
+        let row = row.min(self.line_count().saturating_sub(1));
         let cx = x_dip - gutter_w;
         let display_col = if cx <= 0.0 || self.cell_w <= 0.0 {
             0
         } else {
             (cx / self.cell_w).round() as usize
         };
-        let line = &self.buffer[row];
-        let buf_col = display_col_to_buffer(line, display_col);
-        let n = line.chars().count();
+        let line = self.line_text(row);
+        let buf_col = display_col_to_buffer(&line, display_col);
+        let n = self.line_char_count(row);
         (row, buf_col.min(n))
     }
 
@@ -1876,7 +1865,7 @@ impl ReditState {
         if lines == 0 {
             return;
         }
-        let max_top = self.buffer.len().saturating_sub(1);
+        let max_top = self.line_count().saturating_sub(1);
         let new_top = (self.scroll_top as i32 + lines).max(0) as usize;
         self.scroll_top = new_top.min(max_top);
         self.invalidate();
@@ -1888,17 +1877,13 @@ impl ReditState {
         match std::fs::read(&path) {
             Ok(bytes) => {
                 let text = decode_utf8_lossy_with_bom(&bytes);
-                let lines: Vec<String> = if text.is_empty() {
-                    vec![String::new()]
-                } else {
-                    let mut v: Vec<String> =
-                        text.split('\n').map(|s| s.trim_end_matches('\r').to_string()).collect();
-                    if v.is_empty() {
-                        v.push(String::new());
-                    }
-                    v
-                };
-                self.buffer = lines;
+                // Normalise CRLF → LF so the rope sees consistent
+                // line boundaries; the rope's own newline-counting
+                // assumes LF.
+                let normalised = text.replace("\r\n", "\n");
+                self.buffer = super::rope_buffer::RopeBuffer::from_utf8(
+                    normalised.as_bytes(),
+                );
                 self.cursor_row = 0;
                 self.cursor_col = 0;
                 self.anchor_row = 0;
@@ -1921,13 +1906,11 @@ impl ReditState {
     }
 
     fn save_to(&mut self, path: PathBuf) -> bool {
-        let mut text = String::new();
-        for (i, line) in self.buffer.iter().enumerate() {
-            if i > 0 {
-                text.push_str("\r\n");
-            }
-            text.push_str(line);
-        }
+        // Convert the rope's LF-terminated lines to CRLF for the
+        // on-disk encoding (Windows convention; matches what
+        // `load_from` reverses).
+        let lf_text = self.buffer.to_utf8();
+        let text = lf_text.replace('\n', "\r\n");
         match std::fs::write(&path, text.as_bytes()) {
             Ok(()) => {
                 self.file_path = Some(path);
@@ -2014,7 +1997,7 @@ unsafe extern "system" fn bedit_wnd_proc(
             // caller's stack frame is still live; borrowing the
             // mutex is sound for the duration of this handler.
             let cell = unsafe { &*(lparam.0 as *const Mutex<Option<String>>) };
-            let text = state.buffer.join("\n");
+            let text = state.buffer.to_utf8();
             *cell.lock().expect("snapshot cell poisoned") = Some(text);
         }
         return LRESULT(0);
@@ -2227,8 +2210,8 @@ fn handle_char(state: &mut ReditState, c: char) {
         // Soft tab: insert spaces up to the next display tab stop so
         // typed indentation lines up with rendered tabs from
         // existing files. Single insert => one undo entry.
-        let line = &state.buffer[state.cursor_row];
-        let display_col = buffer_col_to_display(line, state.cursor_col);
+        let line = state.line_text(state.cursor_row);
+        let display_col = buffer_col_to_display(&line, state.cursor_col);
         let pad = TAB_WIDTH - (display_col % TAB_WIDTH);
         let spaces: String = std::iter::repeat(' ').take(pad).collect();
         state.insert_str(&spaces);
@@ -2741,11 +2724,13 @@ fn tokenize_line(line: &str, in_block_in: bool) -> (Vec<Token>, bool) {
 
 /// Tokenize the whole buffer. The block-comment carry-state is
 /// threaded through lines so a `/* … \n … */` span is one comment.
-fn tokenize_buffer(buffer: &[String]) -> Vec<Vec<Token>> {
-    let mut out = Vec::with_capacity(buffer.len());
+fn tokenize_buffer(buffer: &super::rope_buffer::RopeBuffer) -> Vec<Vec<Token>> {
+    let count = buffer.line_count();
+    let mut out = Vec::with_capacity(count);
     let mut in_block = false;
-    for line in buffer {
-        let (tokens, carry) = tokenize_line(line, in_block);
+    for line_idx in 0..count {
+        let line = super::rope_buffer::codepoints_to_utf8(&buffer.get_line(line_idx));
+        let (tokens, carry) = tokenize_line(&line, in_block);
         out.push(tokens);
         in_block = carry;
     }
