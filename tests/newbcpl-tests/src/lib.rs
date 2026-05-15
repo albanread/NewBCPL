@@ -78,6 +78,36 @@ pub fn expect_stdout_contains(name: &str, source: &str, expected_substring: &str
     );
 }
 
+/// Run a probe through `run` and assert it exits 0, its stdout
+/// equals `expected_stdout`, and its stderr contains every entry in
+/// `stderr_substrings`. Used by BRK probes — the snapshot dump goes
+/// to stderr while the program's regular WRITES output stays on
+/// stdout, so both channels need to be asserted.
+pub fn expect_stdout_and_stderr_contains(
+    name: &str,
+    source: &str,
+    expected_stdout: &str,
+    stderr_substrings: &[&str],
+) {
+    let output = run_driver(name, "run", source);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        output.status.success(),
+        "probe `{name}` did not exit 0\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+    );
+    assert_eq!(
+        stdout, expected_stdout,
+        "probe `{name}` unexpected stdout\n--- stderr ---\n{stderr}"
+    );
+    for needle in stderr_substrings {
+        assert!(
+            stderr.contains(*needle),
+            "probe `{name}` stderr missing `{needle}`\n--- stderr ---\n{stderr}"
+        );
+    }
+}
+
 /// Run a probe through a phase subcommand (`dump-ast`,
 /// `dump-tokens`, `dump-sema`) and assert it FAILS with the given
 /// substring in stderr. Tier 1 negative-corpus probes use this to

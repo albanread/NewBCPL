@@ -30,3 +30,9 @@ pub mod igui;
 
 #[cfg(windows)]
 pub mod igui_builtins;
+
+/// `BRK` statement runtime — the signal-safe state dumper invoked
+/// when user code reaches a `BRK` debugger breakpoint. Kept in its
+/// own module so the Win32 import surface stays out of the much
+/// hotter `builtins.rs`.
+pub mod brk;

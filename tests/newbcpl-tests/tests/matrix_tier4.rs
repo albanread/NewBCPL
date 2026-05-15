@@ -4,7 +4,9 @@
 //! exercises one shape and asserts on a small output that
 //! identifies which path the runtime actually took.
 
-use newbcpl_tests::{expect_reject, expect_stdout as expect};
+use newbcpl_tests::{
+    expect_reject, expect_stdout as expect, expect_stdout_and_stderr_contains,
+};
 
 // ─── Conditionals: IF / UNLESS / TEST ─────────────────────────────
 
@@ -544,6 +546,93 @@ fn expression_and_still_works_when_not_followed_by_paren() {
     );
 }
 
+
+// ─── BRK — debugger-breakpoint state dump ─────────────────────────
+//
+// `BRK` is the classical BCPL debugger hint. Our runtime synthesises
+// a signal-safe-ish state dump: routine name + source line, heap
+// summary, full AMD64 register set, and a stack walk via
+// `RtlVirtualUnwind` (we already register unwind tables from the JIT
+// memory manager). Output goes to stderr — stdout still carries the
+// program's own WRITES output — and the program continues after the
+// BRK statement.
+
+#[test]
+fn brk_emits_banner_with_routine_name_and_line() {
+    expect_stdout_and_stderr_contains(
+        "brk_emits_banner_with_routine_name_and_line",
+        "LET START() BE $(\n  WRITES(\"before*N\")\n  BRK\n  WRITES(\"after*N\")\n$)\n",
+        "before\nafter\n",
+        &[
+            "=== BRK in routine `START`",
+            "at line 3",
+            "=== END BRK ===",
+        ],
+    );
+}
+
+#[test]
+fn brk_emits_heap_summary() {
+    // The heap section always emits, even if live=0.
+    expect_stdout_and_stderr_contains(
+        "brk_emits_heap_summary",
+        "LET START() BE $(\n  BRK\n  WRITES(\"ok\")\n$)\n",
+        "ok",
+        &["heap:", "live=", "blocks=", "peak="],
+    );
+}
+
+#[test]
+fn brk_emits_register_state() {
+    // The context section reports RIP/RSP/RBP plus the GPRs and
+    // flags. We assert on the section header and a couple of the
+    // register names — actual values are unstable.
+    expect_stdout_and_stderr_contains(
+        "brk_emits_register_state",
+        "LET START() BE $(\n  BRK\n  WRITES(\"ok\")\n$)\n",
+        "ok",
+        &["context:", "rip=", "rsp=", "rax=", "r15="],
+    );
+}
+
+#[test]
+fn brk_emits_stack_walk() {
+    // The stack section walks frames via RtlVirtualUnwind. We
+    // can't assert on specific frame addresses, but we assert at
+    // least one frame entry was emitted.
+    expect_stdout_and_stderr_contains(
+        "brk_emits_stack_walk",
+        "LET START() BE $(\n  BRK\n  WRITES(\"ok\")\n$)\n",
+        "ok",
+        &["stack:", "#0", "rip="],
+    );
+}
+
+#[test]
+fn brk_reports_routine_name_from_helper() {
+    // BRK fires inside a helper routine, not START. The banner
+    // should name the helper so the user sees where the snapshot
+    // was taken, not just where the program lives.
+    expect_stdout_and_stderr_contains(
+        "brk_reports_routine_name_from_helper",
+        "LET helper() BE $(\n  WRITES(\"in helper*N\")\n  BRK\n$)\nLET START() BE $(\n  helper()\n  WRITES(\"done*N\")\n$)\n",
+        "in helper\ndone\n",
+        &["=== BRK in routine `helper`"],
+    );
+}
+
+#[test]
+fn brk_does_not_halt_program() {
+    // BRK is a snapshot, not FINISH — the program continues and
+    // exits 0. Helper checks that by demanding stdout has output
+    // that only appears *after* the BRK statement.
+    expect_stdout_and_stderr_contains(
+        "brk_does_not_halt_program",
+        "LET START() BE $(\n  WRITEN(1)\n  BRK\n  WRITEN(2)\n  BRK\n  WRITEN(3)\n$)\n",
+        "123",
+        &["=== BRK", "=== END BRK ==="],
+    );
+}
 
 #[test]
 fn get_cycle_rejected() {

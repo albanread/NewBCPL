@@ -1306,6 +1306,10 @@ pub fn builtin_addresses() -> &'static [Builtin] {
             builtin!(TYPE),
             builtin!(SUM),
             builtin!(JOIN),
+            Builtin {
+                name: "__newbcpl_brk",
+                address: crate::brk::__newbcpl_brk as *const () as usize,
+            },
         ];
         #[cfg(windows)]
         {

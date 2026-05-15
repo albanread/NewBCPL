@@ -764,6 +764,26 @@ impl<'a> Lowerer<'a> {
                 // `RETAIN x` (mark existing) — no IR effect. The
                 // binding is already a stack root in our model.
             }
+            Stmt::Brk(span) => {
+                // `BRK` debugger breakpoint — emit a call to the
+                // runtime's `__newbcpl_brk(name, line)` handler.
+                // `name` is the mangled name of the function the
+                // BRK fired inside; `line` is the source line of
+                // the BRK statement itself. Both are best-effort
+                // and the handler tolerates null / 0. After the
+                // handler returns we drop back into the regular
+                // flow — BRK is a snapshot, not a halt.
+                let routine_name = self.b().function.name.clone();
+                let name_value = Value::Const(Const::String(routine_name));
+                let line_value =
+                    Value::Const(Const::Int(span.start.line as i64));
+                self.b().emit(Instr::Call {
+                    dst: None,
+                    callee: Value::Function("__newbcpl_brk".to_string()),
+                    args: vec![name_value, line_value],
+                    hint: TypeHint::Word,
+                });
+            }
             // SWITCHON / FOREACH / labels etc. — subsequent
             // IR-grow chunks lower these.
             _ => {}

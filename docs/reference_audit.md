@@ -90,7 +90,7 @@ Reference precedence table (high → low): `()`, `! OF`, `@ !`, `* / REM`,
 | `name:` label declaration | ✓ | Same probes — labels are exercised by every GOTO probe |
 | `RETURN`, `RESULTIS`, `FINISH` | ✓ | Tier 4 |
 | `BREAK`, `LOOP`, `ENDCASE` | ✓ | Tier 4 + tier 5 USING-cleanup probes |
-| `BRK` debugger breakpoint | ⚠ | Parses; not lowered |
+| `BRK` debugger breakpoint | ✓ | Lowers to `__newbcpl_brk(routine_name, line)`. Runtime handler writes a signal-safe-ish state dump to stderr: banner with routine + line, heap summary (`live_bytes`/`live_blocks`/`peak`), full AMD64 register state via `RtlCaptureContext`, stack walk via `RtlVirtualUnwind` using the same unwind tables `jit_mm` registers for SEH. Program continues after the BRK. Tier 4 (`brk_emits_banner_with_routine_name_and_line`, `brk_emits_heap_summary`, `brk_emits_register_state`, `brk_emits_stack_walk`, `brk_reports_routine_name_from_helper`, `brk_does_not_halt_program`). |
 
 ## §4 — Declarations
 
@@ -206,7 +206,7 @@ Per `BCPL Runtime.md`:
 
 ## Current state — post-iteration-4
 
-The matrix has **300 probes across 17 test binaries**, all green
+The matrix has **306 probes across 17 test binaries**, all green
 (`cargo test -p newbcpl-tests --tests`). Every previously-named
 "high-leverage gap" — SUPER end-to-end, VIRTUAL dispatch, RETAIN
 post-GC, GOTO/label, multibyte UTF-8, EQV, NEQV — now has a
@@ -262,14 +262,25 @@ couldn't:**
   `class_name_from_annotation`. This was also the top failure
   bucket in iteration 4's corpus sweep.
 
+* `BRK` was the last ⚠ row in the audit — parser knew the keyword
+  but no IR was emitted. Implemented as a runtime call to
+  `__newbcpl_brk(routine_name, line)` that captures CONTEXT via
+  `RtlCaptureContext`, walks the stack via `RtlVirtualUnwind` over
+  the unwind tables `jit_mm` already registers, and writes the
+  whole snapshot to stderr through direct `WriteFile` calls (no
+  Rust `String`, no `format!` — fixed-size stack buffer with
+  hand-rolled hex/dec formatting). Caught a `CONTEXT` 16-byte
+  alignment bug on the way in: the `windows` crate's `#[repr(C)]`
+  CONTEXT can land on an 8-byte boundary, faulting
+  `RtlCaptureContext`. Wrapped in `#[repr(C, align(16))]`.
+
 ### Still genuinely thin
 
 These rows are marked ⚠ above because the feature exists in the
 compiler but no probe pins it:
 
-| Row | What's missing |
-|---|---|
-| `BRK` debugger breakpoint | Parses but isn't lowered — *implementation* gap, not a probe gap |
+No rows currently. Every previously ⚠ feature is either ✓ or
+documented as a known Δ.
 
 ### Out-of-scope by design
 
