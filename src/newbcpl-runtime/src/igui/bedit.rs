@@ -224,12 +224,21 @@ pub fn snapshot_buffer() -> Option<String> {
 // layering clean and lets us swap in different checkers (e.g. a
 // fast parse-only check vs full semantic) later.
 
-/// One diagnostic from the compile-check pass. Lines and columns are
-/// 1-indexed to match what shows up in the status bar.
+/// One diagnostic from the compile-check pass. Lines and columns
+/// are 1-indexed to match what shows up in the status bar.
+///
+/// `end_line` / `end_column` mark the end of the offending span;
+/// the renderer draws a red wavy underline between `(line, column)`
+/// and the end position. For point diagnostics where the source
+/// only reports a single position, callers set
+/// `end_line == line` and `end_column == column + 1` so the
+/// squiggle still has visible width.
 #[derive(Clone, Debug)]
 pub struct Diagnostic {
     pub line: usize,
     pub column: usize,
+    pub end_line: usize,
+    pub end_column: usize,
     pub message: String,
 }
 
@@ -913,9 +922,49 @@ impl ReditState {
     }
 
     /// First diagnostic on `line_1based`, if any. Used for the
-    /// status line and the gutter mark.
+    /// status line and the gutter mark. Picks the first diagnostic
+    /// whose span covers the line (start.line ≤ line ≤ end.line)
+    /// so a multi-line span surfaces in the status of any row it
+    /// touches.
     fn diagnostic_on_line(&self, line_1based: usize) -> Option<&Diagnostic> {
-        self.diagnostics.iter().find(|d| d.line == line_1based)
+        self.diagnostics
+            .iter()
+            .find(|d| d.line <= line_1based && d.end_line >= line_1based)
+    }
+
+    /// Map a diagnostic's span to the `[from_col, to_col)` 0-based
+    /// code-point range on a specific row (1-based). When the
+    /// diagnostic starts on a previous row, `from_col` is 0; when
+    /// it ends on a later row, `to_col` extends through the line's
+    /// last column. For single-row diagnostics this is just
+    /// `(column-1, end_column-1)` clamped to the line.
+    fn diagnostic_columns_on_line(
+        &self,
+        diag: &Diagnostic,
+        line_1based: usize,
+    ) -> (usize, usize) {
+        let row = line_1based.saturating_sub(1);
+        let n = self.line_char_count(row);
+        let from = if diag.line == line_1based {
+            diag.column.saturating_sub(1)
+        } else {
+            0
+        };
+        let to = if diag.end_line == line_1based {
+            diag.end_column.saturating_sub(1)
+        } else {
+            n
+        };
+        // Clamp to the line. Squiggles need *some* width even on a
+        // point diagnostic (column == end_column) so a single-token
+        // problem is still visible — extend by one cell when
+        // possible.
+        let from = from.min(n);
+        let mut to = to.min(n);
+        if to == from && to < n {
+            to = from + 1;
+        }
+        (from, to)
     }
 
     fn redo(&mut self) {
@@ -1192,6 +1241,45 @@ impl ReditState {
                             D2D1_DRAW_TEXT_OPTIONS_CLIP,
                         );
                     }
+                }
+            }
+
+            // Inline diagnostic underlines. For every diagnostic
+            // whose span covers any part of this row, draw a red
+            // bar along the bottom of the offending cells. Multi-
+            // line spans are clipped to this row's column range.
+            // The bar greys out when `diagnostics_stale` is set —
+            // same colour story as the gutter mark, so the user
+            // sees at a glance whether the underline matches the
+            // current buffer.
+            let line_1based = line_idx + 1;
+            for diag in &self.diagnostics {
+                if diag.line > line_1based || diag.end_line < line_1based {
+                    continue;
+                }
+                let (from_col, to_col) = self.diagnostic_columns_on_line(
+                    diag,
+                    line_1based,
+                );
+                if to_col <= from_col {
+                    continue;
+                }
+                let from_display = buffer_col_to_display(&line, from_col);
+                let to_display = buffer_col_to_display(&line, to_col);
+                if let Some(b) = err_brush.as_ref() {
+                    let bar_top = y + self.cell_h - 2.0;
+                    let bar_bot = y + self.cell_h;
+                    unsafe {
+                        target.FillRectangle(
+                            &D2D_RECT_F {
+                                left: gutter_w + (from_display as f32) * self.cell_w,
+                                top: bar_top,
+                                right: gutter_w + (to_display as f32) * self.cell_w,
+                                bottom: bar_bot,
+                            },
+                            b,
+                        )
+                    };
                 }
             }
         }

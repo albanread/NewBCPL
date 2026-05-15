@@ -1,0 +1,16 @@
+// Open this in the GUI and press F7 to see inline diagnostics.
+// The override of FINAL `seal` should be flagged with a red
+// squiggle and the message in the status line.
+
+CLASS Box $(
+    FINAL FUNCTION seal() = 1
+$)
+
+CLASS Crate EXTENDS Box $(
+    FUNCTION seal() = 2
+$)
+
+LET START() BE $(
+    LET b = NEW Crate
+    WRITEN(b.seal())
+$)

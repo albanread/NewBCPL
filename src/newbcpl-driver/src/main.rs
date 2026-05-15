@@ -280,6 +280,14 @@ fn run_gui(program_path: PathBuf) -> ExitCode {
     // while Run still reads the original).
     igui::bedit_set_startup_file(program_path.clone());
 
+    // Install the compile-check closure that F7 invokes. Runs the
+    // full front-end pipeline (lex → parse → sema) and returns
+    // every error as a `Diagnostic` with start + end position so
+    // bedit can paint a wavy underline under the offending span.
+    // A single fatal LexError or ParseError is reported alone (later
+    // phases need a valid AST to run); sema errors are accumulated.
+    igui::install_checker(check_source_for_gui);
+
     // Optional: drop a one-time banner so users see the log view
     // working even before they hit Run.
     igui::log_append(&format!(
@@ -287,6 +295,7 @@ fn run_gui(program_path: PathBuf) -> ExitCode {
         program_path.display()
     ));
     igui::log_append("Press Ctrl+R or pick Program ▸ Run to execute.");
+    igui::log_append("Press F7 to check, F8 to jump to next diagnostic.");
 
     match igui::run(Some(worker)) {
         Ok(code) => {
@@ -313,6 +322,60 @@ fn run_gui(_program_path: PathBuf) -> ExitCode {
 }
 
 /// Buffer console bytes by line and ship complete lines into the
+/// Run the front-end pipeline (lex → parse → sema) over the
+/// current editor buffer and return every error as a `Diagnostic`.
+/// Plumbed in by `run_gui` via `igui::install_checker`; bedit's
+/// F7 binding calls this whenever the user asks for a check, and
+/// the result populates the paint-time squiggle layer and the
+/// status-line message.
+///
+/// Lex / parse errors are fatal at their own phase: a syntax
+/// problem produces a single diagnostic and we stop there because
+/// sema can't run on a malformed AST. Sema errors are bulk-
+/// collected; pulling them out of the `SemaOutput.errors` channel
+/// (the same hard-error channel that gates IR/codegen on `run`).
+#[cfg(windows)]
+fn check_source_for_gui(source: &str) -> Vec<newbcpl_runtime::igui::Diagnostic> {
+    use newbcpl_runtime::igui::Diagnostic;
+
+    let mut out: Vec<Diagnostic> = Vec::new();
+
+    // `parse_source` runs the lexer internally and converts
+    // `LexError` → `ParseError` via `ParseError::from_lex`, so a
+    // single failure path covers both phases. Sema only runs on a
+    // successful parse — a malformed AST would crash sema, and
+    // the user's actionable signal is the parse error anyway.
+    let program = match newbcpl_parser::parse_source(source) {
+        Ok(p) => p,
+        Err(e) => {
+            let s = e.span.start;
+            let en = e.span.end;
+            out.push(Diagnostic {
+                line: s.line,
+                column: s.column,
+                end_line: en.line,
+                end_column: en.column,
+                message: format!("parse: {}", e.message),
+            });
+            return out;
+        }
+    };
+
+    let sema_out = newbcpl_sema::analyze(&program);
+    for err in &sema_out.errors {
+        let s = err.span.start;
+        let en = err.span.end;
+        out.push(Diagnostic {
+            line: s.line,
+            column: s.column,
+            end_line: en.line,
+            end_column: en.column,
+            message: format!("sema: {}", err.message),
+        });
+    }
+    out
+}
+
 /// iGui log view. Mutates a process-wide buffer guarded by a mutex;
 /// keyed by thread isn't needed because writes serialise through the
 /// console callback's `Mutex` anyway.
