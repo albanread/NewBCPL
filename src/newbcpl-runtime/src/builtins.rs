@@ -1324,6 +1324,10 @@ pub fn builtin_addresses() -> &'static [Builtin] {
                 name: "__newbcpl_collect",
                 address: crate::gc::__newbcpl_collect as *const () as usize,
             },
+            Builtin {
+                name: "__newbcpl_lookup_method",
+                address: crate::gc::__newbcpl_lookup_method as *const () as usize,
+            },
             builtin!(GC),
             builtin!(HEAP_INFO),
             builtin!(__newbcpl_default_method),

@@ -199,9 +199,7 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
     /// the size field is read on each allocation. The vtable
     /// pointer is included for forward compatibility with the
     /// NewCP-style `obj → header → desc → desc.vtable[slot]`
-    /// dispatch path; today we still keep an inline vtable header
-    /// at offset 0 of the instance, so MethodCall reads it
-    /// directly without touching the TypeDesc.
+    /// dispatch path.
     ///
     /// Layout (must mirror gc::TypeDesc):
     /// `{ i64 size, ptr module, ptr finalizer, ptr base, ptr vtable,
@@ -209,6 +207,15 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
     /// — 7 fixed fields then a sentinel-terminated `ptroffs` array.
     /// We emit `[1 x i64] = [-1]` so the GC's pointer-offset
     /// iterator stops immediately (no pointer fields tracked yet).
+    ///
+    /// In parallel we emit `@{Class}.method_names` as a private
+    /// `[N x ptr]` of name strings. The names aren't stored in the
+    /// TypeDesc directly because instances use a runtime-interned
+    /// size-keyed TypeDesc (see `__newbcpl_alloc_rec`) and we want
+    /// per-class metadata. Instead, the JIT registers each class's
+    /// `(vtable_addr → method_names_addr)` pair with the runtime
+    /// at finalize time; `__newbcpl_lookup_method` keys off the
+    /// instance's inline vtable pointer.
     fn declare_typedesc_globals(&mut self, layouts: &[ClassLayout]) {
         let i64_t = self.context.i64_type();
         let ptr_t = self.context.ptr_type(AddressSpace::default());
@@ -237,6 +244,15 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
                     .as_pointer_value();
                 (vg, layout.vtable.len() as u64)
             };
+            // Emit the parallel `@{Class}.method_names` array even
+            // though it's not embedded in this TypeDesc — see the
+            // comment block above. The IR-side call to
+            // `__newbcpl_register_jit_vtable_methods` at finalize
+            // wires it into the lookup registry.
+            if !layout.vtable.is_empty() {
+                let _ = self
+                    .emit_method_names_global(&layout.class_name, &layout.vtable);
+            }
             // Sentinel -1: tells the GC "no pointer fields".
             // Pointer-tracking ports later by emitting the real
             // offsets from `layout.ptroffs` followed by -1.
@@ -265,6 +281,57 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
             g.set_constant(false);
             g.set_linkage(Linkage::External);
         }
+    }
+
+    /// Emit `@{Class}.method_names`, a `[N x ptr]` array of
+    /// pointers to per-method name strings. Each name string is
+    /// emitted as its own private global (`@{Class}.mname.<slot>`)
+    /// holding the null-terminated UTF-8 bytes of the method name.
+    /// Returned pointer is the address of the array itself, ready
+    /// to slot into the TypeDesc's `method_names` field.
+    fn emit_method_names_global(
+        &mut self,
+        class_name: &str,
+        vtable: &[newbcpl_ir::VtableEntry],
+    ) -> inkwell::values::PointerValue<'ctx> {
+        let i8_t = self.context.i8_type();
+        let ptr_t = self.context.ptr_type(AddressSpace::default());
+        let mut entries: Vec<inkwell::values::PointerValue<'ctx>> =
+            Vec::with_capacity(vtable.len());
+        for (idx, entry) in vtable.iter().enumerate() {
+            // Build a null-terminated byte array literal for the
+            // method name. We use bytes (not strings) so we don't
+            // require utf8-validation on the emit side.
+            let mut bytes: Vec<u8> = entry.method_name.as_bytes().to_vec();
+            bytes.push(0);
+            let byte_consts: Vec<inkwell::values::IntValue<'ctx>> =
+                bytes.iter().map(|b| i8_t.const_int(*b as u64, false)).collect();
+            let array_init = i8_t.const_array(&byte_consts);
+            let name_global = self.module.add_global(
+                array_init.get_type(),
+                None,
+                &format!("{class_name}.mname.{idx}"),
+            );
+            name_global.set_initializer(&array_init);
+            name_global.set_constant(true);
+            name_global.set_linkage(Linkage::Private);
+            entries.push(name_global.as_pointer_value());
+        }
+        let array_ty = ptr_t.array_type(entries.len() as u32);
+        let array_init = ptr_t.const_array(&entries);
+        let g = self.module.add_global(
+            array_ty,
+            None,
+            &format!("{class_name}.method_names"),
+        );
+        g.set_initializer(&array_init);
+        g.set_constant(true);
+        // External linkage so the JIT-side finalize hook can find
+        // the address by name via `LLVMGetGlobalValueAddress` and
+        // register the (vtable, names) pair with the runtime's
+        // lookup table.
+        g.set_linkage(Linkage::External);
+        g.as_pointer_value()
     }
 
     // ─── declarations ───────────────────────────────────────────
@@ -880,6 +947,21 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
                     *hint,
                 );
             }
+            Instr::IndirectMethodCall {
+                dst,
+                receiver,
+                method_name,
+                args,
+                hint,
+            } => {
+                self.emit_indirect_method_call(
+                    *dst,
+                    receiver,
+                    method_name,
+                    args,
+                    *hint,
+                );
+            }
         }
     }
 
@@ -1077,6 +1159,140 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
             .expect("indirect call");
 
         let _ = class_name; // class name was used for slot resolution upstream
+        if let Some(d) = dst {
+            use inkwell::values::ValueKind;
+            match call_site.try_as_basic_value() {
+                ValueKind::Basic(rv) => {
+                    self.value_map.insert(d, rv);
+                }
+                ValueKind::Instruction(_) => {
+                    let z = self.zero(hint);
+                    self.value_map.insert(d, z);
+                }
+            }
+        }
+    }
+
+    /// Lower `Instr::IndirectMethodCall` to a runtime name-keyed
+    /// dispatch. The static class isn't known at this site (typically
+    /// an untyped routine parameter), so codegen emits:
+    ///
+    ///   1. Materialise a private global pointing at the method's
+    ///      null-terminated name string.
+    ///   2. Call `__newbcpl_lookup_method(receiver, name_ptr)` —
+    ///      the runtime walks the receiver's `TypeDesc.method_names`
+    ///      and returns the matching `vtable[i]` function pointer
+    ///      (or null if the method isn't defined on the class).
+    ///   3. Indirect-call through the returned pointer with
+    ///      `(receiver, args...)`.
+    ///
+    /// A null lookup result would dispatch through address 0 and
+    /// crash. We don't guard with a runtime null check here: the
+    /// failure mode is identical to a vtable-slot null today, and
+    /// adding the guard adds a hard-to-explain hidden branch on
+    /// every dynamic dispatch. Programs that hit it have a real
+    /// "method not defined for this class" bug — a BRK at the
+    /// caller will surface it.
+    fn emit_indirect_method_call(
+        &mut self,
+        dst: Option<ValueId>,
+        receiver: &Value,
+        method_name: &str,
+        args: &[Value],
+        hint: TypeHint,
+    ) {
+        let ptr_t = self.context.ptr_type(AddressSpace::default());
+        let i64_t = self.context.i64_type();
+        let i8_t = self.context.i8_type();
+
+        let recv_v = self.lower_value(receiver);
+        let recv_ptr = self.as_pointer(recv_v);
+
+        // 1. Emit a private global holding the null-terminated method
+        // name. Names are interned per-IR-name string to avoid
+        // duplicate globals when the same method is dispatched in
+        // multiple places. Inkwell doesn't easily let us look up a
+        // global by initialiser, so we cache by name via the module's
+        // own symbol table — a `@bcpl.mname.<name>` convention.
+        let mangled_name_sym = format!("bcpl.mname.{method_name}");
+        let name_global = match self.module.get_global(&mangled_name_sym) {
+            Some(g) => g,
+            None => {
+                let mut bytes = method_name.as_bytes().to_vec();
+                bytes.push(0);
+                let byte_consts: Vec<inkwell::values::IntValue<'ctx>> =
+                    bytes
+                        .iter()
+                        .map(|b| i8_t.const_int(*b as u64, false))
+                        .collect();
+                let arr_init = i8_t.const_array(&byte_consts);
+                let g = self
+                    .module
+                    .add_global(arr_init.get_type(), None, &mangled_name_sym);
+                g.set_initializer(&arr_init);
+                g.set_constant(true);
+                g.set_linkage(Linkage::Private);
+                g
+            }
+        };
+
+        // 2. Look the method up via the runtime helper.
+        let lookup_fn = match self.module.get_function("__newbcpl_lookup_method") {
+            Some(f) => f,
+            None => {
+                let fn_type = ptr_t.fn_type(&[ptr_t.into(), ptr_t.into()], false);
+                self.module
+                    .add_function("__newbcpl_lookup_method", fn_type, None)
+            }
+        };
+        let lookup_call = self
+            .builder
+            .build_call(
+                lookup_fn,
+                &[
+                    recv_ptr.into(),
+                    name_global.as_pointer_value().into(),
+                ],
+                "method_fn",
+            )
+            .expect("lookup call");
+        use inkwell::values::ValueKind;
+        let resolved_fn = match lookup_call.try_as_basic_value() {
+            ValueKind::Basic(rv) => rv.into_pointer_value(),
+            ValueKind::Instruction(_) => {
+                panic!("__newbcpl_lookup_method did not return a value")
+            }
+        };
+
+        // 3. Indirect-call through the resolved function pointer
+        // with (receiver, args...). Synthesise a function type that
+        // matches the BCPL-routine ABI: ptr receiver, i64 args, then
+        // the typed return value.
+        let return_type = self.return_type_for(hint);
+        let mut param_types: Vec<BasicMetadataTypeEnum> =
+            Vec::with_capacity(args.len() + 1);
+        param_types.push(ptr_t.into());
+        for _ in args {
+            param_types.push(i64_t.into());
+        }
+        let fn_type = match return_type {
+            Some(t) => t.fn_type(&param_types, false),
+            None => self.context.void_type().fn_type(&param_types, false),
+        };
+
+        let mut call_args: Vec<BasicMetadataValueEnum> =
+            Vec::with_capacity(args.len() + 1);
+        call_args.push(recv_ptr.into());
+        for a in args {
+            let v = self.lower_value(a);
+            let iv = self.as_int_word(v);
+            call_args.push(iv.into());
+        }
+        let call_site = self
+            .builder
+            .build_indirect_call(fn_type, resolved_fn, &call_args, "vcall_dyn")
+            .expect("indirect call (dynamic)");
+
         if let Some(d) = dst {
             use inkwell::values::ValueKind;
             match call_site.try_as_basic_value() {

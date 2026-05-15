@@ -638,17 +638,74 @@ fn param_annotation_enforces_visibility() {
 
 #[test]
 fn param_without_annotation_workaround_via_typed_local() {
-    // Without an annotation a parameter is just a Word and
-    // `p.method()` can't resolve to a class — the IR falls
-    // through to the `__newbcpl_indirect` placeholder. The
-    // canonical workaround prior to param annotations: assign
-    // the param to a class-typed local inside the body. This
-    // probe pins that the workaround still works (and shows
-    // what the new annotation form spares users from writing).
+    // Pre-iteration workaround: when the param annotation form
+    // wasn't yet wired, users assigned to a class-typed local
+    // before calling. This still works (param_AS_Class is the
+    // direct form, this is the indirect-via-local form).
     expect(
         "param_without_annotation_workaround_via_typed_local",
         "CLASS Box $(\n  DECL n\n  ROUTINE CREATE(i) BE SELF.n := i\n  FUNCTION peek() = SELF.n\n$)\nLET unbox(b) = VALOF $(\n  LET typed AS Box = b\n  RESULTIS typed.peek()\n$)\nLET START() BE $(\n  LET b = NEW Box(13)\n  WRITEN(unbox(b))\n$)\n",
         "13",
+    );
+}
+
+// ─── Name-keyed dynamic dispatch (un-annotated receivers) ──────
+//
+// When sema / IR can't determine the receiver's static class — most
+// commonly because the receiver is a routine parameter without an
+// `AS Class` annotation — codegen emits an `IndirectMethodCall`
+// that resolves through `__newbcpl_lookup_method` at runtime.
+// The helper keys off the instance's inline vtable pointer (offset
+// 0) into a process-global `(vtable_addr → method_names_addr)`
+// registry the LLVM crate populates at JIT-finalize time. These
+// probes pin the path end-to-end, including the polymorphic cases
+// where the same `obj.method()` shape dispatches to different
+// classes depending on what gets passed in.
+
+#[test]
+fn indirect_dispatch_resolves_method_on_untyped_param() {
+    // Same source the corpus's many `param.method()` patterns hit.
+    // Without runtime name-keyed dispatch this would crash with
+    // `missing builtin: __newbcpl_indirect`; with it, the method
+    // resolves through `__newbcpl_lookup_method`.
+    expect(
+        "indirect_dispatch_resolves_method_on_untyped_param",
+        "CLASS Box $(\n  DECL n\n  ROUTINE CREATE(i) BE SELF.n := i\n  FUNCTION peek() = SELF.n\n$)\nLET unbox(b) = b.peek()\nLET START() BE $(\n  LET b = NEW Box(42)\n  WRITEN(unbox(b))\n$)\n",
+        "42",
+    );
+}
+
+#[test]
+fn indirect_dispatch_routes_to_dynamic_class() {
+    // The classic polymorphic shape: one helper, multiple classes,
+    // each with a same-named method. Without static class info
+    // the dispatch must route to the receiver's actual class.
+    expect(
+        "indirect_dispatch_routes_to_dynamic_class",
+        "CLASS Cat $(\n  FUNCTION speak() = 100\n$)\nCLASS Dog $(\n  FUNCTION speak() = 200\n$)\nLET say(a) = a.speak()\nLET START() BE $(\n  LET c = NEW Cat\n  LET d = NEW Dog\n  WRITEN(say(c)) WRITES(\"*S\") WRITEN(say(d))\n$)\n",
+        "100 200",
+    );
+}
+
+#[test]
+fn indirect_dispatch_passes_arguments() {
+    // The method takes arguments — the IR's indirect path must
+    // wire each through to the resolved function.
+    expect(
+        "indirect_dispatch_passes_arguments",
+        "CLASS Adder $(\n  DECL base\n  ROUTINE CREATE(b) BE SELF.base := b\n  FUNCTION plus(x, y) = SELF.base + x + y\n$)\nLET sum_call(a) = a.plus(10, 20)\nLET START() BE $(\n  LET adder = NEW Adder(100)\n  WRITEN(sum_call(adder))\n$)\n",
+        "130",
+    );
+}
+
+#[test]
+fn indirect_dispatch_works_in_routine_body() {
+    // Routines with `BE stmt` (no return value) — the dispatch
+    // path needs to handle the void-return case too.
+    expect(
+        "indirect_dispatch_works_in_routine_body",
+        "GLOBAL trace = 0\nCLASS Setter $(\n  FUNCTION write(v) = VALOF $( trace := v\n RESULTIS 0 $)\n$)\nLET poke(s, v) BE s.write(v)\nLET START() BE $(\n  LET s = NEW Setter\n  poke(s, 99)\n  WRITEN(trace)\n$)\n",
+        "99",
     );
 }
 

@@ -110,6 +110,7 @@ Reference precedence table (high → low): `()`, `! OF`, `@ !`, `* / REM`,
 | `LET F(p) = expr` function | ✓ | Tier 3 |
 | `LET R(p) BE stmt` routine | ✓ | Tier 4 |
 | `LET F(p AS Class) = expr` parameter annotation | ✓ | AST carries `param_annotations: Vec<Option<String>>` parallel to `params`. Sema attaches class identity to the parameter binding; IR's `start_function_with_annotations` propagates it so `class_name_of_expr` resolves member access through the parameter. Tier 5 (`function_param_as_class_dispatches_method`, `routine_param_as_class_accesses_field`, `class_method_param_as_class_chains`, `param_annotation_enforces_visibility`, `param_without_annotation_workaround_via_typed_local`). |
+| `param.method()` on un-annotated parameter | ✓ | When sema can't determine the receiver's static class, IR emits `IndirectMethodCall` instead of `MethodCall`. Codegen lowers it to a `__newbcpl_lookup_method(receiver, name)` call followed by an indirect call through the resolved function pointer. The lookup walks a process-global `(vtable_addr → method_names_addr)` registry populated by the LLVM crate at JIT-finalize time. Tier 5 (`indirect_dispatch_resolves_method_on_untyped_param`, `indirect_dispatch_routes_to_dynamic_class`, `indirect_dispatch_passes_arguments`, `indirect_dispatch_works_in_routine_body`). |
 | `FUNCTION` / `ROUTINE` keyword forms | ✓ | Parser tests |
 | `AND` mutual recursion | ✓ | Both surface forms work: (a) consecutive top-level `LET`s relying on sema's pre-pass 2 to preregister names, and (b) classical `LET f(...) = e AND g(...) = e` chains. The parser disambiguates by looking ahead for `AND <ident> (` — when matched, the `AND` is decl-tail and the chain unfolds into independent top-level decls; otherwise `AND` stays a logical operator. Tier 4 probes: `mutual_recursion_via_consecutive_lets_terminates`, `mutual_recursion_routines_with_be_bodies`, `classical_let_and_chain_two_functions`, `classical_let_and_chain_three_routines`, `classical_let_and_chain_mixes_function_and_routine`, `expression_and_still_works_when_not_followed_by_paren`. |
 | `GET "file"` include | ✓ | AST-level splicing: sibling-file first, then modules-active fallback so a module doubles as a header. Cycle detection via depth cap. |
@@ -207,7 +208,7 @@ Per `BCPL Runtime.md`:
 
 ## Current state — post-iteration-4
 
-The matrix has **312 probes across 17 test binaries**, all green
+The matrix has **316 probes across 17 test binaries**, all green
 (`cargo test -p newbcpl-tests --tests`). Every previously-named
 "high-leverage gap" — SUPER end-to-end, VIRTUAL dispatch, RETAIN
 post-GC, GOTO/label, multibyte UTF-8, EQV, NEQV — now has a

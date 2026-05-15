@@ -2702,10 +2702,16 @@ impl<'a> Lowerer<'a> {
                 }
             }
         }
-        // Method dispatch: callee is `obj.methodName`. When sema /
-        // class lookup tells us the receiver's class and that class
-        // has the named method in its vtable, lower as a MethodCall
-        // — codegen emits the vtable load + indirect call.
+        // Method dispatch: callee is `obj.methodName`. Three paths,
+        // tried in order:
+        //
+        //   1. Static class known + method in vtable → `MethodCall`,
+        //      direct vtable-slot dispatch.
+        //   2. Static class known but method not in vtable, OR
+        //      static class unknown → `IndirectMethodCall`, runtime
+        //      name-based lookup via `__newbcpl_lookup_method`.
+        //   3. Callee isn't `obj.method` shape → fall through to the
+        //      generic indirect `Call` path below.
         if let Expr::Binary {
             op: BinaryOp::Dot,
             lhs,
@@ -2713,22 +2719,24 @@ impl<'a> Lowerer<'a> {
             ..
         } = callee
         {
-            if let (Some(class_name), Expr::Ident { name: method, .. }) =
-                (self.class_name_of_expr(lhs), rhs.as_ref())
-            {
-                if let Some(slot) = self.lookup_method_slot(&class_name, method) {
+            if let Expr::Ident { name: method, .. } = rhs.as_ref() {
+                let receiver_class = self.class_name_of_expr(lhs);
+                let static_slot = receiver_class
+                    .as_deref()
+                    .and_then(|c| self.lookup_method_slot(c, method));
+
+                if let (Some(class_name), Some(slot)) =
+                    (receiver_class.clone(), static_slot)
+                {
+                    // Path 1 — direct vtable-slot dispatch.
                     let receiver = self.lower_expr(lhs);
                     let arg_values: Vec<Value> =
                         args.iter().map(|a| self.lower_expr(a)).collect();
-                    // Always capture the call's result. Routines
-                    // return i64 0 by the BCPL convention so callers
-                    // that ignore the value see a sensible zero;
-                    // functions return their inferred type.
                     let dst = self.b().alloc_value();
                     self.b().emit(Instr::MethodCall {
                         dst: Some(dst),
                         receiver,
-                        class_name: class_name.clone(),
+                        class_name,
                         vtable_slot: slot,
                         method_name: method.clone(),
                         args: arg_values,
@@ -2736,6 +2744,26 @@ impl<'a> Lowerer<'a> {
                     });
                     return Value::Local(dst);
                 }
+                // Path 2 — emit a runtime name-based dispatch. We
+                // reach this branch when:
+                //   * `class_name_of_expr` returns None (receiver
+                //     is an untyped parameter or unknown alias), or
+                //   * the static class doesn't carry this method
+                //     name in its vtable (cross-class dispatch
+                //     through a typed-as-base reference whose
+                //     declared class lacks the override).
+                let receiver = self.lower_expr(lhs);
+                let arg_values: Vec<Value> =
+                    args.iter().map(|a| self.lower_expr(a)).collect();
+                let dst = self.b().alloc_value();
+                self.b().emit(Instr::IndirectMethodCall {
+                    dst: Some(dst),
+                    receiver,
+                    method_name: method.clone(),
+                    args: arg_values,
+                    hint,
+                });
+                return Value::Local(dst);
             }
         }
 

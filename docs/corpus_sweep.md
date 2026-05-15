@@ -402,7 +402,7 @@ mismatches one file at a time — not systematic gaps.
 
 ### Where things stand
 
-Across seven sweep iterations the journey is:
+Across eight sweep iterations the journey is:
 
 | Sweep | Pass | % raw | Effective % * |
 |-------|------|-------|---------------|
@@ -412,15 +412,19 @@ Across seven sweep iterations the journey is:
 | 4     | 524  | 61.2  | 68.9          |
 | 5     | 531  | 63.6  | 69.9          |
 | 6     | 534  | 63.9  | 70.3          |
-| 7     | 537  | 64.3  | **70.7**      |
+| 7     | 537  | 64.3  | 70.7          |
+| 8     | 539  | 64.6  | **70.9**      |
 
 \* Effective denominator = 856 − 28 GLOBALS − 45 no-START − 2
 visibility-violation − 21 SDL2 = 760.
 
-Sweep 6 picked up param-annotation-using shapes (where corpus tests
-happened to dispatch through a typed parameter). Sweep 7 picked up
+Sweep 6 picked up param-annotation-using shapes. Sweep 7 picked up
 the typed-allocator bucket (`IGETVEC` / `SGETVEC` / `PGETVEC` /
-`QGETVEC` added as GETVEC aliases).
+`QGETVEC` added as GETVEC aliases). Sweep 8 eliminated the
+`__newbcpl_indirect` bucket entirely by implementing name-keyed
+dynamic dispatch — untyped `param.method()` now resolves through a
+runtime `__newbcpl_lookup_method` helper keyed by the instance's
+inline vtable pointer.
 
 The corpus sweep has done its job: it surfaced systematic gaps,
 each of which got addressed with a focused patch. What's left is

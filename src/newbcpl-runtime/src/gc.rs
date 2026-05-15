@@ -90,6 +90,13 @@ pub type Finalizer = unsafe extern "C-unwind" fn(*mut u8);
 
 /// Runtime type descriptor emitted by `newbcpl-llvm` for every heap-
 /// allocated record type.  Layout-frozen.
+///
+/// `vtable` / `vtable_len` are populated for forward compatibility
+/// with TypeDesc-routed dispatch; the live dispatch path today uses
+/// the *inline* vtable pointer the JIT installs at offset 0 of every
+/// instance. Name-keyed dynamic dispatch
+/// (`__newbcpl_lookup_method`) keys off that inline pointer through a
+/// process-global registry — see `brk::register_jit_vtable_methods`.
 #[repr(C)]
 pub struct TypeDesc {
     pub size: isize,
@@ -1611,6 +1618,124 @@ pub(crate) fn with_locked_state<R>(f: impl FnOnce(&GcState) -> R) -> R {
 pub(crate) fn with_heap_locked<R>(f: impl FnOnce(&Heap) -> R) -> R {
     let heap = heap_lock();
     f(&heap)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Indirect method dispatch
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// `__newbcpl_lookup_method(obj, name)` resolves an untyped
+// `obj.method()` call. The IR emits this when the receiver's class
+// can't be determined statically — usually a routine parameter
+// without an `AS Class` annotation. The helper returns the function
+// pointer for the receiver's actual class's method of that name, or
+// null when the method isn't defined.
+//
+// The instance points at its inline vtable header at offset 0
+// (installed by `emit_new`). We use that vtable address as the
+// dispatch key into a process-global registry of class metadata
+// populated by the LLVM crate at JIT-finalize time. Each entry
+// pairs a vtable pointer with the matching `method_names` array
+// (the parallel `[N x ptr]` of name strings emitted alongside the
+// vtable).
+//
+// Safety contract: `obj` is expected to be a managed heap pointer
+// whose first word is a vtable pointer. A null receiver or an
+// unregistered vtable returns null — the caller will then indirect-
+// call through null and the resulting fault surfaces the issue
+// cleanly rather than silently dispatching to the wrong method.
+
+/// One entry in the JIT-side class registry.
+struct VtableMethodTable {
+    vtable_addr: u64,
+    names_addr: u64,
+    count: u64,
+}
+
+static VTABLE_METHOD_REGISTRY: RwLock<Vec<VtableMethodTable>> =
+    RwLock::new(Vec::new());
+
+/// Register a class's `(vtable_addr, method_names_addr, count)`
+/// triple for name-keyed dispatch. Called from the LLVM crate once
+/// per class layout right after `LLVMGetFunctionAddress(START)`
+/// triggers MCJIT finalize.
+///
+/// `count` is the vtable length (number of methods); `names_addr`
+/// points at a `[count x *const u8]` array of null-terminated UTF-8
+/// method names parallel to the vtable. Both addresses are stable
+/// for the rest of the process's life (the JIT never relocates
+/// finalised code or globals).
+pub fn register_jit_vtable_methods(
+    vtable_addr: u64,
+    names_addr: u64,
+    count: u64,
+) {
+    if vtable_addr == 0 || names_addr == 0 || count == 0 {
+        return;
+    }
+    let mut guard = VTABLE_METHOD_REGISTRY
+        .write()
+        .expect("VTABLE_METHOD_REGISTRY poisoned");
+    guard.push(VtableMethodTable {
+        vtable_addr,
+        names_addr,
+        count,
+    });
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn __newbcpl_lookup_method(
+    obj: *const u8,
+    name: *const u8,
+) -> *const () {
+    if obj.is_null() || name.is_null() {
+        return core::ptr::null();
+    }
+    // Instance offset 0 holds the inline vtable pointer.
+    let vtable_addr = unsafe { *(obj as *const u64) };
+    if vtable_addr == 0 {
+        return core::ptr::null();
+    }
+    let guard = match VTABLE_METHOD_REGISTRY.read() {
+        Ok(g) => g,
+        Err(_) => return core::ptr::null(),
+    };
+    let entry = match guard.iter().find(|e| e.vtable_addr == vtable_addr) {
+        Some(e) => e,
+        None => return core::ptr::null(),
+    };
+    let names_base = entry.names_addr as *const *const u8;
+    let vtable_base = vtable_addr as *const *const ();
+    for i in 0..entry.count {
+        let entry_name = unsafe { *names_base.add(i as usize) };
+        if entry_name.is_null() {
+            continue;
+        }
+        if cstr_eq(entry_name, name) {
+            return unsafe { *vtable_base.add(i as usize) };
+        }
+    }
+    core::ptr::null()
+}
+
+/// Compare two null-terminated byte strings for equality. Bounded
+/// at 256 bytes per side so a malformed pointer doesn't cause us to
+/// walk off the end of the world.
+unsafe fn cstr_eq(a: *const u8, b: *const u8) -> bool {
+    if a.is_null() || b.is_null() {
+        return false;
+    }
+    for i in 0..256 {
+        let ba = unsafe { *a.add(i) };
+        let bb = unsafe { *b.add(i) };
+        if ba != bb {
+            return false;
+        }
+        if ba == 0 {
+            return true;
+        }
+    }
+    false
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -173,6 +173,23 @@ pub enum Instr {
         args: Vec<Value>,
         hint: TypeHint,
     },
+    /// Type-erased method dispatch. Used when sema / IR can't
+    /// determine the receiver's static class — typically an
+    /// untyped routine parameter `LET draw(shape) BE shape.render()`.
+    /// Codegen lowers this to a `__newbcpl_lookup_method(receiver,
+    /// "<method_name>")` call followed by an indirect call through
+    /// the returned function pointer. The runtime helper walks the
+    /// receiver's `TypeDesc.method_names` to find the matching
+    /// vtable slot. Args are passed verbatim to the resolved
+    /// method, with the receiver prepended as the implicit first
+    /// argument.
+    IndirectMethodCall {
+        dst: Option<ValueId>,
+        receiver: Value,
+        method_name: String,
+        args: Vec<Value>,
+        hint: TypeHint,
+    },
     /// `!ptr` — load the value at an address. Used for both prefix
     /// `!ptr` and the result of subscript-family lowering
     /// (`v!i` / `v%i` / `v.%i`) after the GEP step. `byte_width`

@@ -494,6 +494,40 @@ fn run_program_ir(ir: &IrModule, modules_dir: Option<&Path>) -> Result<i64, Stri
         fopt = f.get_next_function();
     }
 
+    // Register each class's (vtable, method_names) pair with the
+    // runtime's name-keyed dispatch table. The lookup helper
+    // `__newbcpl_lookup_method` reads an instance's inline vtable
+    // pointer (at offset 0) and looks it up here to find the
+    // matching `method_names` array. Without this registration,
+    // IndirectMethodCall sites would all resolve to null and
+    // crash. We walk `all_layouts` rather than the LLVM module
+    // because the layouts already carry the canonical class names
+    // and vtable lengths.
+    for layout in &all_layouts {
+        if layout.vtable.is_empty() {
+            continue;
+        }
+        let vt_sym = format!("{}.vtable", layout.class_name);
+        let names_sym = format!("{}.method_names", layout.class_name);
+        let vt_cname = match CString::new(vt_sym.as_str()) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let names_cname = match CString::new(names_sym.as_str()) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let vt_addr =
+            unsafe { LLVMGetGlobalValueAddress(engine, vt_cname.as_ptr()) };
+        let names_addr =
+            unsafe { LLVMGetGlobalValueAddress(engine, names_cname.as_ptr()) };
+        newbcpl_runtime::gc::register_jit_vtable_methods(
+            vt_addr,
+            names_addr,
+            layout.vtable.len() as u64,
+        );
+    }
+
     // Leak the engine. Drop would call LLVMDisposeExecutionEngine
     // which tears down our memory manager and leaves stale SEH
     // function tables registered with the OS unwinder. The host

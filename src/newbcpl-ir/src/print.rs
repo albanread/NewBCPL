@@ -284,6 +284,35 @@ fn render_instr(i: &Instr) -> String {
                 ),
             }
         }
+        Instr::IndirectMethodCall {
+            dst,
+            receiver,
+            method_name,
+            args,
+            hint,
+        } => {
+            let args_str = args
+                .iter()
+                .map(render_value)
+                .collect::<Vec<_>>()
+                .join(", ");
+            match dst {
+                Some(d) => format!(
+                    "%{} = vcall_dyn {}.{}({}) : {}",
+                    d.0,
+                    render_value(receiver),
+                    method_name,
+                    args_str,
+                    hint.as_str()
+                ),
+                None => format!(
+                    "vcall_dyn {}.{}({})",
+                    render_value(receiver),
+                    method_name,
+                    args_str
+                ),
+            }
+        }
     }
 }
 

@@ -22,7 +22,7 @@ pub use ir::{
 // every IR `Module` (see `Module.layouts`), so downstream consumers
 // like `newbcpl-llvm` can refer to it via the IR crate without
 // adding an extra `newbcpl-sema` dependency just for the type.
-pub use newbcpl_sema::ClassLayout;
+pub use newbcpl_sema::{ClassLayout, VtableEntry};
 pub use lower::lower;
 
 /// Read a .bcl file, run the front-end pipeline (lex → parse →
