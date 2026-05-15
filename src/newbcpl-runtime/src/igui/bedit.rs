@@ -99,8 +99,9 @@ use windows::Win32::UI::Controls::Dialogs::{
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_DELETE, VK_DOWN, VK_END, VK_F7, VK_F8,
-    VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RIGHT, VK_SHIFT, VK_UP,
+    GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_BACK, VK_DELETE, VK_DOWN, VK_END,
+    VK_ESCAPE, VK_F3, VK_F7, VK_F8, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT,
+    VK_SHIFT, VK_TAB, VK_UP,
 };
 
 /// `WM_MOUSEMOVE`'s `wparam` low word; bit 0 = left button held. The
@@ -272,6 +273,58 @@ pub struct Diagnostic {
     pub end_line: usize,
     pub end_column: usize,
     pub message: String,
+}
+
+/// Mode of the find/replace prompt. `Replace` is `Find` plus a
+/// second editable line (the replacement) and the
+/// confirm/skip/all action keys.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FindMode {
+    Find,
+    Replace,
+}
+
+/// Which line of the prompt the user is currently typing into.
+/// `Find` always types into `pattern`; `Replace` toggles between
+/// `pattern` and `replacement` via Tab.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FindField {
+    Pattern,
+    Replacement,
+}
+
+/// Active find / replace UI state. Lives in `ReditState.find` only
+/// while the prompt is open; cleared on Esc / on a successful
+/// `Replace All` / on click outside the prompt area.
+#[derive(Clone, Debug)]
+struct FindState {
+    mode: FindMode,
+    /// The text being searched for. Empty pattern matches nothing.
+    pattern: String,
+    /// The replacement text (Replace mode only). May be empty.
+    replacement: String,
+    /// Which field receives typed characters right now.
+    active_field: FindField,
+    /// Case-insensitive when false, case-sensitive when true.
+    /// Toggled with Ctrl+I from inside the prompt. Defaults
+    /// to insensitive — the common case for "find this word".
+    case_sensitive: bool,
+    /// Status sub-string shown below the prompt — usually a hit
+    /// count or "Not found". Cleared when the user keeps typing.
+    status: String,
+}
+
+impl FindState {
+    fn new(mode: FindMode) -> Self {
+        Self {
+            mode,
+            pattern: String::new(),
+            replacement: String::new(),
+            active_field: FindField::Pattern,
+            case_sensitive: false,
+            status: String::new(),
+        }
+    }
 }
 
 type CheckFn = Box<dyn Fn(&str) -> Vec<Diagnostic> + Send + Sync + 'static>;
@@ -490,6 +543,14 @@ struct ReditState {
     tokens: Vec<Vec<Token>>,
     tokens_dirty: bool,
 
+    /// Active find / replace state. `None` when the editor is in
+    /// the normal typing mode; `Some(_)` while a Ctrl+F or Ctrl+H
+    /// prompt is open. The find pattern is captured into the state
+    /// as the user types; printable characters go into the pattern
+    /// instead of the buffer, Enter advances to the next match,
+    /// Esc returns to normal mode. See `FindState` for details.
+    find: Option<FindState>,
+
     /// Diagnostics from the most recent compile check. Cleared when
     /// the buffer is edited (so stale errors don't lie to the user)
     /// and refreshed on F7 / after-save.
@@ -529,6 +590,7 @@ impl ReditState {
             coalesce: None,
             tokens: Vec::new(),
             tokens_dirty: true,
+            find: None,
             diagnostics: Vec::new(),
             diagnostics_stale: true,
         }
@@ -950,6 +1012,207 @@ impl ReditState {
             let c = d.column.saturating_sub(1).min(line_chars);
             self.set_cursor(r, c, false);
             self.pref_col = self.cursor_col;
+        }
+    }
+
+    // ─── Find / Replace ───────────────────────────────────────────
+    //
+    // The prompt repurposes the status line area below the text
+    // pane. While `self.find` is `Some(_)`, the input-routing layer
+    // captures printable chars + a handful of action keys here and
+    // doesn't pass them to the buffer-editing path. Esc tears down
+    // the prompt and returns the editor to normal mode.
+
+    /// Open the Find prompt. Pre-fills `pattern` with the current
+    /// selection (one-line only) so a "find what I just selected"
+    /// gesture is free.
+    fn open_find(&mut self) {
+        let mut st = FindState::new(FindMode::Find);
+        if let Some((start, end)) = self.selection_range() {
+            if start.0 == end.0 {
+                st.pattern = self.selected_text();
+            }
+        }
+        self.find = Some(st);
+        self.invalidate();
+    }
+
+    /// Open the Replace prompt. Same selection-prefill as `open_find`.
+    fn open_replace(&mut self) {
+        let mut st = FindState::new(FindMode::Replace);
+        if let Some((start, end)) = self.selection_range() {
+            if start.0 == end.0 {
+                st.pattern = self.selected_text();
+            }
+        }
+        self.find = Some(st);
+        self.invalidate();
+    }
+
+    /// Tear down the prompt and return to normal editing. Cursor /
+    /// selection stay wherever the last match left them.
+    fn close_find(&mut self) {
+        self.find = None;
+        self.invalidate();
+    }
+
+    /// Search forward from the offset just after the current cursor.
+    /// Wraps to the beginning of the buffer when no later match
+    /// exists; reports "Not found" only when the pattern is absent
+    /// from the entire buffer. Sets the selection to span the
+    /// match.
+    fn find_next(&mut self) {
+        let Some(state) = self.find.as_ref() else { return };
+        if state.pattern.is_empty() {
+            return;
+        }
+        let pattern = state.pattern.clone();
+        let case_sensitive = state.case_sensitive;
+        let text = self.buffer.to_utf8();
+        let cursor_offset = self.buffer.line_col_to_offset(
+            self.cursor_row,
+            self.cursor_col,
+        );
+        // Search starting one byte past the cursor so repeated
+        // F3 advances past the previous hit (without it, the
+        // search keeps returning the same start).
+        let start_byte = char_offset_to_byte(&text, cursor_offset).min(text.len());
+        let start_byte = start_byte.saturating_add(1).min(text.len());
+        let outcome = find_substring(&text, &pattern, start_byte, case_sensitive)
+            .or_else(|| find_substring(&text, &pattern, 0, case_sensitive));
+        match outcome {
+            Some(hit_byte) => self.apply_match(&text, hit_byte, &pattern),
+            None => {
+                if let Some(st) = self.find.as_mut() {
+                    st.status = "Not found".to_string();
+                }
+            }
+        }
+        self.invalidate();
+    }
+
+    /// Search backward from the cursor. Same wrap semantics as
+    /// `find_next`.
+    fn find_prev(&mut self) {
+        let Some(state) = self.find.as_ref() else { return };
+        if state.pattern.is_empty() {
+            return;
+        }
+        let pattern = state.pattern.clone();
+        let case_sensitive = state.case_sensitive;
+        let text = self.buffer.to_utf8();
+        let cursor_offset = self.buffer.line_col_to_offset(
+            self.cursor_row,
+            self.cursor_col,
+        );
+        let end_byte = char_offset_to_byte(&text, cursor_offset).min(text.len());
+        let outcome = rfind_substring(&text, &pattern, end_byte, case_sensitive)
+            .or_else(|| rfind_substring(&text, &pattern, text.len(), case_sensitive));
+        match outcome {
+            Some(hit_byte) => self.apply_match(&text, hit_byte, &pattern),
+            None => {
+                if let Some(st) = self.find.as_mut() {
+                    st.status = "Not found".to_string();
+                }
+            }
+        }
+        self.invalidate();
+    }
+
+    /// In Replace mode: replace the current selection with the
+    /// replacement string IF the selection matches the pattern,
+    /// then advance to the next match. If the selection doesn't
+    /// match the pattern, just find next.
+    fn replace_current(&mut self) {
+        let Some(state) = self.find.as_ref() else { return };
+        if state.pattern.is_empty() {
+            return;
+        }
+        let replacement = state.replacement.clone();
+        if self.selection_range().is_some() {
+            let selected = self.selected_text();
+            let matches = if state.case_sensitive {
+                selected == state.pattern
+            } else {
+                selected.eq_ignore_ascii_case(&state.pattern)
+            };
+            if matches {
+                // `delete_selection_to_undo` + `insert_str` is the
+                // same shape as paste-over-selection: two undo
+                // entries (Deleted then Inserted) the user can
+                // step through individually with Ctrl+Z.
+                self.delete_selection_to_undo();
+                self.insert_str(&replacement);
+            }
+        }
+        self.find_next();
+    }
+
+    /// In Replace mode: replace every match in the buffer with the
+    /// replacement string. Searches from the start of the buffer
+    /// regardless of cursor position. Reports the hit count.
+    fn replace_all(&mut self) {
+        let Some(state) = self.find.as_ref() else { return };
+        if state.pattern.is_empty() {
+            return;
+        }
+        let pattern = state.pattern.clone();
+        let replacement = state.replacement.clone();
+        let case_sensitive = state.case_sensitive;
+
+        let mut count = 0usize;
+        let mut start_byte = 0usize;
+        loop {
+            let text = self.buffer.to_utf8();
+            let hit_byte = match find_substring(&text, &pattern, start_byte, case_sensitive) {
+                Some(h) => h,
+                None => break,
+            };
+            let hit_end = hit_byte + pattern.len();
+            let span_start = byte_to_pos(&text, hit_byte);
+            let span_end = byte_to_pos(&text, hit_end);
+            // Select the match, then delete+insert through the
+            // editor's normal mutation primitives so undo / coalesce
+            // / dirty tracking all behave correctly.
+            self.anchor_row = span_start.0;
+            self.anchor_col = span_start.1;
+            self.cursor_row = span_end.0;
+            self.cursor_col = span_end.1;
+            self.delete_selection_to_undo();
+            self.insert_str(&replacement);
+            count += 1;
+            // Re-tokenize position: re-emit `text` after the edit
+            // to compute the next byte offset. We avoid that by
+            // computing `start_byte` from the new cursor position
+            // — the rope already knows where the cursor sits.
+            let cursor_offset = self.buffer.line_col_to_offset(
+                self.cursor_row,
+                self.cursor_col,
+            );
+            let post = self.buffer.to_utf8();
+            start_byte = char_offset_to_byte(&post, cursor_offset);
+        }
+        if let Some(st) = self.find.as_mut() {
+            st.status = format!("Replaced {count}");
+        }
+        self.invalidate();
+    }
+
+    /// Helper: select `[hit_byte, hit_byte + pattern.len())` and
+    /// scroll the cursor visible. Shared by `find_next` and
+    /// `find_prev`.
+    fn apply_match(&mut self, text: &str, hit_byte: usize, pattern: &str) {
+        let hit_end = hit_byte + pattern.len();
+        let (sr, sc) = byte_to_pos(text, hit_byte);
+        let (er, ec) = byte_to_pos(text, hit_end);
+        self.cursor_row = er;
+        self.cursor_col = ec;
+        self.anchor_row = sr;
+        self.anchor_col = sc;
+        self.pref_col = self.cursor_col;
+        self.ensure_cursor_visible();
+        if let Some(st) = self.find.as_mut() {
+            st.status.clear();
         }
     }
 
@@ -1404,16 +1667,59 @@ impl ReditState {
             n => format!("{{{n}}}"),
         };
 
-        let status = format!(
-            " {dirty} {path}   Ln {row:4}, Col {col:2}   {nlines} lines   {braces}   {diag}",
-            dirty = dirty_mark,
-            path = path_str,
-            row = self.cursor_row + 1,
-            col = self.cursor_col + 1,
-            nlines = self.line_count(),
-            braces = braces_segment,
-            diag = diag_segment,
-        );
+        // While a Find / Replace prompt is open, the status area
+        // shows the prompt content instead of the usual stats.
+        // Format:
+        //
+        //   Find: <pattern>_                       [Enter] next  [Esc]
+        //
+        // or for Replace mode:
+        //
+        //   Find:    <pattern>_                    [Enter] replace
+        //   Replace: <replacement>                 [Ctrl+Enter] all
+        //
+        // The trailing `_` marks which field has the active caret.
+        let status = match self.find.as_ref() {
+            Some(fs) => {
+                let p_caret = if fs.active_field == FindField::Pattern { "_" } else { " " };
+                match fs.mode {
+                    FindMode::Find => {
+                        let hint = if fs.status.is_empty() {
+                            "  [Enter] next  [Shift+Enter] prev  [Esc] close".to_string()
+                        } else {
+                            format!("  {} ", fs.status)
+                        };
+                        format!("  Find:  {}{}{}", fs.pattern, p_caret, hint)
+                    }
+                    FindMode::Replace => {
+                        let r_caret = if fs.active_field == FindField::Replacement {
+                            "_"
+                        } else {
+                            " "
+                        };
+                        let hint = if fs.status.is_empty() {
+                            "  [Tab] switch  [Enter] replace+next  [Ctrl+Enter] all  [Esc] close".to_string()
+                        } else {
+                            format!("  {} ", fs.status)
+                        };
+                        format!(
+                            "  Find: {}{}   Replace: {}{}{}",
+                            fs.pattern, p_caret, fs.replacement, r_caret, hint,
+                        )
+                    }
+                }
+            }
+            None => format!(
+                " {dirty} {path}   Ln {row:4}, Col {col:2}   {nlines} lines   {braces}   {diag}",
+                dirty = dirty_mark,
+                path = path_str,
+                row = self.cursor_row + 1,
+                col = self.cursor_col + 1,
+                nlines = self.line_count(),
+                braces = braces_segment,
+                diag = diag_segment,
+            ),
+        };
         if let (Some(brush), Ok(layout)) = (
             status_fg.as_ref(),
             build_layout(&format, &status, w_dip, status_h),
@@ -2247,9 +2553,86 @@ fn shift_down() -> bool {
     (unsafe { GetKeyState(VK_SHIFT.0 as i32) } as i16) < 0
 }
 
+fn ctrl_down() -> bool {
+    use windows::Win32::UI::Input::KeyboardAndMouse::VK_CONTROL;
+    (unsafe { GetKeyState(VK_CONTROL.0 as i32) } as i16) < 0
+}
+
 fn handle_key(state: &mut ReditState, vk: u32) {
     let vk16 = vk as u16;
     let extend = shift_down();
+
+    // Find / Replace prompt takes priority: while it's open, the
+    // status-line input area captures Esc / Enter / Tab / arrows /
+    // Backspace and the regular editor doesn't see them. F3 always
+    // means "find next" — both inside the prompt and outside, so
+    // a closed prompt can still be re-fired with one key.
+    if state.find.is_some() {
+        if vk16 == VK_ESCAPE.0 {
+            state.close_find();
+            return;
+        }
+        if vk16 == VK_RETURN.0 {
+            // Find mode: Enter advances. Replace mode: Enter replaces
+            // the current selection (if it matches) and then
+            // advances to the next match. Shift+Enter reverses the
+            // direction in both modes. Ctrl+Enter in Replace mode
+            // replaces ALL remaining matches in the buffer.
+            let mode = state.find.as_ref().map(|s| s.mode);
+            if mode == Some(FindMode::Replace) {
+                if ctrl_down() {
+                    state.replace_all();
+                } else if shift_down() {
+                    state.find_prev();
+                } else {
+                    state.replace_current();
+                }
+            } else if shift_down() {
+                state.find_prev();
+            } else {
+                state.find_next();
+            }
+            return;
+        }
+        if vk16 == VK_TAB.0 {
+            if let Some(st) = state.find.as_mut() {
+                st.active_field = match st.active_field {
+                    FindField::Pattern => FindField::Replacement,
+                    FindField::Replacement => FindField::Pattern,
+                };
+            }
+            state.invalidate();
+            return;
+        }
+        if vk16 == VK_BACK.0 {
+            if let Some(st) = state.find.as_mut() {
+                match st.active_field {
+                    FindField::Pattern => {
+                        st.pattern.pop();
+                    }
+                    FindField::Replacement => {
+                        st.replacement.pop();
+                    }
+                }
+                st.status.clear();
+            }
+            state.invalidate();
+            return;
+        }
+        if vk16 == VK_F3.0 {
+            if shift_down() {
+                state.find_prev();
+            } else {
+                state.find_next();
+            }
+            return;
+        }
+        // Other keys fall through so the underlying editor still
+        // sees them (e.g. arrow keys move the cursor in the buffer
+        // while the prompt is open — useful for inspecting matches
+        // before deciding what to do).
+    }
+
     if vk16 == VK_LEFT.0 {
         state.move_left(extend);
     } else if vk16 == VK_RIGHT.0 {
@@ -2273,6 +2656,17 @@ fn handle_key(state: &mut ReditState, vk: u32) {
             state.cut();
         } else {
             state.delete_forward();
+        }
+    } else if vk16 == VK_F3.0 {
+        // F3 — repeat last find (find_next / find_prev). Re-uses the
+        // existing find_state pattern; opens an empty prompt if none.
+        if state.find.is_none() {
+            state.open_find();
+        }
+        if shift_down() {
+            state.find_prev();
+        } else {
+            state.find_next();
         }
     } else if vk16 == VK_F7.0 {
         // F7 — run compile check on the current buffer.
@@ -2298,6 +2692,21 @@ fn handle_char(state: &mut ReditState, c: char) {
             // Ctrl+C — copy.
             state.copy();
             return;
+        }
+        0x06 => {
+            // Ctrl+F — open Find prompt.
+            state.open_find();
+            return;
+        }
+        0x08 => {
+            // 0x08 is BOTH the Backspace WM_CHAR code AND Ctrl+H.
+            // Disambiguate by querying modifier state: Ctrl held =
+            // Ctrl+H = open Replace; otherwise it's the Backspace
+            // character (handled by the existing path below).
+            if ctrl_down() {
+                state.open_replace();
+                return;
+            }
         }
         0x0F => {
             // Ctrl+O — open.
@@ -2338,6 +2747,29 @@ fn handle_char(state: &mut ReditState, c: char) {
             return;
         }
         _ => {}
+    }
+
+    // Find / Replace prompt: while open, printable characters extend
+    // the active field (pattern / replacement) rather than the
+    // buffer. The Alt modifier on a letter is the Replace-mode
+    // action escape: Alt+R replaces & finds next, Alt+A replaces
+    // all. (Alt isn't strictly necessary in the Pattern field —
+    // bare letters extend the pattern there — but using Alt
+    // uniformly avoids "is this a typed char or an action?" mode
+    // confusion when the replacement field is active and the user
+    // wants to take an action without first Tabbing back.)
+    if state.find.is_some() {
+        if (c as u32) >= 0x20 && c != '\u{007F}' {
+            if let Some(st) = state.find.as_mut() {
+                match st.active_field {
+                    FindField::Pattern => st.pattern.push(c),
+                    FindField::Replacement => st.replacement.push(c),
+                }
+                st.status.clear();
+            }
+            state.invalidate();
+            return;
+        }
     }
 
     if c == '\r' {
@@ -2521,6 +2953,89 @@ fn char_to_byte(s: &str, char_idx: usize) -> usize {
         .nth(char_idx)
         .map(|(b, _)| b)
         .unwrap_or_else(|| s.len())
+}
+
+// ─── Find / Replace search helpers ──────────────────────────────────
+//
+// Plain substring matching over the rope's UTF-8 snapshot. The rope
+// is rebuilt to a `String` on each search; for editor-size buffers
+// this is cheap (the rope's `to_utf8` is a single tree walk into a
+// pre-sized Vec) and lets us reuse Rust's tuned `str::find`.
+
+/// Forward substring search starting at byte offset `from_byte`.
+/// Returns the byte offset of the first hit (≥ from_byte) or `None`.
+fn find_substring(haystack: &str, needle: &str, from_byte: usize, case_sensitive: bool) -> Option<usize> {
+    if needle.is_empty() {
+        return None;
+    }
+    let start = from_byte.min(haystack.len());
+    let slice = &haystack[start..];
+    if case_sensitive {
+        slice.find(needle).map(|p| p + start)
+    } else {
+        // Case-insensitive: lowercase both sides and search. The
+        // returned byte offset is into the lowered slice and the
+        // lengths match for ASCII; for multi-byte code points the
+        // simple mapping is approximate (a non-ASCII pattern may
+        // shift bytes through `to_lowercase`). Editor patterns are
+        // overwhelmingly ASCII so this is the right trade-off.
+        let needle_lo = needle.to_lowercase();
+        let slice_lo = slice.to_lowercase();
+        slice_lo.find(&needle_lo).map(|p| p + start)
+    }
+}
+
+/// Reverse substring search ending strictly before byte offset
+/// `end_byte`. Returns the byte offset of the last hit < end_byte
+/// or `None`.
+fn rfind_substring(haystack: &str, needle: &str, end_byte: usize, case_sensitive: bool) -> Option<usize> {
+    if needle.is_empty() {
+        return None;
+    }
+    let end = end_byte.min(haystack.len());
+    let slice = &haystack[..end];
+    if case_sensitive {
+        slice.rfind(needle)
+    } else {
+        let needle_lo = needle.to_lowercase();
+        let slice_lo = slice.to_lowercase();
+        slice_lo.rfind(&needle_lo)
+    }
+}
+
+/// Convert a code-point offset (the rope's native coordinate) into
+/// a byte offset (Rust's `&str` coordinate). Iterates `chars()`
+/// stopping at the nth one — O(offset) in the worst case but for
+/// editor cursor positions that's tens of microseconds at most.
+fn char_offset_to_byte(text: &str, char_offset: usize) -> usize {
+    text.char_indices()
+        .nth(char_offset)
+        .map(|(b, _)| b)
+        .unwrap_or_else(|| text.len())
+}
+
+/// Convert a byte offset into a `(row, col)` `Pos` over a UTF-8
+/// snapshot. Newlines bump `row` and reset `col`; everything else
+/// counts as one code-point column. Matches the rope's
+/// `offset_to_line_col` semantics when applied to the same snapshot.
+fn byte_to_pos(text: &str, byte_offset: usize) -> Pos {
+    let target = byte_offset.min(text.len());
+    let mut row = 0usize;
+    let mut col = 0usize;
+    let mut b = 0usize;
+    for c in text.chars() {
+        if b >= target {
+            break;
+        }
+        if c == '\n' {
+            row += 1;
+            col = 0;
+        } else {
+            col += 1;
+        }
+        b += c.len_utf8();
+    }
+    (row, col)
 }
 
 /// Expand `\t` characters in `line` to spaces, padding to the next
