@@ -126,6 +126,15 @@ with an expected warning substring.
   loops (must respect frame).
 - **RETURN / RESULTIS / FINISH**: from mid-VALOF, from inside loop,
   early termination.
+- **Mutual recursion**: classical `LET f(...) = e AND g(...) = e`
+  chain (parser disambiguates `AND <ident> (` from the
+  precedence-3 logical operator); also the consecutive-LETs form
+  that relies on sema's preregistration pass.
+- **BRK**: signal-safe state dump — banner with routine + line,
+  heap summary, AMD64 register state via `RtlCaptureContext`,
+  stack walk via `RtlVirtualUnwind` with frames resolved to BCPL
+  routine names. Program continues after BRK; verify by output
+  that only appears after the statement runs.
 
 ### Tier 5 — Classes & methods — *where bugs cluster*
 
@@ -152,6 +161,21 @@ enumeration goes here.
   — vtable B.foo slot must contain A_foo's address.
 - **Field offset stability under inheritance**: B's fields land after
   A's; offsets in B's methods must read through the inherited prefix.
+- **FINAL enforcement**: subclass methods that override a FINAL
+  ancestor are rejected by sema; the diagnostic names both the
+  method and the defining class. Walk covers the full inheritance
+  chain (Base FINAL → Mid → Sub override is also rejected).
+- **PRIVATE / PROTECTED enforcement**: visibility checked at every
+  `obj.field` and `obj.method()` site against the access-site's
+  enclosing class.
+- **Parameter type annotations**: `LET f(p AS Class) = ...`
+  attaches class identity to the parameter binding so member access
+  through `p` resolves statically; visibility checks fire as if `p`
+  were a class-typed local.
+- **Indirect method dispatch**: un-annotated receivers resolve
+  through `__newbcpl_lookup_method(receiver, name)` at runtime —
+  the same `helper(obj)` should route to different classes' methods
+  based on what gets passed in (polymorphic shape).
 
 ### Tier 6 — GC & runtime
 
@@ -281,21 +305,34 @@ Given finite time, the order:
 
 ## What's landed so far
 
-- 88 parser tests, 73 sema tests, 55 IR tests, 24 LLVM emit tests,
-  11 GC / runtime tests, plus 5 small integration tests across the
-  driver / loader / tests crates. **287 unit tests total**, all
-  green.
+- The eight-tier matrix has **316 probes** across 17 integration-
+  test binaries. `cargo test -p newbcpl-tests --tests` runs them all
+  in a few seconds; every spec row in
+  [reference_audit.md](reference_audit.md) names the probe(s) that
+  pin it. Tier 5 has grown most this cycle (class-shape, FINAL,
+  visibility, param annotations, indirect dispatch — bug-cluster
+  tier as predicted).
 - The `test-folder` harness:
-  `newbcpl-driver test-folder reference/tests/bcl_tests [start=N stop=M] [grep=text] [report-path]`.
-  Subprocess-per-file; classifies failures by phase
-  (parse / sema / IR / LLVM / run / crash); captures stdout for
-  passes and stderr for failures into a text report.
-- Document trail: this matrix, [pair_and_multilane_types.md](pair_and_multilane_types.md),
+  `newbcpl-driver test-folder reference/tests/bcl_tests [start=N stop=M] [grep=text] [skip=text] [report-path]`.
+  Subprocess-per-file with a per-test timeout; classifies failures
+  by phase (parse / sema / IR / LLVM / run / crash); captures
+  stdout for passes and stderr for failures into a text report.
+  `skip=` (repeatable) quarantines out-of-scope tests — `SDL2_` is
+  the standard exclusion for the Direct2D-only dialect.
+- The corpus journal in
+  [corpus_sweep.md](corpus_sweep.md) tracks each iteration's pass
+  rate; eight sweeps brought 451 → 539 (59.3 % → 70.9 %
+  effective).
+- Document trail: this matrix, [reference_audit.md](reference_audit.md),
+  [corpus_sweep.md](corpus_sweep.md), [user_guide.md](user_guide.md),
+  [pair_and_multilane_types.md](pair_and_multilane_types.md),
   [jit_typedesc_lifetime.md](jit_typedesc_lifetime.md),
   [manifesto.md](manifesto.md).
 
 The matrix-generator binary is **not** built yet — this document is
-the spec for it.
+the spec for it. The matrix has been growing well organically;
+generation is an optimisation for when the manual approach gets
+expensive.
 
 ## Maintenance principles
 

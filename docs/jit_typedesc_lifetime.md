@@ -143,3 +143,25 @@ needs `TypeDesc.size`, which a runtime-side copy provides directly.
 - `module_has_no_live_blocks` exists and is unit-tested in `gc.rs`
   (Fix A's enabling primitive is already there).
 - Neither fix is implemented yet.
+
+## Related: the JIT vtable registry
+
+A separate mechanism, but with overlapping lifetime concerns:
+`__newbcpl_lookup_method` (the runtime helper that resolves
+un-annotated `obj.method()` calls) keys off the instance's inline
+vtable pointer — `instance[0]` is the address of
+`@<Class>.vtable`, a global emitted by the LLVM crate. At
+JIT-finalize, the crate registers each class's
+`(vtable_addr, method_names_addr, count)` triple in a
+process-global `VTABLE_METHOD_REGISTRY` so the helper can find the
+parallel `@<Class>.method_names` array.
+
+This registry has the same JIT-drop hazard as the TypeDesc story:
+if we ever drop and rebuild the JIT engine, vtable globals get
+new addresses but the registry still points at the old ones. The
+fix shape is identical — either retain the engine module (Fix A
+analogue) or have the LLVM crate clear and re-register on each
+build (Fix B analogue). Today we leak the engine, so the registry
+entries stay valid for the lifetime of the process. The note here
+is to keep both parallel sub-systems flagged when retirement
+support lands.

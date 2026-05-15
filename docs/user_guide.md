@@ -223,10 +223,32 @@ LET even(n) = n = 0 -> TRUE, odd(n - 1)
 AND odd(n)  = n = 0 -> FALSE, even(n - 1)
 ```
 
+The parser disambiguates the declaration-tail `AND` from the
+expression-level logical `AND` by looking ahead for the
+`AND <identifier> (` shape — the form a mutual binding must use.
+Plain expressions like `a AND b` or `a AND b + c` still parse as
+logical AND. A consecutive pair of top-level `LET`s without the
+`AND` connector also works as mutual recursion — forward references
+resolve through sema's preregistration pass regardless of source
+order.
+
 The compiler accepts `LET name(...) = expr` and `LET name(...) BE stmt`
 as a single declaration form. It also recognises the longer keyword
 forms `FUNCTION name(...) = expr` and `ROUTINE name(...) BE stmt`; they
 mean the same thing and are interchangeable.
+
+Parameters may carry an optional `AS Type` annotation:
+
+```bcpl
+LET print_distance(p AS Point) BE WRITEN(p.distance_from_origin())
+```
+
+The annotation gives sema the parameter's class identity inside the
+body. Without it, `p` is just a word and `p.method()` falls back to
+runtime name-keyed dispatch (which works, but loses compile-time
+visibility checks and direct-dispatch routing). Annotations apply
+to function parameters, routine parameters, and class-method
+parameters — anywhere a parameter list appears.
 
 ---
 
@@ -463,6 +485,32 @@ A label is `name:` standing on its own as a statement. `GOTO` is the
 escape valve for situations that resist the structured forms; in
 practice you will rarely need it.
 
+`BRK` is more useful than a classical BCPL "debugger breakpoint" —
+the runtime synthesises a structured snapshot of the program's
+state and writes it to stderr, then returns and execution continues.
+A typical dump:
+
+```
+=== BRK in routine `divide` at line 17 ===
+heap:    live=14336 bytes  blocks=42  peak=14336 bytes
+context: rip=00007FF6C807EC7F  rsp=000000A4F1FFEBE0  rbp=000000A4F1FFEC00
+         rax=000000000000002A rbx=0000000000000000 rcx=00007FF6C8023C70
+         ...
+stack:
+  #0  rip=0000024C73170041  in helper
+  #1  rip=0000024C7317006C  in START
+  #2  rip=00007FF6C801703E
+  ...
+=== END BRK ===
+```
+
+The handler uses direct `WriteFile` to `STD_ERROR_HANDLE` with
+fixed stack buffers — no heap allocation, no `format!`, robust
+against a corrupted GC heap — so it's safe to drop a `BRK` into a
+program that's misbehaving and read the snapshot. Stack frames that
+fall inside JIT-d code resolve to their BCPL routine names; frames
+in host, runtime, or OS code stay as raw addresses.
+
 ### 3.5 Compile-Time and Static Storage
 
 ```bcpl
@@ -600,10 +648,25 @@ CLASS Coloured EXTENDS Point $(
 $)
 ```
 
-A `VIRTUAL` method occupies a vtable slot; subclasses may override.
-A `FINAL` method may not be overridden. Visibility headers `PUBLIC:`,
-`PRIVATE:`, and `PROTECTED:` switch the access level of subsequent
-members until the next header; the default is `PUBLIC`.
+A `VIRTUAL` method occupies a vtable slot; subclasses may override
+it freely. A `FINAL` method **may not be overridden** — sema rejects
+the offending subclass at compile time with a diagnostic naming
+both the method and the defining class. The walk covers the full
+inheritance chain, so `Base.m` being FINAL forbids `Sub.m`,
+`SubSub.m`, etc. Visibility headers `PUBLIC:`, `PRIVATE:`, and
+`PROTECTED:` switch the access level of subsequent members until
+the next header; the default is `PUBLIC`. PRIVATE / PROTECTED are
+sema-enforced at every member-access site — the access site's
+enclosing class is checked against the member's defining class, and
+`PROTECTED` extends access to descendant classes.
+
+A method dispatched through `obj.method()` where `obj`'s class
+isn't known statically (an un-annotated parameter, or a value
+flowing through a generic container) resolves through a runtime
+name-keyed lookup. Each class emits a `(vtable_addr,
+method_names)` pair the runtime indexes by the instance's inline
+vtable pointer — typed and untyped dispatch produce the same
+behavioural result, the typed form just resolves at compile time.
 
 ### 4.2 Deterministic Cleanup with `USING`
 
