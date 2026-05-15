@@ -616,5 +616,61 @@ pub fn builtin_addresses() -> Vec<(&'static str, usize)> {
             "bcpl_wingui_poll_event",
             bcpl_wingui_poll_event as *const () as usize,
         ),
+        // ─── Procedural shim (FB-compat surface) ─────────────────
+        //
+        // Same function pointers as the class-form `bcpl_wingui_*`
+        // entries above, exposed under SCREAMING_SNAKE_CASE names
+        // that mirror NewFB's compound verbs (`WINDOW DEFINE` →
+        // `WIN_DEFINE` etc.). Registering as runtime builtins
+        // bypasses the loader's module-prefix pass; programs call
+        // `WIN_DEFINE(...)` from any source file without a `GET` or
+        // class scaffolding.
+        //
+        // Mapping table (FB compound verb ↔ BCPL procedure):
+        //
+        //   WINDOW DEFINE id, title       →  WIN_DEFINE(id, title)
+        //   WINDOW BUTTON id, label       →  WIN_BUTTON(id, label)
+        //   WINDOW LABEL  id, text        →  WIN_LABEL (id, text)
+        //   WINDOW RUN                    →  WIN_RUN()
+        //   WINDOW CLOSE                  →  WIN_CLOSE()
+        //   (close-on-event registration) →  WIN_CLOSE_ON(btn_id)
+        //   (post-run event drain)        →  WIN_POLL() -> btn_id
+        //   (DLL probes)                  →  WIN_VERSION() / WIN_AVAILABLE()
+        (
+            "WIN_DEFINE",
+            bcpl_wingui_window_define as *const () as usize,
+        ),
+        (
+            "WIN_BUTTON",
+            bcpl_wingui_window_button as *const () as usize,
+        ),
+        (
+            "WIN_LABEL",
+            bcpl_wingui_window_label as *const () as usize,
+        ),
+        (
+            "WIN_RUN",
+            bcpl_wingui_window_run as *const () as usize,
+        ),
+        (
+            "WIN_CLOSE",
+            bcpl_wingui_window_close as *const () as usize,
+        ),
+        (
+            "WIN_CLOSE_ON",
+            bcpl_wingui_close_on as *const () as usize,
+        ),
+        (
+            "WIN_POLL",
+            bcpl_wingui_poll_event as *const () as usize,
+        ),
+        (
+            "WIN_VERSION",
+            bcpl_wingui_version_packed as *const () as usize,
+        ),
+        (
+            "WIN_AVAILABLE",
+            bcpl_wingui_is_available as *const () as usize,
+        ),
     ]
 }

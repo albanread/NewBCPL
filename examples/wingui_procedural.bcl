@@ -1,0 +1,54 @@
+// wingui_procedural.bcl — FB-style procedural verbs.
+//
+// W3 deliverable. Same window as `wingui_hello.bcl` but written
+// using the SCREAMING_SNAKE_CASE procedural shim instead of the
+// class form. A near-verbatim translation from the FB demos:
+//
+//   FB  (.bas):                          BCPL (.bcl):
+//     WINDOW DEFINE 1, "Counter"           WIN_DEFINE(1, "Counter")
+//     WINDOW LABEL  11, "..."              WIN_LABEL (11, "...")
+//     WINDOW BUTTON 20, "Quit"             WIN_BUTTON(20, "Quit")
+//     ' (close-on-click — implicit in FB)  WIN_CLOSE_ON(20)
+//     WINDOW RUN                           WIN_RUN()
+//     ' WINDOW_POLL_EVENT$ loop            WIN_POLL() loop
+//
+// No class allocation, no method dispatch — direct procedure
+// calls into the runtime's builtin table. The verbs route to
+// the same Rust functions as the class methods do; both forms
+// share state via the `REGISTRY` / `EVENT_QUEUE` / `CLOSE_TRIGGERS`
+// globals inside `bcpl-wingui`.
+//
+// Run:
+//   newbcpl-driver run examples/wingui_procedural.bcl
+
+LET START() BE $(
+    UNLESS WIN_AVAILABLE() = 1 DO $(
+        WRITES("wingui DLL not available; aborting*N")
+        FINISH
+    $)
+
+    WIN_DEFINE(1, "Procedural Demo")
+    WIN_LABEL (11, "Press Quit to close the window.")
+    WIN_BUTTON(20, "Quit")
+    WIN_CLOSE_ON(20)
+
+    WRITES("Opening window — click Quit or close via title bar.*N")
+    LET code = WIN_RUN()
+    WRITES("window exited with code ")
+    WRITEN(code)
+    NEWLINE()
+
+    // Drain the event queue and report which button (if any)
+    // closed the window. The polling loop is the BCPL-side
+    // equivalent of the FB `WINDOW_POLL_EVENT$` walk.
+    LET seen_quit = 0
+    LET ev = WIN_POLL()
+    WHILE ev ~= 0 DO $(
+        IF ev = 20 THEN seen_quit := 1
+        ev := WIN_POLL()
+    $)
+    IF seen_quit = 1 THEN
+        WRITES("Quit button clicked.*N")
+    ELSE
+        WRITES("Window closed via title-bar.*N")
+$)
