@@ -55,7 +55,8 @@ mod tools_menu;
 pub(crate) mod window;
 
 pub use bedit::{
-    install_checker, set_startup_file as bedit_set_startup_file,
+    install_checker, run_check_in_singleton as bedit_run_check,
+    set_startup_file as bedit_set_startup_file,
     snapshot_buffer as bedit_snapshot_buffer, Diagnostic,
 };
 pub use log_view::append as log_append;

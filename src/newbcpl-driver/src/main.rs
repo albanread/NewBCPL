@@ -501,6 +501,13 @@ fn gui_run_program(program_path: &Path, modules_dir: &Path) {
             igui::log_append(&format!("[gui-worker] error: {e}"));
         }
     }
+
+    // Refresh the editor's inline diagnostics from the same source.
+    // A successful run with sema-clean code clears the squiggles;
+    // a failed run lights them up, even if the user hadn't pressed
+    // F7. The check runs over the buffer text bedit currently has,
+    // so the error positions line up with what's on screen.
+    igui::bedit_run_check();
 }
 
 /// One file's outcome from `test-folder`. The phase records *how far*

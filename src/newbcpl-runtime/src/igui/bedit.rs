@@ -146,6 +146,13 @@ const WM_BEDIT_LOAD_FILE: u32 =
 const WM_BEDIT_SNAPSHOT_BUFFER: u32 =
     windows::Win32::UI::WindowsAndMessaging::WM_USER + 2;
 
+/// Marshalled "run the installed checker now and update the
+/// inline diagnostics" message. Used by the driver after a Ctrl+R
+/// run finishes so any sema / parse error the user just saw in
+/// the log also surfaces as a squiggle in the editor.
+const WM_BEDIT_RUN_CHECK: u32 =
+    windows::Win32::UI::WindowsAndMessaging::WM_USER + 3;
+
 /// A path consumed by `bedit::open` on the first window-creation,
 /// causing the new bedit to immediately load it. The driver calls
 /// `set_startup_file` before `igui::run` so the user's launch-time
@@ -184,6 +191,31 @@ pub fn load_file_into_singleton(path: PathBuf) {
         );
     }
     // The WndProc handler takes ownership of the Box.
+}
+
+/// Ask the singleton bedit to re-run the installed checker now.
+/// The driver calls this after each Ctrl+R / Program ▸ Run so any
+/// sema / parse error the user just saw in the log also lights up
+/// in the editor as a squiggle + gutter `!`. No-op when no bedit
+/// is open or no checker is installed. Safe from any thread —
+/// marshalled onto the UI thread via `SendMessageW`.
+pub fn run_check_in_singleton() {
+    let raw = match BEDIT_HWND.lock().expect("BEDIT_HWND poisoned").as_ref() {
+        Some(r) => *r,
+        None => return,
+    };
+    let hwnd = HWND(raw as *mut _);
+    if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+        return;
+    }
+    unsafe {
+        SendMessageW(
+            hwnd,
+            WM_BEDIT_RUN_CHECK,
+            Some(WPARAM(0)),
+            Some(LPARAM(0)),
+        );
+    }
 }
 
 /// Snapshot the singleton bedit's text buffer as one `String` with
@@ -1073,12 +1105,18 @@ impl ReditState {
         let num_brush = solid_brush(&target, 0.95, 0.70, 0.30, 1.0);
         let str_brush = solid_brush(&target, 0.65, 0.85, 0.55, 1.0);
         let cmt_brush = solid_brush(&target, 0.50, 0.55, 0.60, 1.0);
-        // Error gutter mark — bright red. Greyed when stale (the
-        // buffer has been edited since the last check).
+        // Error indicator brush. Used for both the gutter `!`
+        // glyph and the inline squiggle. Two states:
+        //   * bright red  — diagnostics are live (just checked)
+        //   * amber       — diagnostics are stale (buffer was
+        //                   edited since the last check)
+        // Amber rather than dim red so the difference between
+        // "this is still wrong" and "this might already be fixed"
+        // is obvious without thinking.
         let err_brush = if self.diagnostics_stale {
-            solid_brush(&target, 0.55, 0.30, 0.30, 1.0)
+            solid_brush(&target, 1.00, 0.70, 0.20, 1.0)
         } else {
-            solid_brush(&target, 0.95, 0.30, 0.25, 1.0)
+            solid_brush(&target, 1.00, 0.30, 0.25, 1.0)
         };
 
         // Refresh tokens lazily, before any line is laid out.
@@ -1182,23 +1220,30 @@ impl ReditState {
                 }
             }
 
-            // Error mark — a small red bar painted at the right edge
-            // of the gutter on lines with diagnostics. Position it
-            // inside the gutter so it doesn't overlap with text.
+            // Error mark — a bright `!` glyph drawn in the rightmost
+            // gutter cell for any line with diagnostics. A character
+            // is far more legible at a glance than a thin coloured
+            // bar — the user picks it out without leaning in.
+            // Colour:
+            //   * bright red    — diagnostics are live (just checked)
+            //   * dim amber/red — diagnostics are stale (buffer was
+            //                     edited since the last check)
             if self.diagnostic_on_line(line_idx + 1).is_some() {
-                if let Some(brush) = err_brush.as_ref() {
-                    let bar_w = (self.cell_w * 0.4).max(2.0);
+                if let (Some(brush), Ok(layout)) = (
+                    err_brush.as_ref(),
+                    build_layout(&format, "!", self.cell_w * 2.0, self.cell_h),
+                ) {
+                    // Right-align in the gutter, one cell width
+                    // before the gutter's right edge.
+                    let x = gutter_w - self.cell_w * 1.2;
                     unsafe {
-                        target.FillRectangle(
-                            &D2D_RECT_F {
-                                left: gutter_w - bar_w - 1.0,
-                                top: y + 2.0,
-                                right: gutter_w - 1.0,
-                                bottom: y + self.cell_h - 2.0,
-                            },
+                        target.DrawTextLayout(
+                            windows_numerics::Vector2 { X: x, Y: y },
+                            &layout,
                             brush,
-                        )
-                    };
+                            D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                        );
+                    }
                 }
             }
 
@@ -1267,7 +1312,11 @@ impl ReditState {
                 let from_display = buffer_col_to_display(&line, from_col);
                 let to_display = buffer_col_to_display(&line, to_col);
                 if let Some(b) = err_brush.as_ref() {
-                    let bar_top = y + self.cell_h - 2.0;
+                    // 3-DIP-tall underline along the cell baseline.
+                    // Thicker than the previous 2-DIP version so
+                    // it's actually visible at standard zoom.
+                    let bar_thickness = 3.0_f32;
+                    let bar_top = y + self.cell_h - bar_thickness;
                     let bar_bot = y + self.cell_h;
                     unsafe {
                         target.FillRectangle(
@@ -2088,6 +2137,10 @@ unsafe extern "system" fn bedit_wnd_proc(
             let text = state.buffer.to_utf8();
             *cell.lock().expect("snapshot cell poisoned") = Some(text);
         }
+        return LRESULT(0);
+    }
+    if msg == WM_BEDIT_RUN_CHECK {
+        state.run_check();
         return LRESULT(0);
     }
 
