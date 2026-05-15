@@ -1,0 +1,69 @@
+// wingui_hello.bcl — Phase W1 smoke test.
+//
+// Confirms that the bcpl-wingui crate is built into the runtime
+// and JIT'd BCPL can call into the wingui DLL through the BCPL
+// class wrappers. W1 stops short of opening a real window — the
+// hosting code from newfb-wingui's `run_window_now` ports across
+// in W2. After this demo prints, you'll know:
+//
+//   * the wingui.dll loaded and reports a sensible version,
+//   * the App / Window classes parse, sema-clean, and JIT,
+//   * the FFI bridge between BCPL and wingui-rs works end-to-end.
+//
+// Run:
+//   newbcpl-driver run examples/wingui_hello.bcl
+//
+// The class definitions below mirror what
+// `docs/wingui_bcpl_design.md` proposes as the BCPL surface. Once
+// classes-in-modules-active is supported (currently the loader's
+// name-prefix pass conflicts with vtable globals), these move into
+// `modules-active/wingui.bcl` and programs just write
+// `LET w = NEW Window(1, "Title")`. For W1 they live in-source so
+// every demo can be smoke-tested without that follow-up.
+
+CLASS App $(
+    PRIVATE:
+    DECL title
+
+    PUBLIC:
+    ROUTINE CREATE(t) BE SELF.title := t
+
+    FUNCTION version() = bcpl_wingui_version_packed()
+    FUNCTION is_available() = bcpl_wingui_is_available()
+
+    ROUTINE run() BE $(
+        // No-op until W2 — the hosting layer lands then.
+    $)
+$)
+
+CLASS Window $(
+    PRIVATE:
+    DECL id
+
+    PUBLIC:
+    ROUTINE CREATE(i) BE SELF.id := i
+
+    FUNCTION ident() = SELF.id
+
+    ROUTINE show() BE $( $)
+    ROUTINE close() BE $( $)
+$)
+
+LET START() BE $(
+    LET app = NEW App("Hello wingui")
+
+    WRITES("wingui available? ")
+    WRITEN(app.is_available())
+    NEWLINE()
+
+    WRITES("wingui version packed: ")
+    WRITEN(app.version())
+    NEWLINE()
+
+    LET w = NEW Window(1)
+    WRITES("Window id: ")
+    WRITEN(w.ident())
+    NEWLINE()
+
+    WRITES("App constructed, ready for W2 windows.*N")
+$)

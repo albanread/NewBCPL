@@ -1,0 +1,35 @@
+[package]
+name = "bcpl-wingui"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+description = "BCPL-side bindings to the wingui retro-graphics framework. Sits on top of the language-neutral wingui-rs crate (from the NewFB workspace until it moves to its own home) and adapts the surface to BCPL's runtime ABI: i64 words, NUL-terminated UTF-8 strings, GC-managed heap pointers."
+
+# Two-layer architecture (see docs/wingui_bcpl_design.md):
+#
+#   bcpl-wingui (THIS CRATE)
+#     - extern "C-unwind" shims callable from JIT'd BCPL
+#     - argument unmarshalling (i64 ↔ Rust types,
+#       *const u8 NUL-terminated ↔ &str)
+#     - hosting state (window registry, UI context, event queue)
+#
+#   wingui-rs (E:\NewFB\src\wingui-rs)
+#     - language-neutral typed Rust API
+#     - links wingui.lib + stages wingui.dll
+#     - JSON spec builder, callback trampolines
+#
+#   multiwingui.dll (E:\multiwingui\x64\Debug\)
+#     - Win32 + D3D rendering, native window management
+#
+# The BCPL-side class layer lives in
+# `modules-active/wingui.bcl` (Window / Canvas / App classes) and
+# the procedural shim lives in the same module. Both forms call
+# back into THIS crate's `bcpl_wingui_*` builtins.
+
+[dependencies]
+# wingui-rs currently lives in the sibling NewFB workspace. The
+# design doc anticipates moving it to a standalone E:\wingui-rs\
+# repo once the API stabilises; until then, path-depend on the
+# in-NewFB copy. When it moves we update one line here and nothing
+# else changes.
+wingui-rs = { path = "../../../NewFB/src/wingui-rs" }

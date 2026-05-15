@@ -6,6 +6,14 @@ edition = "2024"
 [dependencies]
 serde_json = "1"
 
+# bcpl-wingui sits next to newbcpl-runtime in the workspace but its
+# builtins are loaded the same way as the runtime's own — the
+# runtime's `builtins::builtin_addresses()` table includes the
+# wingui entries via this dependency. Keeps the JIT-side resolution
+# story uniform: one symbol table, one source of truth.
+[target.'cfg(windows)'.dependencies.bcpl-wingui]
+path = "../bcpl-wingui"
+
 [target.'cfg(windows)'.dependencies]
 windows-numerics = "0.3"
 

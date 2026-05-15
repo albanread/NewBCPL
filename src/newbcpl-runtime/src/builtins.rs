@@ -1357,6 +1357,16 @@ pub fn builtin_addresses() -> &'static [Builtin] {
         ];
         #[cfg(windows)]
         {
+            // wingui retro-graphics framework. Builtins live in the
+            // sibling `bcpl-wingui` crate (path-dep) — their address
+            // table is pulled in here so the JIT-side symbol
+            // resolution sees one unified registry. See
+            // `docs/wingui_bcpl_design.md` for the surface design and
+            // `src/bcpl-wingui/` for the shim implementations.
+            for (name, address) in bcpl_wingui::builtin_addresses() {
+                v.push(Builtin { name, address });
+            }
+
             use crate::igui_builtins as g;
             v.push(Builtin {
                 name: "iGui_OpenChild",

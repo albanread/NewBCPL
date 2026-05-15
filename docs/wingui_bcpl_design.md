@@ -319,10 +319,48 @@ foundation, procedural shim on top.** Six reasons:
 
 ---
 
-## What this turn delivers
+## Implementation status (live)
 
-Just the design above. Once you approve the shape, the next turns
-do the actual implementation:
+| Phase | Status |
+|---|---|
+| **W1** — crate scaffold + version probe + class form in-source | ✅ landed |
+| **W2** — port hosting code (window-define, button, show, run, close) | pending |
+| **W3** — procedural shim (`WIN_DEFINE` etc.) + port two FB demos | pending |
+| **W4** — audio + screen-mode verbs | pending |
+| **W5** — event-loop iteration to E2 (blocking) | pending |
+
+### W1 deliverable
+
+* `src/bcpl-wingui` crate (path-dep on
+  `../../../NewFB/src/wingui-rs`). Two builtins
+  registered: `bcpl_wingui_version_packed`,
+  `bcpl_wingui_is_available`.
+* `examples/wingui_hello.bcl` demonstrates the class form
+  (`NEW App(...)`, `app.is_available()`, `app.version()`,
+  `NEW Window(...)`) and runs end-to-end through the JIT,
+  the FFI shim, `wingui-rs`, and `wingui.dll`.
+* Output proves the bridge: `wingui available? 1`, version
+  reported from the actual DLL.
+
+### Known gap: classes in `modules-active/`
+
+The original plan put the class definitions in
+`modules-active/wingui.bcl` so user programs could write
+`NEW App(...)` without an inline declaration. The loader's
+name-prefix pass clashes with vtable globals: every function
+gets prefixed `<stem>_<name>` (so `App_CREATE` →
+`wingui_App_CREATE`), but `@App.vtable` references the
+un-prefixed names. Result: "Linking globals named
+`'App.vtable'`: symbol multiply defined!".
+
+This isn't a wingui-specific issue — it would hit any class
+declared in a modules-active file. For W1 we sidestep by
+keeping the class definitions inline in the demo source.
+Fixing properly needs the loader to either skip prefixing for
+class methods or co-rename vtable references; that's a separate
+piece of work tracked as its own follow-up.
+
+## Next turns deliver
 
 | Phase | Work |
 |---|---|
