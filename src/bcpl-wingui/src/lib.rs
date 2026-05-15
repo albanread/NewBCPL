@@ -52,6 +52,12 @@ enum ChildNode {
     Button { id: i32, label: String },
     /// `Window.label(text)` — a static text node.
     Label { id: i32, text: String },
+    /// `Window.canvas(id, w, h)` — an RGBA drawing surface. The
+    /// spec emits this as an `"rgba-pane"` node with the requested
+    /// dimensions; the runtime allocates a backing texture and
+    /// resolves the node-id back to a `SuperTerminalPaneId` we use
+    /// for vector-draw calls.
+    Canvas { id: u32, width: u32, height: u32 },
 }
 
 #[cfg(target_os = "windows")]
@@ -60,15 +66,51 @@ struct MainWindow {
     children: Vec<ChildNode>,
 }
 
+/// One declared canvas pane plus its resolved runtime id.
+/// Populated when `Window.canvas(id, w, h)` is called; the
+/// `runtime_pane_id` slot stays `None` until `resolve_canvas_panes`
+/// asks the host for the matching `SuperTerminalPaneId`. After
+/// resolution, drawing primitives can be dispatched directly.
+#[cfg(target_os = "windows")]
+struct CanvasPaneEntry {
+    pane_id: u32,
+    width: u32,
+    height: u32,
+    runtime_pane_id: Option<wingui_rs::super_terminal::SuperTerminalPaneId>,
+}
+
+/// Drawing operations queued before `run()` captures the UI ctx.
+/// Drained from `on_setup` after the host has resolved each pane
+/// to a runtime id. Lets BCPL programs describe a chart layout
+/// linearly before the blocking `run()` call.
+#[cfg(target_os = "windows")]
+#[derive(Clone)]
+enum PendingCanvasDraw {
+    Clear {
+        pane_id: u32,
+        color: [f32; 4],
+    },
+    Primitive {
+        pane_id: u32,
+        primitive: wingui_rs::super_terminal::WinguiVectorPrimitive,
+    },
+}
+
 #[cfg(target_os = "windows")]
 struct Registry {
     main: Option<MainWindow>,
+    canvas_panes: Vec<CanvasPaneEntry>,
+    pending_canvas_draws: Vec<PendingCanvasDraw>,
 }
 
 #[cfg(target_os = "windows")]
 impl Registry {
     const fn new() -> Self {
-        Self { main: None }
+        Self {
+            main: None,
+            canvas_panes: Vec::new(),
+            pending_canvas_draws: Vec::new(),
+        }
     }
 }
 
@@ -180,6 +222,10 @@ fn build_spec(main: &MainWindow) -> wingui_rs::spec::SpecNode {
             ChildNode::Label { id, text } => SpecNode::new("text")
                 .id(format!("lbl_{id}"))
                 .text(text.clone()),
+            ChildNode::Canvas { id, width, height } => SpecNode::new("rgba-pane")
+                .id(format!("canvas_pane_{id}"))
+                .width(*width as i64)
+                .height(*height as i64),
         })
         .collect();
     let body = SpecNode::new("stack")
@@ -253,6 +299,10 @@ pub unsafe extern "C-unwind" fn bcpl_wingui_window_define(
                 title,
                 children: Vec::new(),
             });
+            // Reset canvas state — the previous run's panes and
+            // pending draws don't apply to the new window.
+            g.canvas_panes.clear();
+            g.pending_canvas_draws.clear();
         }
     }
     #[cfg(not(target_os = "windows"))]
@@ -409,6 +459,410 @@ pub extern "C-unwind" fn bcpl_wingui_poll_event() -> i64 {
     }
 }
 
+// ─── Canvas drawing — RGBA surface ────────────────────────────────
+//
+// A canvas pane is declared by `Window.canvas(id, w, h)` (or the
+// `WIN_CANVAS` procedural alias). The spec emits an `"rgba-pane"`
+// node; after `super_terminal_run_hosted_app` starts, `on_setup`
+// asks the host for the matching `SuperTerminalPaneId` via
+// `super_terminal_resolve_pane_id_utf8` and parks it on the
+// registry entry. Drawing primitives (CLEAR / FILL / FRAME / LINE
+// / CIRCLE) are queued onto `pending_canvas_draws` while the
+// runtime ctx is missing, then drained from `on_setup` after the
+// resolve pass.
+//
+// Coordinates are integer pixels (BCPL passes i64; we cast to
+// f32 inside the shim). Colours are 0-255 byte components (FB
+// convention); we normalise to 0.0-1.0 f32 for wingui's vector
+// primitives. Alpha defaults to fully opaque — programs that want
+// transparency call the `*_alpha` variants (TBD).
+
+#[cfg(target_os = "windows")]
+fn rgba_bytes_to_f32(r: i64, g: i64, b: i64) -> [f32; 4] {
+    [
+        (r.clamp(0, 255) as f32) / 255.0,
+        (g.clamp(0, 255) as f32) / 255.0,
+        (b.clamp(0, 255) as f32) / 255.0,
+        1.0,
+    ]
+}
+
+#[cfg(target_os = "windows")]
+fn lookup_canvas_pane(
+    pane_id: u32,
+) -> Option<(wingui_rs::super_terminal::SuperTerminalPaneId, u32, u32)> {
+    let g = REGISTRY.lock().ok()?;
+    let entry = g.canvas_panes.iter().find(|p| p.pane_id == pane_id)?;
+    let rt = entry.runtime_pane_id?;
+    Some((rt, entry.width, entry.height))
+}
+
+#[cfg(target_os = "windows")]
+fn current_ui_ctx() -> Option<*mut wingui_rs::super_terminal::SuperTerminalClientContext> {
+    let g = UI_CTX.lock().ok()?;
+    Some(g.as_ref()?.0)
+}
+
+/// Submit a single vector primitive to a canvas pane. If the
+/// runtime ctx isn't live yet (pre-run) or the pane hasn't
+/// resolved, queue the primitive onto `pending_canvas_draws` for
+/// the on_setup drain pass.
+#[cfg(target_os = "windows")]
+fn submit_canvas_primitive(
+    pane_id: u32,
+    prim: wingui_rs::super_terminal::WinguiVectorPrimitive,
+) {
+    let ctx_opt = current_ui_ctx();
+    let pane_opt = lookup_canvas_pane(pane_id);
+    let ctx_alive = ctx_opt.map(|c| !c.is_null()).unwrap_or(false);
+    if !ctx_alive || pane_opt.is_none() {
+        if let Ok(mut g) = REGISTRY.lock() {
+            g.pending_canvas_draws.push(PendingCanvasDraw::Primitive {
+                pane_id,
+                primitive: prim,
+            });
+        }
+        return;
+    }
+    let ctx = ctx_opt.unwrap();
+    let rt_pane = pane_opt.unwrap().0;
+    let _ = unsafe {
+        wingui_rs::super_terminal::super_terminal_vector_draw(
+            ctx,
+            rt_pane,
+            0,
+            wingui_rs::super_terminal::rgba_content_buffer::PERSISTENT,
+            wingui_rs::super_terminal::rgba_blit::ALPHA_OVER,
+            0,
+            std::ptr::null::<f32>(),
+            &prim,
+            1,
+        )
+    };
+}
+
+/// Same shape as `submit_canvas_primitive` but for a CLEAR — the
+/// only "primitive" that wipes the surface rather than compositing
+/// on top. Goes through `super_terminal_vector_draw` with the
+/// `clear_before=1` flag and an OPAQUE blit so the colour fully
+/// replaces what was there.
+#[cfg(target_os = "windows")]
+fn submit_canvas_clear(pane_id: u32, color: [f32; 4]) {
+    let ctx_opt = current_ui_ctx();
+    let pane_opt = lookup_canvas_pane(pane_id);
+    let ctx_alive = ctx_opt.map(|c| !c.is_null()).unwrap_or(false);
+    if !ctx_alive || pane_opt.is_none() {
+        if let Ok(mut g) = REGISTRY.lock() {
+            g.pending_canvas_draws
+                .push(PendingCanvasDraw::Clear { pane_id, color });
+        }
+        return;
+    }
+    let ctx = ctx_opt.unwrap();
+    let rt_pane = pane_opt.unwrap().0;
+    let _ = unsafe {
+        wingui_rs::super_terminal::super_terminal_vector_draw(
+            ctx,
+            rt_pane,
+            0,
+            wingui_rs::super_terminal::rgba_content_buffer::PERSISTENT,
+            wingui_rs::super_terminal::rgba_blit::OPAQUE,
+            1,
+            color.as_ptr(),
+            std::ptr::null(),
+            0,
+        )
+    };
+}
+
+/// Walk the declared canvas panes and resolve each one's runtime
+/// pane id via `super_terminal_resolve_pane_id_utf8`. Called from
+/// on_setup immediately after the framework signals it's ready to
+/// accept commands. After this returns, primitives can dispatch
+/// directly via `super_terminal_vector_draw`.
+#[cfg(target_os = "windows")]
+fn resolve_canvas_panes(
+    ctx: *mut wingui_rs::super_terminal::SuperTerminalClientContext,
+) {
+    use wingui_rs::super_terminal::{
+        super_terminal_resolve_pane_id_utf8, SuperTerminalPaneId,
+    };
+    let pending: Vec<u32> = match REGISTRY.lock() {
+        Ok(g) => g
+            .canvas_panes
+            .iter()
+            .filter(|p| p.runtime_pane_id.is_none())
+            .map(|p| p.pane_id)
+            .collect(),
+        Err(_) => return,
+    };
+    let mut resolved: Vec<(u32, SuperTerminalPaneId)> = Vec::new();
+    for pid in pending {
+        let node_id = format!("canvas_pane_{}", pid);
+        let Ok(cstr) = CString::new(node_id) else {
+            continue;
+        };
+        let mut out = SuperTerminalPaneId::default();
+        let ok = unsafe {
+            super_terminal_resolve_pane_id_utf8(ctx, cstr.as_ptr(), &mut out)
+        };
+        if ok != 0 && out.value != 0 {
+            resolved.push((pid, out));
+        }
+    }
+    if let Ok(mut g) = REGISTRY.lock() {
+        for (pid, rt) in resolved {
+            if let Some(p) = g.canvas_panes.iter_mut().find(|p| p.pane_id == pid) {
+                p.runtime_pane_id = Some(rt);
+            }
+        }
+    }
+}
+
+/// Drain queued canvas draws now the ctx + runtime pane ids are
+/// live. Ops whose pane id never resolved (id typo etc.) are
+/// silently dropped.
+#[cfg(target_os = "windows")]
+fn drain_pending_canvas_draws(
+    ctx: *mut wingui_rs::super_terminal::SuperTerminalClientContext,
+) {
+    if ctx.is_null() {
+        return;
+    }
+    let pending: Vec<PendingCanvasDraw> = match REGISTRY.lock() {
+        Ok(mut g) => std::mem::take(&mut g.pending_canvas_draws),
+        Err(_) => return,
+    };
+    for op in pending {
+        match op {
+            PendingCanvasDraw::Clear { pane_id, color } => {
+                let Some((rt_pane, _, _)) = lookup_canvas_pane(pane_id) else {
+                    continue;
+                };
+                let _ = unsafe {
+                    wingui_rs::super_terminal::super_terminal_vector_draw(
+                        ctx,
+                        rt_pane,
+                        0,
+                        wingui_rs::super_terminal::rgba_content_buffer::PERSISTENT,
+                        wingui_rs::super_terminal::rgba_blit::OPAQUE,
+                        1,
+                        color.as_ptr(),
+                        std::ptr::null(),
+                        0,
+                    )
+                };
+            }
+            PendingCanvasDraw::Primitive { pane_id, primitive } => {
+                let Some((rt_pane, _, _)) = lookup_canvas_pane(pane_id) else {
+                    continue;
+                };
+                let _ = unsafe {
+                    wingui_rs::super_terminal::super_terminal_vector_draw(
+                        ctx,
+                        rt_pane,
+                        0,
+                        wingui_rs::super_terminal::rgba_content_buffer::PERSISTENT,
+                        wingui_rs::super_terminal::rgba_blit::ALPHA_OVER,
+                        0,
+                        std::ptr::null::<f32>(),
+                        &primitive,
+                        1,
+                    )
+                };
+            }
+        }
+    }
+}
+
+// ─── Canvas FFI shims ─────────────────────────────────────────────
+
+/// `Window.canvas(id, w, h)` — declare an RGBA canvas pane. The id
+/// is the BCPL caller's chosen handle; subsequent CLEAR / FILL /
+/// LINE / etc. calls reference this same id. Width and height are
+/// the pane's backing-texture dimensions in pixels.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn bcpl_wingui_window_canvas(
+    id: i64,
+    width: i64,
+    height: i64,
+) {
+    #[cfg(target_os = "windows")]
+    {
+        let pid = (id.max(0)) as u32;
+        let w = width.max(1) as u32;
+        let h = height.max(1) as u32;
+        if let Ok(mut g) = REGISTRY.lock() {
+            if let Some(main) = g.main.as_mut() {
+                main.children.push(ChildNode::Canvas {
+                    id: pid,
+                    width: w,
+                    height: h,
+                });
+            }
+            g.canvas_panes.retain(|p| p.pane_id != pid);
+            g.canvas_panes.push(CanvasPaneEntry {
+                pane_id: pid,
+                width: w,
+                height: h,
+                runtime_pane_id: None,
+            });
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (id, width, height);
+    }
+}
+
+/// `Window.canvas_clear(canvas_id, r, g, b)` — wipe a canvas to a
+/// solid RGB colour. Alpha is forced to opaque.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn bcpl_wingui_canvas_clear(
+    canvas_id: i64,
+    r: i64,
+    g: i64,
+    b: i64,
+) {
+    #[cfg(target_os = "windows")]
+    {
+        let pid = canvas_id.max(0) as u32;
+        let color = rgba_bytes_to_f32(r, g, b);
+        submit_canvas_clear(pid, color);
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (canvas_id, r, g, b);
+    }
+}
+
+/// `Window.canvas_fill(canvas_id, x, y, w, h, r, g, b)` — filled
+/// rectangle. Composites over what's already on the surface.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn bcpl_wingui_canvas_fill(
+    canvas_id: i64,
+    x: i64,
+    y: i64,
+    w: i64,
+    h: i64,
+    r: i64,
+    g: i64,
+    b: i64,
+) {
+    #[cfg(target_os = "windows")]
+    {
+        let pid = canvas_id.max(0) as u32;
+        let prim = wingui_rs::super_terminal::WinguiVectorPrimitive::rect_filled(
+            x as f32,
+            y as f32,
+            w as f32,
+            h as f32,
+            rgba_bytes_to_f32(r, g, b),
+        );
+        submit_canvas_primitive(pid, prim);
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (canvas_id, x, y, w, h, r, g, b);
+    }
+}
+
+/// `Window.canvas_frame(canvas_id, x, y, w, h, stroke, r, g, b)` —
+/// stroked rectangle. `stroke` is the full line thickness in
+/// pixels; the renderer halves it internally.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn bcpl_wingui_canvas_frame(
+    canvas_id: i64,
+    x: i64,
+    y: i64,
+    w: i64,
+    h: i64,
+    stroke: i64,
+    r: i64,
+    g: i64,
+    b: i64,
+) {
+    #[cfg(target_os = "windows")]
+    {
+        let pid = canvas_id.max(0) as u32;
+        let prim = wingui_rs::super_terminal::WinguiVectorPrimitive::rect_stroked(
+            x as f32,
+            y as f32,
+            w as f32,
+            h as f32,
+            stroke.max(1) as f32,
+            rgba_bytes_to_f32(r, g, b),
+        );
+        submit_canvas_primitive(pid, prim);
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (canvas_id, x, y, w, h, stroke, r, g, b);
+    }
+}
+
+/// `Window.canvas_line(canvas_id, x0, y0, x1, y1, stroke, r, g, b)`
+/// — straight line between two points.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn bcpl_wingui_canvas_line(
+    canvas_id: i64,
+    x0: i64,
+    y0: i64,
+    x1: i64,
+    y1: i64,
+    stroke: i64,
+    r: i64,
+    g: i64,
+    b: i64,
+) {
+    #[cfg(target_os = "windows")]
+    {
+        let pid = canvas_id.max(0) as u32;
+        let prim = wingui_rs::super_terminal::WinguiVectorPrimitive::line(
+            x0 as f32,
+            y0 as f32,
+            x1 as f32,
+            y1 as f32,
+            stroke.max(1) as f32,
+            rgba_bytes_to_f32(r, g, b),
+        );
+        submit_canvas_primitive(pid, prim);
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (canvas_id, x0, y0, x1, y1, stroke, r, g, b);
+    }
+}
+
+/// `Window.canvas_circle(canvas_id, cx, cy, radius, r, g, b)` —
+/// filled circle centred on (cx, cy).
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn bcpl_wingui_canvas_circle(
+    canvas_id: i64,
+    cx: i64,
+    cy: i64,
+    radius: i64,
+    r: i64,
+    g: i64,
+    b: i64,
+) {
+    #[cfg(target_os = "windows")]
+    {
+        let pid = canvas_id.max(0) as u32;
+        let prim = wingui_rs::super_terminal::WinguiVectorPrimitive::circle_filled(
+            cx as f32,
+            cy as f32,
+            radius.max(1) as f32,
+            rgba_bytes_to_f32(r, g, b),
+        );
+        submit_canvas_primitive(pid, prim);
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (canvas_id, cx, cy, radius, r, g, b);
+    }
+}
+
 // ─── Hosting entry point ──────────────────────────────────────────
 
 #[cfg(target_os = "windows")]
@@ -444,7 +898,10 @@ fn run_window_now() -> i32 {
     /// Called once before any events. Captures the
     /// `SuperTerminalClientContext*` so `close()` (which may be
     /// called from a worker thread) has something to push a
-    /// request_stop through.
+    /// request_stop through. Then resolves the runtime ids of any
+    /// declared canvas panes and drains the pre-run drawing queue
+    /// — pre-run primitives are queued because the panes haven't
+    /// resolved yet; on_setup is the first moment they can.
     unsafe extern "C" fn on_setup(
         ctx: *mut SuperTerminalClientContext,
         _user_data: *mut std::ffi::c_void,
@@ -453,6 +910,8 @@ fn run_window_now() -> i32 {
             if let Ok(mut g) = UI_CTX.lock() {
                 *g = Some(SendableCtx(ctx));
             }
+            resolve_canvas_panes(ctx);
+            drain_pending_canvas_draws(ctx);
         }
         1
     }
@@ -616,6 +1075,31 @@ pub fn builtin_addresses() -> Vec<(&'static str, usize)> {
             "bcpl_wingui_poll_event",
             bcpl_wingui_poll_event as *const () as usize,
         ),
+        // ─── Canvas surface (W4) ────────────────────────────────
+        (
+            "bcpl_wingui_window_canvas",
+            bcpl_wingui_window_canvas as *const () as usize,
+        ),
+        (
+            "bcpl_wingui_canvas_clear",
+            bcpl_wingui_canvas_clear as *const () as usize,
+        ),
+        (
+            "bcpl_wingui_canvas_fill",
+            bcpl_wingui_canvas_fill as *const () as usize,
+        ),
+        (
+            "bcpl_wingui_canvas_frame",
+            bcpl_wingui_canvas_frame as *const () as usize,
+        ),
+        (
+            "bcpl_wingui_canvas_line",
+            bcpl_wingui_canvas_line as *const () as usize,
+        ),
+        (
+            "bcpl_wingui_canvas_circle",
+            bcpl_wingui_canvas_circle as *const () as usize,
+        ),
         // ─── Procedural shim (FB-compat surface) ─────────────────
         //
         // Same function pointers as the class-form `bcpl_wingui_*`
@@ -671,6 +1155,38 @@ pub fn builtin_addresses() -> Vec<(&'static str, usize)> {
         (
             "WIN_AVAILABLE",
             bcpl_wingui_is_available as *const () as usize,
+        ),
+        // ─── Canvas procedural shim ─────────────────────────────
+        //
+        //   WINDOW CANVAS id, w, h        →  WIN_CANVAS(id, w, h)
+        //   PANE CLEAR id, r, g, b         →  CANVAS_CLEAR(id, r, g, b)
+        //   PANE FILL  id, x,y,w,h, r,g,b  →  CANVAS_FILL (id, x,y,w,h, r,g,b)
+        //   PANE FRAME id, x,y,w,h, s, r,g,b → CANVAS_FRAME(id, x,y,w,h, s, r,g,b)
+        //   PANE LINE  id, x0,y0,x1,y1, s, r,g,b → CANVAS_LINE(id, x0,y0,x1,y1, s, r,g,b)
+        //   PANE CIRCLE id, cx,cy,r, r,g,b → CANVAS_CIRCLE(id, cx,cy,r, r,g,b)
+        (
+            "WIN_CANVAS",
+            bcpl_wingui_window_canvas as *const () as usize,
+        ),
+        (
+            "CANVAS_CLEAR",
+            bcpl_wingui_canvas_clear as *const () as usize,
+        ),
+        (
+            "CANVAS_FILL",
+            bcpl_wingui_canvas_fill as *const () as usize,
+        ),
+        (
+            "CANVAS_FRAME",
+            bcpl_wingui_canvas_frame as *const () as usize,
+        ),
+        (
+            "CANVAS_LINE",
+            bcpl_wingui_canvas_line as *const () as usize,
+        ),
+        (
+            "CANVAS_CIRCLE",
+            bcpl_wingui_canvas_circle as *const () as usize,
         ),
     ]
 }

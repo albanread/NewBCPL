@@ -1,0 +1,75 @@
+// wingui_draw.bcl — W4 demo: draw shapes on an RGBA canvas pane.
+//
+// Constructs a window with one 480×360 canvas and a Quit button.
+// Before run() blocks, queues a few drawing primitives — they're
+// flushed by `on_setup` once the pane resolves to a runtime
+// handle, so the window appears with the shapes already painted.
+//
+// Procedural form (FB-style). Run with:
+//   newbcpl-driver run examples/wingui_draw.bcl
+
+LET START() BE $(
+    UNLESS WIN_AVAILABLE() = 1 DO $(
+        WRITES("wingui DLL not available; aborting*N")
+        FINISH
+    $)
+
+    WIN_DEFINE(1, "Draw Demo")
+    WIN_CANVAS(10, 480, 360)
+    WIN_BUTTON(20, "Quit")
+    WIN_CLOSE_ON(20)
+
+    // Background: dark slate.
+    CANVAS_CLEAR(10, 24, 28, 38)
+
+    // Three filled rects across the top — red, green, blue.
+    CANVAS_FILL(10,  20, 20, 120, 80, 220,  60,  60)
+    CANVAS_FILL(10, 160, 20, 120, 80,  60, 200,  80)
+    CANVAS_FILL(10, 300, 20, 120, 80,  80, 120, 240)
+
+    // Three stroked rects below them at 4-pixel thickness.
+    CANVAS_FRAME(10,  20, 120, 120, 80, 4, 240, 200,  80)
+    CANVAS_FRAME(10, 160, 120, 120, 80, 4,  80, 220, 220)
+    CANVAS_FRAME(10, 300, 120, 120, 80, 4, 240, 100, 200)
+
+    // A diagonal line.
+    CANVAS_LINE(10, 20, 220, 460, 320, 2, 200, 200, 200)
+
+    // Two filled circles.
+    CANVAS_CIRCLE(10,  90, 280, 30, 240, 200,  80)
+    CANVAS_CIRCLE(10, 220, 280, 40,  80, 220, 220)
+
+    // A "watch face" of small dots arranged on a ring.
+    LET cx = 380
+    LET cy = 280
+    FOR i = 0 TO 11 DO $(
+        // Pre-computed coordinates so we don't need sin/cos here.
+        // 12 evenly-spaced angles on a ring of radius 50.
+        // Hand-calculated for the demo; future iterations can do
+        // the trig themselves when float math is friendlier.
+        LET dx = -1
+        LET dy = -1
+        SWITCHON i INTO $(
+            CASE  0:  dx :=   0; dy := -50; ENDCASE
+            CASE  1:  dx :=  25; dy := -43; ENDCASE
+            CASE  2:  dx :=  43; dy := -25; ENDCASE
+            CASE  3:  dx :=  50; dy :=   0; ENDCASE
+            CASE  4:  dx :=  43; dy :=  25; ENDCASE
+            CASE  5:  dx :=  25; dy :=  43; ENDCASE
+            CASE  6:  dx :=   0; dy :=  50; ENDCASE
+            CASE  7:  dx := -25; dy :=  43; ENDCASE
+            CASE  8:  dx := -43; dy :=  25; ENDCASE
+            CASE  9:  dx := -50; dy :=   0; ENDCASE
+            CASE 10:  dx := -43; dy := -25; ENDCASE
+            CASE 11:  dx := -25; dy := -43; ENDCASE
+            DEFAULT:  dx :=   0; dy :=   0; ENDCASE
+        $)
+        CANVAS_CIRCLE(10, cx + dx, cy + dy, 5, 240, 240, 240)
+    $)
+
+    WRITES("Drawing window opened — close it when you've seen it.*N")
+    LET code = WIN_RUN()
+    WRITES("window exited with code ")
+    WRITEN(code)
+    NEWLINE()
+$)
