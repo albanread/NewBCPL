@@ -1,25 +1,19 @@
-// wingui_hello.bcl — Phase W1 smoke test.
+// wingui_hello.bcl — opens a real window with a button.
 //
-// Confirms that the bcpl-wingui crate is built into the runtime
-// and JIT'd BCPL can call into the wingui DLL through the BCPL
-// class wrappers. W1 stops short of opening a real window — the
-// hosting code from newfb-wingui's `run_window_now` ports across
-// in W2. After this demo prints, you'll know:
+// W2 deliverable. Runs through:
+//   bedit / driver → JIT
+//   → BCPL classes → bcpl_wingui_* FFI shims
+//   → wingui-rs (super_terminal_run_hosted_app)
+//   → wingui.dll
+//   → Win32 + D3D rendering
 //
-//   * the wingui.dll loaded and reports a sensible version,
-//   * the App / Window classes parse, sema-clean, and JIT,
-//   * the FFI bridge between BCPL and wingui-rs works end-to-end.
+// `app.run()` blocks until the user clicks the Quit button or
+// closes the window via the title bar. Polls the event queue
+// (E1 loop from the design doc; E2 blocking lands later) and
+// breaks when the Quit button (id 20) fires.
 //
 // Run:
 //   newbcpl-driver run examples/wingui_hello.bcl
-//
-// The class definitions below mirror what
-// `docs/wingui_bcpl_design.md` proposes as the BCPL surface. Once
-// classes-in-modules-active is supported (currently the loader's
-// name-prefix pass conflicts with vtable globals), these move into
-// `modules-active/wingui.bcl` and programs just write
-// `LET w = NEW Window(1, "Title")`. For W1 they live in-source so
-// every demo can be smoke-tested without that follow-up.
 
 CLASS App $(
     PRIVATE:
@@ -31,22 +25,18 @@ CLASS App $(
     FUNCTION version() = bcpl_wingui_version_packed()
     FUNCTION is_available() = bcpl_wingui_is_available()
 
-    ROUTINE run() BE $(
-        // No-op until W2 — the hosting layer lands then.
-    $)
-$)
+    ROUTINE define_window(id, t) BE bcpl_wingui_window_define(id, t)
+    ROUTINE add_button(id, label) BE bcpl_wingui_window_button(id, label)
+    ROUTINE add_label(id, text) BE bcpl_wingui_window_label(id, text)
 
-CLASS Window $(
-    PRIVATE:
-    DECL id
+    // Register a button id that should close the window when
+    // clicked. Without this, a Quit button only queues an event
+    // and the user has to dismiss the window via the title bar.
+    ROUTINE close_on(id) BE bcpl_wingui_close_on(id)
 
-    PUBLIC:
-    ROUTINE CREATE(i) BE SELF.id := i
-
-    FUNCTION ident() = SELF.id
-
-    ROUTINE show() BE $( $)
-    ROUTINE close() BE $( $)
+    FUNCTION run() = bcpl_wingui_window_run()
+    ROUTINE close() BE bcpl_wingui_window_close()
+    FUNCTION poll() = bcpl_wingui_poll_event()
 $)
 
 LET START() BE $(
@@ -56,14 +46,35 @@ LET START() BE $(
     WRITEN(app.is_available())
     NEWLINE()
 
-    WRITES("wingui version packed: ")
-    WRITEN(app.version())
+    UNLESS app.is_available() = 1 DO $(
+        WRITES("wingui DLL not available; aborting*N")
+        FINISH
+    $)
+
+    // Build the window spec.
+    app.define_window(1, "Hello wingui")
+    app.add_label(10, "Press Quit to close.")
+    app.add_button(20, "Quit")
+    app.close_on(20)
+
+    WRITES("Opening window — press Quit (button 20) or close the title bar.*N")
+
+    // app.run() blocks until the window closes. After it returns
+    // we drain the event queue and check whether the Quit button
+    // was the cause; either way the program ends here.
+    LET code = app.run()
+    WRITES("window exited with code ")
+    WRITEN(code)
     NEWLINE()
 
-    LET w = NEW Window(1)
-    WRITES("Window id: ")
-    WRITEN(w.ident())
-    NEWLINE()
-
-    WRITES("App constructed, ready for W2 windows.*N")
+    LET seen_quit = 0
+    LET ev = app.poll()
+    WHILE ev ~= 0 DO $(
+        IF ev = 20 THEN seen_quit := 1
+        ev := app.poll()
+    $)
+    IF seen_quit = 1 THEN
+        WRITES("Quit button clicked.*N")
+    ELSE
+        WRITES("Window closed via title-bar.*N")
 $)
