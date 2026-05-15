@@ -110,7 +110,7 @@ Reference precedence table (high → low): `()`, `! OF`, `@ !`, `* / REM`,
 | `LET F(p) = expr` function | ✓ | Tier 3 |
 | `LET R(p) BE stmt` routine | ✓ | Tier 4 |
 | `FUNCTION` / `ROUTINE` keyword forms | ✓ | Parser tests |
-| `AND` mutual recursion | ✓ | Parser test for `LET ... AND ...`; runtime check thin |
+| `AND` mutual recursion | Δ | Classical `LET f = e AND g = e` declaration-tail isn't accepted — the parser's only `AND` rule is the precedence-3 logical operator. Functional mutual recursion works via **consecutive top-level `LET`s** because sema's pre-pass 2 registers every function name before any body is analysed. Tier 4 (`mutual_recursion_via_consecutive_lets_terminates`, `mutual_recursion_routines_with_be_bodies`). Adding the classical syntax would need parser lookahead to disambiguate `LET x = a AND b` (logical) from `LET f = e AND g = e` (declaration-tail). |
 | `GET "file"` include | ✓ | AST-level splicing: sibling-file first, then modules-active fallback so a module doubles as a header. Cycle detection via depth cap. |
 | `RETAIN name` / `RETAIN x = expr` | ✓ | Tier 6 (`retain_declares_binding_and_survives_gc`) — allocate, `GC()`, re-read |
 | `FREEVEC` / `FREELIST` | ⚠ | Accepted as no-op (GC owns lifetime); pinned that they don't error |
@@ -171,7 +171,7 @@ Per `classes_and_objects.md`:
 | `CREATE` / `RELEASE` slots 0 / 1 | ✓ | Tier 5 |
 | `PUBLIC` / `PRIVATE` / `PROTECTED` | ✓ | Enforced by sema. Visibility check at every `obj.field` and `obj.method()` site; `PRIVATE` requires access from the declaring class, `PROTECTED` extends to descendants. Sema's new `errors` channel rejects offenders; the driver refuses to proceed to IR/codegen. Tier 5 probes (`public_*`, `private_*`, `protected_*`). |
 | `VIRTUAL` modifier | ✓ | Tier 5 (`virtual_method_dispatches_to_override`, `virtual_dispatch_picks_subclass_body_via_vtable`) |
-| `FINAL` modifier | ⚠ | Parsed; not yet pinned by a probe asserting it blocks override |
+| `FINAL` modifier | ✓ | Sema pre-pass 1c rejects override (`check_final_overrides`). Tier 5 (`final_method_callable_when_not_overridden`, `final_method_override_rejected`, `final_override_rejected_through_chain`, `non_final_override_still_allowed`). |
 
 ## §9 — Memory model
 
@@ -205,7 +205,7 @@ Per `BCPL Runtime.md`:
 
 ## Current state — post-iteration-4
 
-The matrix has **285 probes across 17 test binaries**, all green
+The matrix has **291 probes across 17 test binaries**, all green
 (`cargo test -p newbcpl-tests --tests`). Every previously-named
 "high-leverage gap" — SUPER end-to-end, VIRTUAL dispatch, RETAIN
 post-GC, GOTO/label, multibyte UTF-8, EQV, NEQV — now has a
@@ -213,17 +213,28 @@ behavioural probe. They are listed in this audit's status column
 with the probe name so a future regression in any of those features
 has a single specific cell to fall through.
 
-**The spec pivot caught a real bug on first contact.** Adding the
-nine `char_lit_*` probes uncovered that `Expr::CharLit` was being
-lowered to `Const::String(lexeme)` — the lexeme `'A'` was passing
-through codegen as a pointer to the four-byte string `"'A'"` rather
-than as the integer 65. `WRITEN('A')` printed a pointer value
-instead of `65`. The old IR comment even said "codegen can decode
-the BCPL escape" — but codegen never did. Fixed by decoding the
-lexeme at IR time via `decode_char_lexeme`, resolving each of the
-eight escapes (`*N`, `*T`, `*S`, `*B`, `*P`, `*C`, `*"`, `**`) to
-its byte value at lowering. Exactly the class of bug the user said
-the corpus couldn't be trusted to surface.
+**The spec pivot has surfaced multiple real bugs the corpus
+couldn't:**
+
+* `char_lit_*` probes uncovered `Expr::CharLit` lowering to
+  `Const::String(lexeme)` — `WRITEN('A')` was printing a pointer
+  value instead of `65`. Fixed by adding `decode_char_lexeme` at
+  IR-lowering time. (9 probes added; see below.)
+
+* `final_*` probes drove the implementation of `FINAL` enforcement
+  in sema (`check_final_overrides`, pre-pass 1c). Subclasses that
+  try to override a FINAL ancestor method are now rejected through
+  the same hard-error channel that visibility violations use, with
+  a diagnostic naming both the method and the defining class.
+  (4 probes added.)
+
+* `mutual_recursion_*` probes confirmed that consecutive top-level
+  LETs already give us functional mutual recursion through sema's
+  pre-pass 2 (preregister-functions). They also revealed that the
+  classical `LET f = e AND g = e` declaration-tail syntax silently
+  folds into a logical-AND expression inside the first body —
+  a parser disambiguation gap recorded above. (2 probes added,
+  the classical syntax row downgraded to Δ.)
 
 ### Still genuinely thin
 
@@ -232,10 +243,9 @@ compiler but no probe pins it:
 
 | Row | What's missing |
 |---|---|
-| `FINAL` modifier | Parsed; no probe asserts override of a FINAL method is rejected |
-| `AND` mutual recursion (runtime) | Parser test exists; no probe that two `LET … AND …` routines actually call each other and terminate correctly |
 | `BRK` debugger breakpoint | Parses but isn't lowered — *implementation* gap, not a probe gap |
 | `LET f(p AS Class)` parameter | Doesn't parse — *implementation* gap |
+| Classical `LET … AND …` declaration tail | Silently consumed as logical AND inside the first body's expression — *parser disambiguation* gap; consecutive LETs work as a substitute |
 
 ### Out-of-scope by design
 

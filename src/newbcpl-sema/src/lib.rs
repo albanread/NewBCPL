@@ -538,6 +538,51 @@ impl Sema {
         });
     }
 
+    /// Reject any method on `c` that overrides an ancestor's method
+    /// marked `FINAL`. Walks `c.extends` chain looking for a method
+    /// with the same name; if one is found with `is_final == true`,
+    /// emits a hard `SemaError` pointing at the offending override
+    /// site. The error message names both classes so the user sees
+    /// exactly which inheritance hop introduces the conflict.
+    fn check_final_overrides(&mut self, c: &ClassDecl) {
+        // The class hasn't necessarily been refined yet, so walk the
+        // AST's members directly rather than `self.classes`. We do
+        // need the ancestor's method list, so we use `self.classes`
+        // for the lookup direction.
+        let Some(parent_name) = c.extends.as_ref() else {
+            return;
+        };
+        for member in &c.members {
+            let ClassMemberKind::Method(method) = &member.kind else {
+                continue;
+            };
+            // Walk ancestors and look for a same-name method.
+            let mut current = Some(parent_name.clone());
+            while let Some(ancestor_name) = current {
+                let Some(ancestor) = self.classes.get(&ancestor_name).cloned() else {
+                    break;
+                };
+                if let Some(ancestor_method) =
+                    ancestor.methods.iter().find(|m| m.name == method.name)
+                {
+                    if ancestor_method.is_final {
+                        self.error(
+                            format!(
+                                "cannot override FINAL method `{}` from class `{}`",
+                                method.name, ancestor_name
+                            ),
+                            method.span,
+                        );
+                    }
+                    // Found the method (FINAL or not) — first ancestor
+                    // with this name wins; stop the walk regardless.
+                    break;
+                }
+                current = ancestor.extends.clone();
+            }
+        }
+    }
+
     /// True iff `candidate` is `ancestor` or transitively extends it.
     /// Walks the class table's `extends` chain. Used by visibility
     /// checks to grant `PROTECTED` access from any subclass.
@@ -641,6 +686,17 @@ impl Sema {
         for decl in &program.items {
             if let Decl::Class(c) = decl {
                 self.refine_class_field_annotations(c);
+            }
+        }
+        // Pre-pass 1c: enforce `FINAL` — a subclass cannot override a
+        // method that an ancestor marked `FINAL`. We do this after
+        // every class is registered so the inheritance walk has
+        // complete information. Errors are routed through the same
+        // hard-diagnostic channel as visibility violations, so the
+        // driver refuses to proceed to IR/codegen.
+        for decl in &program.items {
+            if let Decl::Class(c) = decl {
+                self.check_final_overrides(c);
             }
         }
         // Pre-pass 2: register functions / routines with placeholder

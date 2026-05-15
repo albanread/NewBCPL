@@ -511,6 +511,65 @@ fn virtual_dispatch_picks_subclass_body_via_vtable() {
     );
 }
 
+// ─── FINAL — override-rejection enforcement ───────────────────────
+//
+// A `FINAL` method on a parent class cannot be overridden by any
+// descendant. Sema's pre-pass 1c walks every subclass's method list
+// against its inheritance chain and rejects same-name methods whose
+// ancestor counterpart is `FINAL`. The error is routed through the
+// `errors` channel (not `warnings`), so the driver refuses to
+// proceed to IR/codegen.
+
+#[test]
+fn final_method_callable_when_not_overridden() {
+    // FINAL is just a constraint, not a behaviour change — a class
+    // with a FINAL method should still work normally when nobody
+    // tries to override it. Sub inherits Seal.imprint via vtable.
+    expect(
+        "final_method_callable_when_not_overridden",
+        "CLASS Seal $(\n  FINAL FUNCTION imprint() = 7\n$)\nCLASS Sub EXTENDS Seal $(\n  DECL spare\n$)\nLET START() BE $(\n  LET s = NEW Sub\n  WRITEN(s.imprint())\n$)\n",
+        "7",
+    );
+}
+
+#[test]
+fn final_method_override_rejected() {
+    // Subclass tries to override a FINAL method — sema rejects with
+    // a diagnostic naming both the method and the defining class.
+    use newbcpl_tests::expect_reject;
+    expect_reject(
+        "final_method_override_rejected",
+        "run",
+        "CLASS Seal $(\n  FINAL FUNCTION imprint() = 7\n$)\nCLASS Sub EXTENDS Seal $(\n  FUNCTION imprint() = 9\n$)\nLET START() BE $(\n  LET s = NEW Sub\n  WRITEN(s.imprint())\n$)\n",
+        "FINAL",
+    );
+}
+
+#[test]
+fn final_override_rejected_through_chain() {
+    // Two-deep chain: Base has FINAL m, Mid extends Base, Sub
+    // extends Mid and tries to override. The check walks the
+    // ancestor chain, not just the direct parent.
+    use newbcpl_tests::expect_reject;
+    expect_reject(
+        "final_override_rejected_through_chain",
+        "run",
+        "CLASS Base $(\n  FINAL FUNCTION m() = 1\n$)\nCLASS Mid EXTENDS Base $(\n  DECL placeholder\n$)\nCLASS Sub EXTENDS Mid $(\n  FUNCTION m() = 2\n$)\nLET START() BE $(\n  LET s = NEW Sub\n  WRITEN(s.m())\n$)\n",
+        "FINAL",
+    );
+}
+
+#[test]
+fn non_final_override_still_allowed() {
+    // A FINAL constraint on `m` doesn't accidentally lock down `n`.
+    // Sub overrides only the non-FINAL method; sema accepts.
+    expect(
+        "non_final_override_still_allowed",
+        "CLASS Base $(\n  FINAL FUNCTION sealed() = 1\n  FUNCTION open() = 2\n$)\nCLASS Sub EXTENDS Base $(\n  FUNCTION open() = 99\n$)\nLET START() BE $(\n  LET s = NEW Sub\n  WRITEN(s.sealed()) WRITES(\"*S\") WRITEN(s.open())\n$)\n",
+        "1 99",
+    );
+}
+
 // ─── Visibility enforcement (PUBLIC / PRIVATE / PROTECTED) ────────
 //
 // Sema rejects accesses that violate the declared visibility. The
