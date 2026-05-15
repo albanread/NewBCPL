@@ -41,6 +41,88 @@
 //! On non-Windows hosts the handler falls back to a plain stderr
 //! write so the test matrix can exercise the banner + heap path
 //! without an OS-specific dependency.
+//!
+//! ### JIT-symbol resolution
+//!
+//! The stack walk above produces raw RIPs. To turn them back into
+//! BCPL routine names we keep a process-global registry of
+//! `(start_addr, routine_name)` entries, populated by the JIT
+//! crate after finalize. Lookup is a binary search for the largest
+//! `start_addr ≤ rip` — we treat the next entry's start as the
+//! implicit end of the current function. Entries are immutable
+//! once registered; the JIT never relocates code, so a slot in the
+//! map stays valid for the rest of the process's life.
+
+// ─── JIT-symbol registry ───────────────────────────────────────────
+//
+// Populated by the LLVM crate after each JIT-finalize. The BRK
+// handler reads this to resolve stack-frame RIPs back to BCPL
+// routine names. A `RwLock<Vec<(u64, String)>>` is fine here
+// because:
+//   * writes happen once per program (at startup, before BRK can
+//     ever fire);
+//   * reads happen on the BRK path, which is itself a slow path —
+//     no need for lock-free.
+// `parking_lot` isn't pulled in; std's `RwLock` is plenty.
+
+use std::sync::RwLock;
+
+static JIT_SYMBOLS: RwLock<Vec<(u64, String)>> = RwLock::new(Vec::new());
+
+/// Register a JIT-emitted function for stack-trace resolution.
+/// Called from the LLVM crate after `LLVMGetFunctionAddress`
+/// returns a stable address. The registry stays sorted by start
+/// address so lookups can binary-search.
+///
+/// `name_bytes` is borrowed for the duration of the call; the
+/// registry copies the bytes into an owned `String`.
+pub fn register_jit_symbol(start_addr: u64, name: &str) {
+    let mut guard = JIT_SYMBOLS.write().expect("JIT_SYMBOLS poisoned");
+    // Keep sorted by start_addr. Most realistic call patterns add
+    // entries in some arbitrary order (LLVM iteration order), so a
+    // single sort after the bulk register is more efficient — but
+    // we don't have a "bulk done" signal, so we insertion-sort each
+    // entry. The registry is small (one entry per BCPL function);
+    // O(n) per insert is fine.
+    let pos = guard.partition_point(|(s, _)| *s < start_addr);
+    guard.insert(pos, (start_addr, name.to_string()));
+}
+
+/// Reasonable upper bound on a JIT-d BCPL routine's machine-code
+/// size. Any RIP that sits more than this far above its nearest
+/// registered start address is almost certainly host / OS / runtime
+/// code, not JIT code, and we report it as un-named to avoid
+/// mis-attributing it to the highest-address JIT function.
+///
+/// BCPL routines compiled at -O0 fit in a few KB; even a vector
+/// loop with intrinsic lowering rarely passes 64 KB. 1 MB is wildly
+/// generous yet still tight enough to keep host addresses
+/// (typically `0x7FF…`) far above any JIT-d region (`0x1DE…` etc.)
+/// out of the resolved set.
+const MAX_REASONABLE_ROUTINE_SIZE: u64 = 1024 * 1024;
+
+/// Look up the routine name for a given RIP. Returns the entry
+/// whose `start_addr` is the largest value `≤ rip` *and* whose
+/// distance to the RIP is below `MAX_REASONABLE_ROUTINE_SIZE`.
+/// Frames in host / OS / runtime code resolve to `None` and the
+/// caller prints just the raw address.
+fn lookup_jit_symbol(rip: u64) -> Option<String> {
+    let guard = JIT_SYMBOLS.read().ok()?;
+    if guard.is_empty() {
+        return None;
+    }
+    // `partition_point` returns the index of the first entry with
+    // `start > rip`. The entry we want is just before that.
+    let after = guard.partition_point(|(s, _)| *s <= rip);
+    if after == 0 {
+        return None;
+    }
+    let (start, name) = &guard[after - 1];
+    if rip.saturating_sub(*start) > MAX_REASONABLE_ROUTINE_SIZE {
+        return None;
+    }
+    Some(name.clone())
+}
 
 #[cfg(windows)]
 const BRK_BUFFER_BYTES: usize = 4096;
@@ -351,13 +433,20 @@ unsafe fn write_stack_walk_section(w: &mut BrkWriter) {
             break;
         }
 
-        // Print this frame's RIP. A follow-up will resolve RIP to a
-        // BCPL routine name via a JIT-side address-range table; for
-        // now we emit the raw address.
+        // Print this frame's RIP plus, when we can, the BCPL
+        // routine that owns it. `lookup_jit_symbol` consults the
+        // process-global registry the LLVM crate populated at
+        // finalize. Frames that fall outside any JIT-d routine —
+        // the host driver, OS, runtime helpers — just show the
+        // raw address.
         w.write_str("  #");
         w.write_dec_u64(frame_index as u64);
         w.write_str("  rip=");
         w.write_hex16(rip);
+        if let Some(name) = lookup_jit_symbol(rip) {
+            w.write_str("  in ");
+            w.write_bytes(name.as_bytes());
+        }
         w.write_str("\n");
 
         // Find the unwind info for the function containing rip.

@@ -402,7 +402,7 @@ mismatches one file at a time — not systematic gaps.
 
 ### Where things stand
 
-Across five sweep iterations the journey is:
+Across seven sweep iterations the journey is:
 
 | Sweep | Pass | % raw | Effective % * |
 |-------|------|-------|---------------|
@@ -410,10 +410,17 @@ Across five sweep iterations the journey is:
 | 2     | 508  | 59.3  | 66.8          |
 | 3     | 524  | 61.2  | 68.9          |
 | 4     | 524  | 61.2  | 68.9          |
-| 5     | 531  | 63.6  | **69.9**      |
+| 5     | 531  | 63.6  | 69.9          |
+| 6     | 534  | 63.9  | 70.3          |
+| 7     | 537  | 64.3  | **70.7**      |
 
 \* Effective denominator = 856 − 28 GLOBALS − 45 no-START − 2
 visibility-violation − 21 SDL2 = 760.
+
+Sweep 6 picked up param-annotation-using shapes (where corpus tests
+happened to dispatch through a typed parameter). Sweep 7 picked up
+the typed-allocator bucket (`IGETVEC` / `SGETVEC` / `PGETVEC` /
+`QGETVEC` added as GETVEC aliases).
 
 The corpus sweep has done its job: it surfaced systematic gaps,
 each of which got addressed with a focused patch. What's left is

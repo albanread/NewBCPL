@@ -635,6 +635,34 @@ fn brk_does_not_halt_program() {
 }
 
 #[test]
+fn brk_stack_frame_resolves_routine_name() {
+    // After Phase A's JIT-symbol registration, frames in JIT-d code
+    // resolve to BCPL routine names. helper calls into BRK; the
+    // stack walk should report at least one frame "in helper" and
+    // at least one "in START". Other frames (host driver, OS) stay
+    // as raw RIPs.
+    expect_stdout_and_stderr_contains(
+        "brk_stack_frame_resolves_routine_name",
+        "LET helper() BE $(\n  BRK\n$)\nLET START() BE $(\n  helper()\n  WRITES(\"ok\")\n$)\n",
+        "ok",
+        &["in helper", "in START"],
+    );
+}
+
+#[test]
+fn brk_two_deep_call_chain_names_each_frame() {
+    // Three nested routines, BRK in the innermost. All three names
+    // should appear in the stack walk so the user can trace the
+    // call chain from the BRK site upward.
+    expect_stdout_and_stderr_contains(
+        "brk_two_deep_call_chain_names_each_frame",
+        "LET inner() BE BRK\nLET middle() BE inner()\nLET START() BE $(\n  middle()\n  WRITES(\"ok\")\n$)\n",
+        "ok",
+        &["in inner", "in middle", "in START"],
+    );
+}
+
+#[test]
 fn get_cycle_rejected() {
     // Two files that GET each other — the depth cap fires.
     use std::fs;

@@ -74,6 +74,56 @@ fn fvec_holds_floats() {
     );
 }
 
+// ─── Typed allocators (IGETVEC / SGETVEC / PGETVEC / QGETVEC) ────
+//
+// Naming-only aliases of GETVEC — the element-type prefix tells
+// the reader what the vector is for (Integer / String / Pair /
+// Quad) but the underlying storage is identical: one word-slot
+// per element, length stamped at p[-1], `p!i` reads / writes
+// slot i. Each typed form gets one probe to pin it as live so a
+// regression in `builtins.rs`'s registration table catches it.
+
+#[test]
+fn igetvec_allocates_integer_vector() {
+    expect(
+        "igetvec_allocates_integer_vector",
+        "LET START() BE $(\n  LET v = IGETVEC(5)\n  FOR i = 0 TO 4 DO v!i := i + 100\n  WRITEN(v!2) WRITES(\"*S\") WRITEN(LEN(v))\n$)\n",
+        "102 5",
+    );
+}
+
+#[test]
+fn sgetvec_allocates_string_vector() {
+    // Holds string pointers — each slot can store the address of a
+    // distinct string literal.
+    expect(
+        "sgetvec_allocates_string_vector",
+        "LET START() BE $(\n  LET v = SGETVEC(3)\n  v!0 := \"alpha\"\n  v!1 := \"beta\"\n  v!2 := \"gamma\"\n  WRITES(v!1)\n$)\n",
+        "beta",
+    );
+}
+
+#[test]
+fn pgetvec_allocates_pair_vector() {
+    // Pair vector: each slot is one packed pair (word).
+    // We just exercise allocation + subscript here; pair encoding
+    // is covered in tier 7's lane probes.
+    expect(
+        "pgetvec_allocates_pair_vector",
+        "LET START() BE $(\n  LET v = PGETVEC(4)\n  WRITEN(LEN(v))\n$)\n",
+        "4",
+    );
+}
+
+#[test]
+fn qgetvec_allocates_quad_vector() {
+    expect(
+        "qgetvec_allocates_quad_vector",
+        "LET START() BE $(\n  LET v = QGETVEC(2)\n  WRITEN(LEN(v))\n$)\n",
+        "2",
+    );
+}
+
 // ─── List runtime (ListHeader + ListAtom chain) ────────────────────
 
 #[test]

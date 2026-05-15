@@ -90,7 +90,7 @@ Reference precedence table (high → low): `()`, `! OF`, `@ !`, `* / REM`,
 | `name:` label declaration | ✓ | Same probes — labels are exercised by every GOTO probe |
 | `RETURN`, `RESULTIS`, `FINISH` | ✓ | Tier 4 |
 | `BREAK`, `LOOP`, `ENDCASE` | ✓ | Tier 4 + tier 5 USING-cleanup probes |
-| `BRK` debugger breakpoint | ✓ | Lowers to `__newbcpl_brk(routine_name, line)`. Runtime handler writes a signal-safe-ish state dump to stderr: banner with routine + line, heap summary (`live_bytes`/`live_blocks`/`peak`), full AMD64 register state via `RtlCaptureContext`, stack walk via `RtlVirtualUnwind` using the same unwind tables `jit_mm` registers for SEH. Program continues after the BRK. Tier 4 (`brk_emits_banner_with_routine_name_and_line`, `brk_emits_heap_summary`, `brk_emits_register_state`, `brk_emits_stack_walk`, `brk_reports_routine_name_from_helper`, `brk_does_not_halt_program`). |
+| `BRK` debugger breakpoint | ✓ | Lowers to `__newbcpl_brk(routine_name, line)`. Runtime handler writes a signal-safe-ish state dump to stderr: banner with routine + line, heap summary (`live_bytes`/`live_blocks`/`peak`), full AMD64 register state via `RtlCaptureContext`, stack walk via `RtlVirtualUnwind` using the same unwind tables `jit_mm` registers for SEH. Each stack frame resolves to a BCPL routine name when the RIP falls inside a JIT-d function, via a process-global registry populated by the LLVM crate after `LLVMGetFunctionAddress` finalize. Program continues after the BRK. Tier 4 — 8 probes (`brk_emits_*`, `brk_reports_routine_name_from_helper`, `brk_does_not_halt_program`, `brk_stack_frame_resolves_routine_name`, `brk_two_deep_call_chain_names_each_frame`). |
 
 ## §4 — Declarations
 
@@ -196,6 +196,7 @@ Per `BCPL Runtime.md`:
 | `FWRITE` | ✓ | Float printer |
 | `FINISH` | ✓ | |
 | `GETVEC` / `FGETVEC` | ✓ | Heap allocators |
+| Typed allocators `IGETVEC` / `SGETVEC` / `PGETVEC` / `QGETVEC` | ✓ | Naming-only aliases of GETVEC — same word-slot layout, length stamped at p[-1]. The element-type prefix is documentation today; eventually drives TypeDesc tagging. Tier 6 (`igetvec_allocates_integer_vector`, `sgetvec_allocates_string_vector`, `pgetvec_allocates_pair_vector`, `qgetvec_allocates_quad_vector`). |
 | `FREEVEC` | ⚠ | No-op stub; GC owns lifetime |
 | List ops `HD TL REST LEN CONCAT APND APND_*` | ✓ | Tier 6 |
 | Math `FSIN FCOS FTAN FABS FLOG FEXP FSQRT FLOAT FIX TRUNC ENTIER` | ✓ | |
@@ -206,7 +207,7 @@ Per `BCPL Runtime.md`:
 
 ## Current state — post-iteration-4
 
-The matrix has **306 probes across 17 test binaries**, all green
+The matrix has **312 probes across 17 test binaries**, all green
 (`cargo test -p newbcpl-tests --tests`). Every previously-named
 "high-leverage gap" — SUPER end-to-end, VIRTUAL dispatch, RETAIN
 post-GC, GOTO/label, multibyte UTF-8, EQV, NEQV — now has a

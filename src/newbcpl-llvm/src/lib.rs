@@ -469,6 +469,31 @@ fn run_program_ir(ir: &IrModule, modules_dir: Option<&Path>) -> Result<i64, Stri
         return Err("LLVMGetFunctionAddress(START) returned 0".to_string());
     }
 
+    // Walk every function in the module and register its compiled
+    // address with the runtime's JIT-symbol registry. BRK's stack
+    // walk reads this to map RIPs back to BCPL routine names.
+    //
+    // We do this *after* resolving START because START's address
+    // resolution is what triggers MCJIT finalize — at that point
+    // every function in the module has a stable code-section
+    // address. Functions emitted with no body (extern declarations
+    // for runtime builtins) return address 0 from
+    // `LLVMGetFunctionAddress` and are skipped.
+    let mut fopt = module.get_first_function();
+    while let Some(f) = fopt {
+        let name = f.get_name().to_string_lossy().into_owned();
+        if !name.is_empty() && f.get_first_basic_block().is_some() {
+            let cname = CString::new(name.as_str()).ok();
+            if let Some(cname) = cname {
+                let addr = unsafe { LLVMGetFunctionAddress(engine, cname.as_ptr()) };
+                if addr != 0 {
+                    newbcpl_runtime::brk::register_jit_symbol(addr, &name);
+                }
+            }
+        }
+        fopt = f.get_next_function();
+    }
+
     // Leak the engine. Drop would call LLVMDisposeExecutionEngine
     // which tears down our memory manager and leaves stale SEH
     // function tables registered with the OS unwinder. The host

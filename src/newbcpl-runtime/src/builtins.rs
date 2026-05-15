@@ -941,6 +941,42 @@ pub unsafe extern "C-unwind" fn FOCTS(n: i64) -> *mut i64 {
     alloc_vec_words(n)
 }
 
+// `IGETVEC` / `SGETVEC` / `PGETVEC` / `QGETVEC` — typed-allocator
+// aliases of `GETVEC`. Each names the element type the vector is
+// going to hold (Integer / String / Pair / Quad) but produces the
+// same underlying GC-allocated word-slot vector. The shape matches
+// PAIRS / QUADS / OCTS — one slot per element, length stamped at
+// `p[-1]`, lookup via `p ! i`.
+//
+// Today the type-name is documentation; storage and lookup are
+// identical to GETVEC. Eventually a future TypeDesc-aware
+// allocator could stamp the block's type-tag with the element
+// type so `TYPE(v ! 0)` can answer "what was this vector built
+// to hold?" without inspecting individual elements. The user
+// guide already promises the naming convention, so corpus tests
+// that say `LET v = IGETVEC(10)` instead of `LET v = GETVEC(10)`
+// link without change.
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn IGETVEC(n_words: i64) -> *mut i64 {
+    alloc_vec_words(n_words)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn SGETVEC(n_words: i64) -> *mut i64 {
+    alloc_vec_words(n_words)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn PGETVEC(n_words: i64) -> *mut i64 {
+    alloc_vec_words(n_words)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn QGETVEC(n_words: i64) -> *mut i64 {
+    alloc_vec_words(n_words)
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C-unwind" fn FREEVEC(_p: *mut i64) -> i64 {
     // Leak — proper free needs the GC's metadata. Tests don't
@@ -1306,6 +1342,10 @@ pub fn builtin_addresses() -> &'static [Builtin] {
             builtin!(TYPE),
             builtin!(SUM),
             builtin!(JOIN),
+            builtin!(IGETVEC),
+            builtin!(SGETVEC),
+            builtin!(PGETVEC),
+            builtin!(QGETVEC),
             Builtin {
                 name: "__newbcpl_brk",
                 address: crate::brk::__newbcpl_brk as *const () as usize,
