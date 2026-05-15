@@ -8,39 +8,59 @@
 //! the user can fix source files and reload them.
 //!
 //! Inherited from the sister NewCormanLisp repo's `ledit` (which
-//! itself descends from NewCP's `redit`). Renamed to bedit and
-//! growing a small set of BCPL-aware affordances:
+//! itself descends from NewCP's `redit`). Renamed to bedit; the
+//! BCPL-aware affordances landed in tranches.
 //!
-//!   - **auto-indent on Enter** — the new line gets the current
-//!     line's leading whitespace, plus an extra two spaces if the
-//!     cursor sits inside an open block: either there's an
-//!     unmatched `{` / `$(` to the left of the cursor on this
-//!     line, or the line (up to the cursor) ends in a BCPL
-//!     block-opening keyword (`DO`, `THEN`, `ELSE`, `BE`).
-//!   - **brace-balance in the status line** — a count of open vs
-//!     close `{`/`}` (and the bracket-style `$(`/`$)` synonyms) so
-//!     you can see at a glance whether an editing buffer is
-//!     well-formed.
+//! ## Editing features
 //!
-//! Real structural editing (jump-to-matching-brace, balanced
-//! cursor motion, etc.) is deferred — it'll land as user-BCPL
-//! once we have enough of an editor API to drive from outside.
+//!   - **File I/O** — `Ctrl+O` opens a file via the Win32 common
+//!     dialog; `Ctrl+S` saves to the current path; `Shift+Ctrl+S`
+//!     saves as. The driver's `gui <path>` populates the buffer at
+//!     startup and wires `file_path` so the first save round-trips.
+//!   - **Editing keys** — arrows, Home/End, PgUp/PgDn, Enter,
+//!     Backspace, Delete, Tab, printable chars. Tab is soft (spaces
+//!     to the next stop). Mouse click positions the cursor;
+//!     click-drag and Shift+motion extend the selection.
+//!   - **Selection** — Shift+arrow / Shift+Home/End / Shift+PgUp/Dn
+//!     extend a selection that the paint loop highlights under the
+//!     glyphs. `Ctrl+A` selects the whole buffer.
+//!   - **Clipboard** — `Ctrl+C` / `Ctrl+V` / `Ctrl+X` go through
+//!     the Win32 clipboard (UTF-16). Typing or pasting over a
+//!     selection deletes-then-inserts as one undo entry.
+//!   - **Undo / redo** — `Ctrl+Z` / `Ctrl+Y`. Insert-character
+//!     edits coalesce into a single undo entry until a non-edit
+//!     event (movement, click, paste, redo) clears the coalesce
+//!     window.
+//!   - **Auto-indent on Enter** — the new line inherits the current
+//!     line's leading whitespace, plus an extra indent step if the
+//!     cursor sits inside an open block: either an unmatched `{` /
+//!     `$(` to the left of the cursor on this line, or the line
+//!     (up to the cursor) ends in a BCPL block-opening keyword
+//!     (`DO`, `THEN`, `ELSE`, `BE`).
 //!
-//! Architecture: a single-instance MDI child with its own WndProc
-//! that handles WM_PAINT (Direct2D + DirectWrite, fixed grid) and
-//! all input directly. State is heap-allocated on first
-//! `WM_NCCREATE` and stored in `GWLP_USERDATA`.
+//! ## BCPL-aware affordances
 //!
-//! R1 scope:
-//!   - open / save (Win32 common dialogs)
-//!   - basic editing keys (arrows, Home/End, PgUp/PgDn, Enter,
-//!     Backspace, Delete, Tab, printable chars)
-//!   - mouse click to position cursor
-//!   - vertical wheel scroll
-//!   - line numbers in a left gutter
-//!   - status line at bottom
-//!   - no selection, no clipboard, no undo, no syntax colour, no
-//!     compiler hookup (those land in R2/R3/R4)
+//!   - **Syntax colouring** — `tokenize_buffer` runs a tiny line-
+//!     by-line lexer (BCPL keywords, numbers, strings, comments)
+//!     and the paint loop draws each token's run with the matching
+//!     `kw_brush` / `num_brush` / `str_brush` / `cmt_brush`.
+//!     Refreshed lazily on any buffer-mutating edit.
+//!   - **Brace-balance in the status line** — a running count of
+//!     open vs close `{` / `}` (and the bracket-style `$(` / `$)`
+//!     synonyms) so a malformed buffer is obvious at a glance.
+//!   - **Compile-check on F7** — invokes the
+//!     `install_checker`-registered callback (the driver wires it
+//!     to sema). Results land in `self.diagnostics`; the gutter
+//!     marks turn red where an error sits. `diagnostics_stale`
+//!     greys the marks the moment the user starts editing again,
+//!     so the diagnostic shown is never out of date by accident.
+//!
+//! ## Architecture
+//!
+//! A single-instance MDI child with its own WndProc that handles
+//! `WM_PAINT` (Direct2D + DirectWrite, fixed grid) and all input
+//! directly. State is heap-allocated on first `WM_NCCREATE` and
+//! stored in `GWLP_USERDATA`.
 
 #![cfg(windows)]
 

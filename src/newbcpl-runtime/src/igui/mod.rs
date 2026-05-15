@@ -48,6 +48,7 @@ mod menu;
 mod registry;
 mod renderer;
 mod replies;
+pub(crate) mod rope_buffer;
 pub mod system_colors;
 pub(crate) mod text_view;
 mod tools_menu;
