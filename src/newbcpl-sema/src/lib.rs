@@ -936,8 +936,21 @@ impl Sema {
             Decl::Function(f) => {
                 self.declare(&f.name, TypeHint::Function, None, f.span);
                 self.push_scope();
-                for p in &f.params {
-                    self.declare(p, TypeHint::Word, None, f.span);
+                for (idx, p) in f.params.iter().enumerate() {
+                    // Per-parameter `AS Class` annotation: if present
+                    // and the type resolves to a registered class,
+                    // attach the class identity to the parameter
+                    // binding. Inside the body, sema's
+                    // `class_name_of_expr` reads this class_name from
+                    // the binding so `p.method()` dispatches against
+                    // `Class`'s vtable and `p.field` runs the same
+                    // visibility check that a class-typed local does.
+                    let class_name = f
+                        .param_annotations
+                        .get(idx)
+                        .and_then(|a| a.as_deref())
+                        .and_then(|a| self.class_name_from_annotation(a));
+                    self.declare(p, TypeHint::Word, class_name, f.span);
                 }
                 let body_hint = self.type_of(&f.body);
                 let body_class = self.class_of_expr(&f.body);
@@ -956,8 +969,13 @@ impl Sema {
             Decl::Routine(r) => {
                 self.declare(&r.name, TypeHint::Function, None, r.span);
                 self.push_scope();
-                for p in &r.params {
-                    self.declare(p, TypeHint::Word, None, r.span);
+                for (idx, p) in r.params.iter().enumerate() {
+                    let class_name = r
+                        .param_annotations
+                        .get(idx)
+                        .and_then(|a| a.as_deref())
+                        .and_then(|a| self.class_name_from_annotation(a));
+                    self.declare(p, TypeHint::Word, class_name, r.span);
                 }
                 self.analyze_stmt(&r.body);
                 self.pop_scope();
@@ -1130,8 +1148,13 @@ impl Sema {
                     c.extends.clone(),
                     method.span,
                 );
-                for p in &method.params {
-                    self.declare(p, TypeHint::Word, None, method.span);
+                for (idx, p) in method.params.iter().enumerate() {
+                    let class_name = method
+                        .param_annotations
+                        .get(idx)
+                        .and_then(|a| a.as_deref())
+                        .and_then(|a| self.class_name_from_annotation(a));
+                    self.declare(p, TypeHint::Word, class_name, method.span);
                 }
                 // Mark this body as "inside class c" so visibility
                 // checks can answer "where is this access from?".

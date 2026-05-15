@@ -343,7 +343,12 @@ impl<'a> Lowerer<'a> {
     }
 
     fn lower_routine(&mut self, r: &RoutineDecl) {
-        self.start_function(&r.name, &r.params, TypeHint::Word);
+        self.start_function_with_annotations(
+            &r.name,
+            &r.params,
+            &r.param_annotations,
+            TypeHint::Word,
+        );
         self.lower_stmt(&r.body);
         // If the body fell through without an explicit RETURN, emit
         // one for routines (no return value).
@@ -355,7 +360,12 @@ impl<'a> Lowerer<'a> {
 
     fn lower_function(&mut self, f: &FunctionDecl) {
         let return_hint = f.body.hint();
-        self.start_function(&f.name, &f.params, return_hint);
+        self.start_function_with_annotations(
+            &f.name,
+            &f.params,
+            &f.param_annotations,
+            return_hint,
+        );
         let value = self.lower_expr(&f.body);
         self.b().terminate(Terminator::Return(Some(value)));
         self.finish_function();
@@ -451,16 +461,27 @@ impl<'a> Lowerer<'a> {
     ) {
         let mangled = mangle_method(class_name, &m.name);
         // Build the method's parameter list with SELF as the first
-        // implicit param. Real BCPL params follow.
+        // implicit param. Real BCPL params follow. The SELF slot
+        // takes no annotation (its class identity is patched in
+        // separately below); user params carry their own.
         let mut params: Vec<String> = Vec::with_capacity(m.params.len() + 1);
         params.push("SELF".to_string());
         params.extend(m.params.iter().cloned());
+        let mut param_annotations: Vec<Option<String>> =
+            Vec::with_capacity(m.params.len() + 1);
+        param_annotations.push(None); // SELF
+        param_annotations.extend(m.param_annotations.iter().cloned());
 
         let return_hint = match &m.body {
             ClassMethodBody::Routine(_) => TypeHint::Word,
             ClassMethodBody::Function(e) => e.hint(),
         };
-        self.start_function(&mangled, &params, return_hint);
+        self.start_function_with_annotations(
+            &mangled,
+            &params,
+            &param_annotations,
+            return_hint,
+        );
 
         // Tag the SELF binding with the current class so member
         // access through SELF resolves to the right field offsets.
@@ -500,20 +521,50 @@ impl<'a> Lowerer<'a> {
     }
 
     fn start_function(&mut self, name: &str, params: &[String], return_hint: TypeHint) {
+        self.start_function_with_annotations(name, params, &[], return_hint);
+    }
+
+    /// Variant of `start_function` that propagates per-parameter
+    /// `AS Class` annotations onto the local binding so that
+    /// `class_name_of_expr` returns the right class identity for
+    /// the parameter inside the body. The annotation slice is
+    /// parallel to `params` (same length); a `None` (or a missing
+    /// trailing entry) means the parameter has no class identity
+    /// and stays a bare Word.
+    fn start_function_with_annotations(
+        &mut self,
+        name: &str,
+        params: &[String],
+        annotations: &[Option<String>],
+        return_hint: TypeHint,
+    ) {
+        // Pre-resolve any class-annotation strings to canonical
+        // class names so `declare_local` can attach them directly.
+        // Non-class annotations (`INTEGER`, `^STRING`, …) and names
+        // that aren't in this compilation's layouts table resolve
+        // to `None` and the parameter stays a Word — matching the
+        // pre-existing un-annotated behaviour for backward compat.
+        let resolved: Vec<Option<String>> = params
+            .iter()
+            .enumerate()
+            .map(|(idx, _)| {
+                annotations
+                    .get(idx)
+                    .and_then(|a| a.as_deref())
+                    .and_then(|a| self.class_name_from_annotation(a))
+            })
+            .collect();
+
         let mut b = Builder::new(name);
         b.function.return_hint = return_hint;
-        // Allocate parameter slots in the entry block. Each parameter
-        // gets a stack slot the body sees through Load/Store, plus
-        // an `in_value` representing the incoming SSA value (which
-        // codegen materialises from the calling convention).
-        for p in params {
+        for (idx, p) in params.iter().enumerate() {
             let in_value = b.alloc_value();
             let slot = b.alloca(p, TypeHint::Word);
             b.emit(Instr::Store {
                 slot,
                 value: Value::Local(in_value),
             });
-            b.declare_local(p, slot, None);
+            b.declare_local(p, slot, resolved.get(idx).and_then(|c| c.clone()));
             b.function.params.push(Param {
                 name: p.clone(),
                 hint: TypeHint::Word,

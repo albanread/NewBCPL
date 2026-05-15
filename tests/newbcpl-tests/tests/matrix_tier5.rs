@@ -570,6 +570,88 @@ fn non_final_override_still_allowed() {
     );
 }
 
+// ─── Parameter type annotations `LET f(p AS Class)` ──────────────
+//
+// A function/routine parameter annotated `AS Class` binds the
+// parameter with class identity from inside the body. This lets
+// the receiver's methods and fields dispatch / visibility-check
+// the same way a class-typed local does. Without the annotation
+// the parameter is a bare word and methods fall back to dynamic
+// vtable resolution; with it, sema can do the static work.
+//
+// The shape lives in `param_annotations: Vec<Option<String>>` on
+// `FunctionDecl` / `RoutineDecl` / `ClassMethod`, parallel to the
+// `params: Vec<String>` list. Sema's body-analysis pass reads the
+// annotation through `class_name_from_annotation` and attaches the
+// class identity to the parameter binding.
+
+#[test]
+fn function_param_as_class_dispatches_method() {
+    // A function that takes a Point and reads its method —
+    // dispatch should work because the param is class-typed.
+    expect(
+        "function_param_as_class_dispatches_method",
+        "CLASS Point $(\n  DECL x\n  ROUTINE CREATE(ix) BE SELF.x := ix\n  FUNCTION value() = SELF.x\n$)\nLET show(p AS Point) = p.value()\nLET START() BE $(\n  LET q = NEW Point(123)\n  WRITEN(show(q))\n$)\n",
+        "123",
+    );
+}
+
+#[test]
+fn routine_param_as_class_accesses_field() {
+    // A routine takes a Point and reads/prints the bare field
+    // (not via accessor method) — proves class identity flows
+    // through enough to resolve `.x` to the right slot.
+    expect(
+        "routine_param_as_class_accesses_field",
+        "CLASS Point $(\n  DECL x\n  ROUTINE CREATE(ix) BE SELF.x := ix\n$)\nLET dump(p AS Point) BE WRITEN(p.x)\nLET START() BE $(\n  LET q = NEW Point(55)\n  dump(q)\n$)\n",
+        "55",
+    );
+}
+
+#[test]
+fn class_method_param_as_class_chains() {
+    // Class method takes another class as a param and calls a
+    // method on it — the chain `arg.method()` works the same way
+    // it does for a local binding. Pins that param annotations
+    // also work on methods, not just top-level routines.
+    expect(
+        "class_method_param_as_class_chains",
+        "CLASS Inner $(\n  DECL value\n  ROUTINE CREATE(v) BE SELF.value := v\n  FUNCTION getValue() = SELF.value\n$)\nCLASS Outer $(\n  FUNCTION sum_with(other AS Inner) = other.getValue() + 1000\n$)\nLET START() BE $(\n  LET inner = NEW Inner(7)\n  LET outer = NEW Outer\n  WRITEN(outer.sum_with(inner))\n$)\n",
+        "1007",
+    );
+}
+
+#[test]
+fn param_annotation_enforces_visibility() {
+    // The class-typed param is subject to the same visibility
+    // checks as a class-typed local. Trying to read a PRIVATE
+    // field from a routine that has no class context — even with
+    // an `AS Foo` param — is rejected by sema.
+    use newbcpl_tests::expect_reject;
+    expect_reject(
+        "param_annotation_enforces_visibility",
+        "run",
+        "CLASS Foo $(\n  PRIVATE:\n  DECL secret\n  PUBLIC:\n  ROUTINE CREATE(s) BE SELF.secret := s\n$)\nLET peek(p AS Foo) = p.secret\nLET START() BE $(\n  LET f = NEW Foo(99)\n  WRITEN(peek(f))\n$)\n",
+        "private",
+    );
+}
+
+#[test]
+fn param_without_annotation_workaround_via_typed_local() {
+    // Without an annotation a parameter is just a Word and
+    // `p.method()` can't resolve to a class — the IR falls
+    // through to the `__newbcpl_indirect` placeholder. The
+    // canonical workaround prior to param annotations: assign
+    // the param to a class-typed local inside the body. This
+    // probe pins that the workaround still works (and shows
+    // what the new annotation form spares users from writing).
+    expect(
+        "param_without_annotation_workaround_via_typed_local",
+        "CLASS Box $(\n  DECL n\n  ROUTINE CREATE(i) BE SELF.n := i\n  FUNCTION peek() = SELF.n\n$)\nLET unbox(b) = VALOF $(\n  LET typed AS Box = b\n  RESULTIS typed.peek()\n$)\nLET START() BE $(\n  LET b = NEW Box(13)\n  WRITEN(unbox(b))\n$)\n",
+        "13",
+    );
+}
+
 // ─── Visibility enforcement (PUBLIC / PRIVATE / PROTECTED) ────────
 //
 // Sema rejects accesses that violate the declared visibility. The

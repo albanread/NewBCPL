@@ -192,6 +192,9 @@ pub enum ClassMemberKind {
 pub struct ClassMethod {
     pub name: String,
     pub params: Vec<String>,
+    /// Per-parameter `AS Type` annotation, parallel to `params`.
+    /// See `FunctionDecl::param_annotations`.
+    pub param_annotations: Vec<Option<String>>,
     /// `VIRTUAL ROUTINE` / `VIRTUAL FUNCTION`.
     pub is_virtual: bool,
     /// `FINAL ROUTINE` / `FINAL FUNCTION`.
@@ -233,6 +236,13 @@ pub struct NamedBinding {
 pub struct FunctionDecl {
     pub name: String,
     pub params: Vec<String>,
+    /// Per-parameter `AS Type` annotation, parallel to `params`
+    /// (same length). `None` for un-annotated parameters — the
+    /// common case. The string is the canonicalised type-expression
+    /// form, e.g. `"INTEGER"`, `"^STRING"`, `"Window"`. Mirrors the
+    /// shape of `LetDecl.annotations` so sema's class-identity
+    /// resolution code can re-use the same canonicalisation path.
+    pub param_annotations: Vec<Option<String>>,
     pub body: Expr,
     pub span: Span,
 }
@@ -241,6 +251,9 @@ pub struct FunctionDecl {
 pub struct RoutineDecl {
     pub name: String,
     pub params: Vec<String>,
+    /// Per-parameter `AS Type` annotation, parallel to `params`.
+    /// See `FunctionDecl::param_annotations`.
+    pub param_annotations: Vec<Option<String>>,
     pub body: Box<Stmt>,
     pub span: Span,
 }

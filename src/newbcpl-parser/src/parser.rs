@@ -69,6 +69,14 @@ pub(crate) struct Parser {
     /// (which would otherwise eat the closing delimiter as a logical
     /// OR), so lane indices like `f.|i+1|` parse as expected.
     lane_depth: u32,
+    /// Decls produced as side effects of parsing a chained
+    /// declaration form like `LET f(...) = ... AND g(...) = ...`.
+    /// `parse_let_decl` returns the first binding and pushes the
+    /// rest here in source order; `parse_program` drains this
+    /// buffer before its next `parse_decl()` call so the AND chain
+    /// surfaces as independent top-level decls (matching how
+    /// sema's pre-pass 2 preregisters every function name regardless).
+    pending_decls: std::collections::VecDeque<Decl>,
 }
 
 impl Parser {
@@ -77,6 +85,7 @@ impl Parser {
             tokens,
             pos: 0,
             lane_depth: 0,
+            pending_decls: std::collections::VecDeque::new(),
         }
     }
 
@@ -96,6 +105,33 @@ impl Parser {
     fn check_sym(&self, name: &str) -> bool {
         let t = self.peek();
         t.kind == TokenKind::Symbol && t.lexeme == name
+    }
+
+    /// Lookahead helper for the classical BCPL mutual-recursion
+    /// declaration tail. Returns true iff the parser is currently
+    /// looking at the three-token sequence `AND <identifier> (`,
+    /// which is the only shape used by the `LET f(...) = ... AND
+    /// g(...) = ...` form. `peek_binary_op` uses this to refuse to
+    /// hand back `AND` as a logical operator at that position so the
+    /// enclosing `parse_let_decl` can consume the `AND` itself. The
+    /// expression form `expr AND name(args)` is rare enough that the
+    /// false-positive cost is acceptable; users wanting that shape
+    /// can write `expr AND (name(args))` to defeat the lookahead.
+    fn looks_like_decl_tail_and(&self) -> bool {
+        if !self.check_kw("AND") {
+            return false;
+        }
+        let after_and = self.pos + 1;
+        let Some(name_tok) = self.tokens.get(after_and) else {
+            return false;
+        };
+        if name_tok.kind != TokenKind::Identifier {
+            return false;
+        }
+        let Some(paren_tok) = self.tokens.get(after_and + 1) else {
+            return false;
+        };
+        paren_tok.kind == TokenKind::Symbol && paren_tok.lexeme == "("
     }
 
     fn eat(&mut self) -> Token {
@@ -137,11 +173,24 @@ impl Parser {
     fn parse_program(&mut self) -> Result<Program, ParseError> {
         let mut items = Vec::new();
         while !self.is_at_end() {
+            // Drain any sibling decls a chained `LET … AND …` left
+            // pending before consuming the next token. Each AND in a
+            // mutual-recursion chain pushes another `Decl::Function`
+            // or `Decl::Routine` here in source order.
+            while let Some(d) = self.pending_decls.pop_front() {
+                items.push(d);
+            }
             if self.check_sym(";") {
                 self.eat();
                 continue;
             }
             items.push(self.parse_decl()?);
+        }
+        // Edge case: a chained LET appeared at the very tail of the
+        // program — drain any decls that weren't picked up by the
+        // loop body's check above.
+        while let Some(d) = self.pending_decls.pop_front() {
+            items.push(d);
         }
         Ok(Program { items })
     }
@@ -614,6 +663,7 @@ impl Parser {
                         kind: ClassMemberKind::Method(ClassMethod {
                             name: f.name,
                             params: f.params,
+                            param_annotations: f.param_annotations,
                             is_virtual,
                             is_final,
                             body: ClassMethodBody::Function(f.body),
@@ -629,6 +679,7 @@ impl Parser {
                         kind: ClassMemberKind::Method(ClassMethod {
                             name: r.name,
                             params: r.params,
+                            param_annotations: r.param_annotations,
                             is_virtual,
                             is_final,
                             body: ClassMethodBody::Routine(r.body),
@@ -785,11 +836,14 @@ impl Parser {
         let name = self.eat_identifier()?.lexeme;
         self.expect_sym("(")?;
         let mut params = Vec::new();
+        let mut param_annotations: Vec<Option<String>> = Vec::new();
         if !self.check_sym(")") {
             params.push(self.eat_identifier()?.lexeme);
+            param_annotations.push(self.parse_optional_as_annotation());
             while self.check_sym(",") {
                 self.eat();
                 params.push(self.eat_identifier()?.lexeme);
+                param_annotations.push(self.parse_optional_as_annotation());
             }
         }
         self.expect_sym(")")?;
@@ -832,6 +886,7 @@ impl Parser {
             kind: ClassMemberKind::Method(ClassMethod {
                 name,
                 params,
+                param_annotations,
                 is_virtual,
                 is_final,
                 body,
@@ -947,6 +1002,69 @@ impl Parser {
         }
     }
 
+    /// Classical BCPL mutual-recursion declaration tail. After a
+    /// `LET name(params) = body` or `LET name(params) BE body` has
+    /// been parsed, peek for the chain continuation
+    /// `AND name(params) = body` / `AND name(params) BE body` and
+    /// push each sibling onto `pending_decls`. The shared scope
+    /// semantics (each routine can call the others) are already
+    /// satisfied by sema's pre-pass 2, which preregisters every
+    /// function name before any body is analysed — so we just need
+    /// to surface each sibling as an independent top-level decl.
+    fn consume_mutual_recursion_chain(&mut self) -> Result<(), ParseError> {
+        while self.looks_like_decl_tail_and() {
+            self.eat(); // AND
+            let start = self.peek().span.start;
+            let name = self.eat_identifier()?.lexeme;
+            self.expect_sym("(")?;
+            let mut params = Vec::new();
+            let mut param_annotations: Vec<Option<String>> = Vec::new();
+            if !self.check_sym(")") {
+                params.push(self.eat_identifier()?.lexeme);
+                param_annotations.push(self.parse_optional_as_annotation());
+                while self.check_sym(",") {
+                    self.eat();
+                    params.push(self.eat_identifier()?.lexeme);
+                    param_annotations.push(self.parse_optional_as_annotation());
+                }
+            }
+            self.expect_sym(")")?;
+            if self.check_sym("=") {
+                self.eat();
+                let body = self.parse_expr()?;
+                let end = body.span().end;
+                self.pending_decls.push_back(Decl::Function(FunctionDecl {
+                    name,
+                    params,
+                    param_annotations,
+                    body,
+                    span: SourceSpan { start, end },
+                }));
+            } else if self.check_kw("BE") {
+                self.eat();
+                let body = self.parse_stmt()?;
+                let end = body.span().end;
+                self.pending_decls.push_back(Decl::Routine(RoutineDecl {
+                    name,
+                    params,
+                    param_annotations,
+                    body: Box::new(body),
+                    span: SourceSpan { start, end },
+                }));
+            } else {
+                let span = self.peek().span;
+                let lex = self.peek().lexeme.clone();
+                return Err(ParseError::new(
+                    format!(
+                        "expected `=` or `BE` after `AND {name}(params)`, got `{lex}`"
+                    ),
+                    span,
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn parse_let_decl(&mut self) -> Result<Decl, ParseError> {
         let let_token = self.eat();
         let kind = if let_token.lexeme == "FLET" {
@@ -960,11 +1078,14 @@ impl Parser {
         if self.check_sym("(") {
             self.eat();
             let mut params = Vec::new();
+            let mut param_annotations: Vec<Option<String>> = Vec::new();
             if !self.check_sym(")") {
                 params.push(self.eat_identifier()?.lexeme);
+                param_annotations.push(self.parse_optional_as_annotation());
                 while self.check_sym(",") {
                     self.eat();
                     params.push(self.eat_identifier()?.lexeme);
+                    param_annotations.push(self.parse_optional_as_annotation());
                 }
             }
             self.expect_sym(")")?;
@@ -972,23 +1093,29 @@ impl Parser {
                 self.eat();
                 let body = self.parse_expr()?;
                 let end = body.span().end;
-                return Ok(Decl::Function(FunctionDecl {
+                let first = Decl::Function(FunctionDecl {
                     name: first_name,
                     params,
+                    param_annotations,
                     body,
                     span: SourceSpan { start, end },
-                }));
+                });
+                self.consume_mutual_recursion_chain()?;
+                return Ok(first);
             }
             if self.check_kw("BE") {
                 self.eat();
                 let body = self.parse_stmt()?;
                 let end = body.span().end;
-                return Ok(Decl::Routine(RoutineDecl {
+                let first = Decl::Routine(RoutineDecl {
                     name: first_name,
                     params,
+                    param_annotations,
                     body: Box::new(body),
                     span: SourceSpan { start, end },
-                }));
+                });
+                self.consume_mutual_recursion_chain()?;
+                return Ok(first);
             }
             let span = self.peek().span;
             let lex = self.peek().lexeme.clone();
@@ -1836,12 +1963,19 @@ impl Parser {
             // Precedence 3 — AND family:
             //   `&` symbol form → bitwise (`BitAnd`), matches C convention
             //   `BAND` keyword → bitwise
-            //   `AND` keyword  → *logical* (returns 0/1)
-            // The declaration-tail use (`LET f = ... AND g = ...`) is a
-            // separate form handled at LET-parse time, not here.
+            //   `AND` keyword  → *logical* (returns 0/1), unless the
+            //     token sequence `AND <ident> (` indicates a classical
+            //     BCPL mutual-recursion declaration tail
+            //     (`LET f(...) = ... AND g(...) = ...`). In that case
+            //     we stop expression parsing here so the enclosing
+            //     `parse_let_decl` can consume the `AND` and parse the
+            //     second declaration. Users wanting `expr AND fn(x)`
+            //     as a logical expression need parens: `expr AND (fn(x))`.
             (TokenKind::Symbol, "&") => Some((BinaryOp::BitAnd, 3)),
             (TokenKind::Keyword, "BAND") => Some((BinaryOp::BitAnd, 3)),
-            (TokenKind::Keyword, "AND") => Some((BinaryOp::LogAnd, 3)),
+            (TokenKind::Keyword, "AND") if !self.looks_like_decl_tail_and() => {
+                Some((BinaryOp::LogAnd, 3))
+            }
             // Precedence 2 — OR / XOR / EQV family:
             //   `|` symbol form → bitwise (`BitOr`); inside a `.|…|`
             //     lane bracket the `|` is the closing delimiter, not

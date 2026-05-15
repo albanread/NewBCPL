@@ -459,24 +459,21 @@ fn get_missing_file_rejected() {
 
 // ─── Mutual recursion via `LET … AND …` ──────────────────────────
 //
-// `LET f(p) = ...  AND  g(p) = ...` declares two routines that
-// share scope and can reference each other before either body is
-// fully analysed. Classic use: split a property check into two
-// routines that ping-pong (parity, lexer state, parser shape).
-// The parser test pins the declaration shape; this probe pins the
-// behavioural contract that the two routines actually call each
-// other at runtime and terminate with the right answer.
+// Two surface forms work today:
+//   1. Consecutive top-level `LET name(...) = body` declarations —
+//      forward references resolve through sema's pre-pass 2.
+//   2. Classical `LET name(...) = body AND name(...) = body` chains
+//      — the parser disambiguates `AND` followed by `<ident> (` as
+//      a declaration-tail and unfolds the chain into independent
+//      top-level decls. Semantically identical to form 1.
+//
+// Form 2 is the classical BCPL syntax and the form Martin Richards'
+// reference programs use; form 1 is what the manifesto-era code
+// adopted. Both round-trip through the same IR.
 
 #[test]
 fn mutual_recursion_via_consecutive_lets_terminates() {
-    // BCPL's classic `LET f = … AND g = …` form isn't yet accepted
-    // by the parser (see reference_audit — declaration-tail `AND`
-    // is an implementation gap). Mutual recursion still works
-    // through plain consecutive LETs because sema's pre-pass 2
-    // registers every function name before any body is analysed —
-    // is_even can reference is_odd at the IR level even though
-    // is_odd's body is declared after.
-    //
+    // Form 1 — consecutive LETs.
     // is_even / is_odd ping-pong toward 0. For n=5 we expect
     // is_even=0 (5 is odd), is_odd=1.
     expect(
@@ -488,16 +485,62 @@ fn mutual_recursion_via_consecutive_lets_terminates() {
 
 #[test]
 fn mutual_recursion_routines_with_be_bodies() {
-    // Same shape with ROUTINE bodies (`BE stmt`) instead of
-    // function bodies (`= expr`). Two routines update a shared
-    // GLOBAL while ping-ponging.
+    // Form 1 with ROUTINE bodies (`BE stmt`) and a shared GLOBAL.
     expect(
         "mutual_recursion_routines_with_be_bodies",
         "GLOBAL trace = 0\nLET step_a(n) BE $(\n  trace := trace + 100 + n\n  IF n > 0 THEN step_b(n - 1)\n$)\nLET step_b(n) BE $(\n  trace := trace + n\n  IF n > 0 THEN step_a(n - 1)\n$)\nLET START() BE $(\n  step_a(2)\n  WRITEN(trace)\n$)\n",
-        // step_a(2): trace += 102 → 102; calls step_b(1)
-        // step_b(1): trace += 1    → 103; calls step_a(0)
-        // step_a(0): trace += 100  → 203; no recursive call
         "203",
+    );
+}
+
+#[test]
+fn classical_let_and_chain_two_functions() {
+    // Form 2 — classical `LET f(n) = e AND g(n) = e` chain.
+    // The parser disambiguates the `AND <ident> (` shape as
+    // declaration-tail and emits two `Decl::Function` entries.
+    // Same is_even / is_odd ping-pong as the consecutive-LETs probe.
+    expect(
+        "classical_let_and_chain_two_functions",
+        "LET is_even(n) = n = 0 -> 1, is_odd(n - 1)\nAND is_odd(n) = n = 0 -> 0, is_even(n - 1)\nLET START() BE $(\n  WRITEN(is_even(0)) WRITES(\"*S\")\n  WRITEN(is_even(4)) WRITES(\"*S\")\n  WRITEN(is_even(5)) WRITES(\"*S\")\n  WRITEN(is_odd(5))\n$)\n",
+        "1 1 0 1",
+    );
+}
+
+#[test]
+fn classical_let_and_chain_three_routines() {
+    // Three-deep chain — exercise the loop in
+    // `consume_mutual_recursion_chain`.
+    expect(
+        "classical_let_and_chain_three_routines",
+        "GLOBAL out = 0\nLET a(n) BE $( out := out + 1\n  IF n > 0 THEN b(n - 1) $)\nAND b(n) BE $( out := out + 10\n  IF n > 0 THEN c(n - 1) $)\nAND c(n) BE $( out := out + 100\n  IF n > 0 THEN a(n - 1) $)\nLET START() BE $(\n  a(3)\n  WRITEN(out)\n$)\n",
+        // a→b→c→a: 1, 10, 100, 1 = 112
+        "112",
+    );
+}
+
+#[test]
+fn classical_let_and_chain_mixes_function_and_routine() {
+    // Mixed bodies inside one chain — one `=` function and one
+    // `BE` routine. The two halves of the chain dispatch through
+    // each other.
+    expect(
+        "classical_let_and_chain_mixes_function_and_routine",
+        "GLOBAL collected = 0\nLET note(n) BE collected := collected + n\nLET sum_via(n) = n = 0 -> 0, n + sum_via(n - 1)\nAND tag_via(n) BE $( note(n)\n  IF n > 0 THEN tag_via(n - 1) $)\nLET START() BE $(\n  WRITEN(sum_via(4))\n  WRITES(\"*S\")\n  tag_via(3)\n  WRITEN(collected)\n$)\n",
+        // sum_via(4) = 4+3+2+1 = 10; tag_via accumulates 3+2+1+0 = 6
+        "10 6",
+    );
+}
+
+#[test]
+fn expression_and_still_works_when_not_followed_by_paren() {
+    // Regression: `expr AND ident` (no `(` follow) must still
+    // parse as logical AND, not be mistaken for a decl tail.
+    // Pins that the disambiguation is keyed on the three-token
+    // `AND <ident> (` shape.
+    expect(
+        "expression_and_still_works_when_not_followed_by_paren",
+        "LET START() BE $(\n  LET a = 1\n  LET b = 1\n  TEST a AND b THEN WRITES(\"both\") ELSE WRITES(\"not\")\n$)\n",
+        "both",
     );
 }
 

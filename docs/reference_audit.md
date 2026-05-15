@@ -109,8 +109,9 @@ Reference precedence table (high → low): `()`, `! OF`, `@ !`, `* / REM`,
 | `LET v = FVEC k` | ✓ | Tier 6 |
 | `LET F(p) = expr` function | ✓ | Tier 3 |
 | `LET R(p) BE stmt` routine | ✓ | Tier 4 |
+| `LET F(p AS Class) = expr` parameter annotation | ✓ | AST carries `param_annotations: Vec<Option<String>>` parallel to `params`. Sema attaches class identity to the parameter binding; IR's `start_function_with_annotations` propagates it so `class_name_of_expr` resolves member access through the parameter. Tier 5 (`function_param_as_class_dispatches_method`, `routine_param_as_class_accesses_field`, `class_method_param_as_class_chains`, `param_annotation_enforces_visibility`, `param_without_annotation_workaround_via_typed_local`). |
 | `FUNCTION` / `ROUTINE` keyword forms | ✓ | Parser tests |
-| `AND` mutual recursion | Δ | Classical `LET f = e AND g = e` declaration-tail isn't accepted — the parser's only `AND` rule is the precedence-3 logical operator. Functional mutual recursion works via **consecutive top-level `LET`s** because sema's pre-pass 2 registers every function name before any body is analysed. Tier 4 (`mutual_recursion_via_consecutive_lets_terminates`, `mutual_recursion_routines_with_be_bodies`). Adding the classical syntax would need parser lookahead to disambiguate `LET x = a AND b` (logical) from `LET f = e AND g = e` (declaration-tail). |
+| `AND` mutual recursion | ✓ | Both surface forms work: (a) consecutive top-level `LET`s relying on sema's pre-pass 2 to preregister names, and (b) classical `LET f(...) = e AND g(...) = e` chains. The parser disambiguates by looking ahead for `AND <ident> (` — when matched, the `AND` is decl-tail and the chain unfolds into independent top-level decls; otherwise `AND` stays a logical operator. Tier 4 probes: `mutual_recursion_via_consecutive_lets_terminates`, `mutual_recursion_routines_with_be_bodies`, `classical_let_and_chain_two_functions`, `classical_let_and_chain_three_routines`, `classical_let_and_chain_mixes_function_and_routine`, `expression_and_still_works_when_not_followed_by_paren`. |
 | `GET "file"` include | ✓ | AST-level splicing: sibling-file first, then modules-active fallback so a module doubles as a header. Cycle detection via depth cap. |
 | `RETAIN name` / `RETAIN x = expr` | ✓ | Tier 6 (`retain_declares_binding_and_survives_gc`) — allocate, `GC()`, re-read |
 | `FREEVEC` / `FREELIST` | ⚠ | Accepted as no-op (GC owns lifetime); pinned that they don't error |
@@ -205,7 +206,7 @@ Per `BCPL Runtime.md`:
 
 ## Current state — post-iteration-4
 
-The matrix has **291 probes across 17 test binaries**, all green
+The matrix has **300 probes across 17 test binaries**, all green
 (`cargo test -p newbcpl-tests --tests`). Every previously-named
 "high-leverage gap" — SUPER end-to-end, VIRTUAL dispatch, RETAIN
 post-GC, GOTO/label, multibyte UTF-8, EQV, NEQV — now has a
@@ -213,13 +214,32 @@ behavioural probe. They are listed in this audit's status column
 with the probe name so a future regression in any of those features
 has a single specific cell to fall through.
 
+Two pieces of language work landed this iteration on top of the
+spec-pivot baseline:
+
+* **Parameter type annotations** — `LET f(p AS Class) = …` and the
+  routine + method equivalents now carry per-parameter `AS Type`
+  annotations through parser → AST → sema → IR. Inside the body the
+  parameter binds with class identity, so method dispatch resolves
+  statically and visibility checks fire the same way they do for a
+  class-typed local. Also unblocks the top corpus failure bucket
+  (`__newbcpl_indirect` for `param.method()` patterns).
+
+* **Classical `LET … AND …` mutual recursion** — the parser now
+  disambiguates `AND <ident> (` as a declaration-tail and unfolds
+  the chain into independent top-level decls. The shared-scope
+  semantics come for free from sema's pre-pass 2. The disambiguation
+  is keyed on the three-token shape; expressions like `a AND b`
+  (logical) and `a AND b + c` (logical with arithmetic tail) still
+  parse the same way they always did.
+
 **The spec pivot has surfaced multiple real bugs the corpus
 couldn't:**
 
 * `char_lit_*` probes uncovered `Expr::CharLit` lowering to
   `Const::String(lexeme)` — `WRITEN('A')` was printing a pointer
   value instead of `65`. Fixed by adding `decode_char_lexeme` at
-  IR-lowering time. (9 probes added; see below.)
+  IR-lowering time. (9 probes added.)
 
 * `final_*` probes drove the implementation of `FINAL` enforcement
   in sema (`check_final_overrides`, pre-pass 1c). Subclasses that
@@ -228,13 +248,19 @@ couldn't:**
   a diagnostic naming both the method and the defining class.
   (4 probes added.)
 
-* `mutual_recursion_*` probes confirmed that consecutive top-level
-  LETs already give us functional mutual recursion through sema's
-  pre-pass 2 (preregister-functions). They also revealed that the
-  classical `LET f = e AND g = e` declaration-tail syntax silently
-  folds into a logical-AND expression inside the first body —
-  a parser disambiguation gap recorded above. (2 probes added,
-  the classical syntax row downgraded to Δ.)
+* The mutual-recursion probes initially failed because the parser
+  silently folded `LET f = e AND g = e` into a logical-AND
+  expression inside the first body — silent semantic divergence
+  rather than a hard rejection. Documented as a parser gap, then
+  fixed in the same iteration as task 2 below.
+
+* The param-annotation probes initially failed because IR lowering
+  passed parameter slots without class identity, so `param.method()`
+  fell through to a placeholder `__newbcpl_indirect` extern. Fixed
+  by threading per-parameter annotations through
+  `start_function_with_annotations` and pre-resolving them via
+  `class_name_from_annotation`. This was also the top failure
+  bucket in iteration 4's corpus sweep.
 
 ### Still genuinely thin
 
@@ -244,8 +270,6 @@ compiler but no probe pins it:
 | Row | What's missing |
 |---|---|
 | `BRK` debugger breakpoint | Parses but isn't lowered — *implementation* gap, not a probe gap |
-| `LET f(p AS Class)` parameter | Doesn't parse — *implementation* gap |
-| Classical `LET … AND …` declaration tail | Silently consumed as logical AND inside the first body's expression — *parser disambiguation* gap; consecutive LETs work as a substitute |
 
 ### Out-of-scope by design
 
