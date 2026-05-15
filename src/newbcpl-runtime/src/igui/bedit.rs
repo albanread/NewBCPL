@@ -128,9 +128,20 @@ pub const MENU_CMD_ID: u16 = 0x3000;
 const BEDIT_CLASS: PCWSTR = w!("NewBCPL.iGui.Bedit");
 const TITLE_NEW: PCWSTR = w!("bedit — untitled");
 
-/// HWND of the singleton bedit MDI child, if one exists. Used to
-/// activate the existing instance instead of creating a second one.
-static BEDIT_HWND: Mutex<Option<isize>> = Mutex::new(None);
+/// Every bedit MDI child currently alive. Indexed in arbitrary
+/// order; an `NCDESTROY` handler removes its own slot. Multiple
+/// open buffers are first-class — the user can drag two bedits
+/// side-by-side, or maximize one to get tab-style switching via
+/// the MDI frame's window-list menu.
+static BEDIT_HWNDS: Mutex<Vec<isize>> = Mutex::new(Vec::new());
+
+/// HWND of the most-recently-focused bedit. Helpers like
+/// `snapshot_buffer` / `run_check_in_singleton` / Ctrl+R target
+/// this one, so "the buffer the user just clicked into" is the
+/// one that gets run / checked / saved without further ceremony.
+/// `None` while no bedit has the focus (e.g. immediately after
+/// closing the last one).
+static ACTIVE_BEDIT: Mutex<Option<isize>> = Mutex::new(None);
 
 /// Private WM_USER message: load a file into the singleton bedit
 /// instance. `lparam` is `Box::into_raw(Box::new(PathBuf))`; the
@@ -169,19 +180,28 @@ pub fn set_startup_file(path: PathBuf) {
     *STARTUP_FILE.lock().expect("STARTUP_FILE poisoned") = Some(path);
 }
 
-/// Marshal a file-load request onto the UI thread to the singleton
-/// bedit window via `SendMessageW(WM_BEDIT_LOAD_FILE)`. Used by
-/// `open()` after window creation. No-op if no bedit is currently
-/// open.
-pub fn load_file_into_singleton(path: PathBuf) {
-    let raw = match BEDIT_HWND.lock().expect("BEDIT_HWND poisoned").as_ref() {
-        Some(r) => *r,
-        None => return,
-    };
+/// Return the HWND of the most-recently-focused bedit, or `None`
+/// if no bedit is currently alive. Verifies `IsWindow` because
+/// the registry may briefly hold a stale entry after a
+/// `WM_NCDESTROY` if we ever query mid-teardown.
+fn active_bedit_hwnd() -> Option<HWND> {
+    let raw = (*ACTIVE_BEDIT.lock().ok()?)?;
     let hwnd = HWND(raw as *mut _);
-    if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
-        return;
+    if unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+        Some(hwnd)
+    } else {
+        None
     }
+}
+
+/// Marshal a file-load request onto the UI thread to the active
+/// bedit window via `SendMessageW(WM_BEDIT_LOAD_FILE)`. Used by
+/// `open()` after window creation. No-op when no bedit has the
+/// focus.
+pub fn load_file_into_singleton(path: PathBuf) {
+    let Some(hwnd) = active_bedit_hwnd() else {
+        return;
+    };
     let boxed = Box::into_raw(Box::new(path));
     unsafe {
         SendMessageW(
@@ -194,21 +214,15 @@ pub fn load_file_into_singleton(path: PathBuf) {
     // The WndProc handler takes ownership of the Box.
 }
 
-/// Ask the singleton bedit to re-run the installed checker now.
+/// Ask the active bedit to re-run the installed checker now.
 /// The driver calls this after each Ctrl+R / Program ▸ Run so any
 /// sema / parse error the user just saw in the log also lights up
 /// in the editor as a squiggle + gutter `!`. No-op when no bedit
-/// is open or no checker is installed. Safe from any thread —
-/// marshalled onto the UI thread via `SendMessageW`.
+/// is open or no checker is installed.
 pub fn run_check_in_singleton() {
-    let raw = match BEDIT_HWND.lock().expect("BEDIT_HWND poisoned").as_ref() {
-        Some(r) => *r,
-        None => return,
-    };
-    let hwnd = HWND(raw as *mut _);
-    if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+    let Some(hwnd) = active_bedit_hwnd() else {
         return;
-    }
+    };
     unsafe {
         SendMessageW(
             hwnd,
@@ -219,20 +233,13 @@ pub fn run_check_in_singleton() {
     }
 }
 
-/// Snapshot the singleton bedit's text buffer as one `String` with
-/// `\n` line separators. Returns `None` if no bedit window is open.
-/// Safe to call from any thread: this marshals onto the UI thread
-/// via `SendMessageW`, which blocks until the WndProc returns and
-/// fills the result cell.
+/// Snapshot the active bedit's text buffer as one `String` with
+/// `\n` line separators. Returns `None` if no bedit window is
+/// focused. Safe to call from any thread.
 pub fn snapshot_buffer() -> Option<String> {
-    let raw = match BEDIT_HWND.lock().expect("BEDIT_HWND poisoned").as_ref() {
-        Some(r) => *r,
-        None => return None,
-    };
-    let hwnd = HWND(raw as *mut _);
-    if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+    let Some(hwnd) = active_bedit_hwnd() else {
         return None;
-    }
+    };
     let cell: Mutex<Option<String>> = Mutex::new(None);
     let cell_ptr = &cell as *const _ as isize;
     unsafe {
@@ -381,22 +388,11 @@ pub fn register_class() -> Result<(), super::IGuiError> {
 /// the frame WndProc when the user picks the menu item or hits the
 /// shortcut. UI-thread only.
 pub fn open(frame: HWND, mdi_client: HWND) {
-    if let Some(raw) = *BEDIT_HWND.lock().expect("BEDIT_HWND poisoned") {
-        let hwnd = HWND(raw as *mut _);
-        if unsafe { IsWindow(Some(hwnd)) }.as_bool() {
-            unsafe {
-                SendMessageW(
-                    mdi_client,
-                    windows::Win32::UI::WindowsAndMessaging::WM_MDIACTIVATE,
-                    Some(WPARAM(hwnd.0 as usize)),
-                    Some(LPARAM(0)),
-                )
-            };
-            let _ = unsafe { BringWindowToTop(hwnd) };
-            return;
-        }
-    }
-
+    // Multi-window mode: every `open()` call creates a fresh bedit
+    // child. The user can compare files side-by-side; the MDI
+    // frame's window-list menu acts as a tab strip when one bedit
+    // is maximized. The pre-existing "activate the singleton"
+    // shortcut became unnecessary: every new window starts active.
     let h_instance = match unsafe { GetModuleHandleW(None) } {
         Ok(h) => windows::Win32::Foundation::HANDLE(h.0),
         Err(e) => {
@@ -430,10 +426,11 @@ pub fn open(frame: HWND, mdi_client: HWND) {
     let _ = frame; // reserved for future use
 
     // Consume a one-shot startup-file request, if any. By now the
-    // window's WM_NCCREATE has installed bedit's state and populated
-    // BEDIT_HWND, so the load-message marshalling can find the
-    // singleton. Only the *first* bedit creation observes a pending
-    // path; subsequent `open()` calls activate the existing window.
+    // window's WM_NCCREATE has installed bedit's state and pushed
+    // its HWND onto BEDIT_HWNDS / ACTIVE_BEDIT, so the load-
+    // message marshalling can find it. Only the *first* `open()`
+    // observes a pending path because `take()` empties the slot;
+    // subsequent calls produce empty buffers.
     let pending = STARTUP_FILE
         .lock()
         .expect("STARTUP_FILE poisoned")
@@ -2407,8 +2404,16 @@ unsafe extern "system" fn bedit_wnd_proc(
         let state = Box::new(ReditState::new(hwnd));
         let raw = Box::into_raw(state) as isize;
         unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, raw) };
-        if let Ok(mut slot) = BEDIT_HWND.lock() {
-            *slot = Some(hwnd.0 as isize);
+        let hwnd_raw = hwnd.0 as isize;
+        if let Ok(mut list) = BEDIT_HWNDS.lock() {
+            list.push(hwnd_raw);
+        }
+        // First-created bedit becomes the active one immediately,
+        // so the startup file load + initial run-check are routed
+        // correctly. Subsequent windows take focus when the user
+        // clicks into them.
+        if let Ok(mut active) = ACTIVE_BEDIT.lock() {
+            *active = Some(hwnd_raw);
         }
         return unsafe { DefMDIChildProcW(hwnd, msg, wparam, lparam) };
     }
@@ -2508,6 +2513,13 @@ unsafe extern "system" fn bedit_wnd_proc(
             LRESULT(0)
         }
         WM_SETFOCUS | WM_MDIACTIVATE => {
+            // Track the most-recently-focused bedit. `snapshot_buffer`
+            // / `run_check_in_singleton` / Ctrl+R target this one so
+            // "the buffer the user just clicked into" is the one
+            // that gets acted on.
+            if let Ok(mut active) = ACTIVE_BEDIT.lock() {
+                *active = Some(hwnd.0 as isize);
+            }
             state.invalidate();
             unsafe { DefMDIChildProcW(hwnd, msg, wparam, lparam) }
         }
@@ -2535,12 +2547,22 @@ unsafe extern "system" fn bedit_wnd_proc(
             LRESULT(0)
         }
         WM_NCDESTROY => {
-            // Drop the heap state. Clear singleton slot if it matches.
+            // Drop the heap state, then remove this window from
+            // both the registry and the active slot (if it was the
+            // active one — promote a survivor when possible so the
+            // user keeps having a notion of "current buffer").
             let _ = unsafe { Box::from_raw(state_ptr) };
             unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) };
-            if let Ok(mut slot) = BEDIT_HWND.lock() {
-                if matches!(*slot, Some(h) if h == hwnd.0 as isize) {
-                    *slot = None;
+            let raw = hwnd.0 as isize;
+            if let Ok(mut list) = BEDIT_HWNDS.lock() {
+                list.retain(|h| *h != raw);
+            }
+            if let Ok(mut active) = ACTIVE_BEDIT.lock() {
+                if matches!(*active, Some(h) if h == raw) {
+                    // Pick any surviving bedit as the new active one
+                    // so a save / snapshot during teardown still has
+                    // a sensible target.
+                    *active = BEDIT_HWNDS.lock().ok().and_then(|l| l.last().copied());
                 }
             }
             unsafe { DefMDIChildProcW(hwnd, msg, wparam, lparam) }
@@ -2696,6 +2718,19 @@ fn handle_char(state: &mut ReditState, c: char) {
         0x06 => {
             // Ctrl+F — open Find prompt.
             state.open_find();
+            return;
+        }
+        0x0E => {
+            // Ctrl+N — open a new empty bedit window. Each window
+            // has its own buffer, cursor, undo, file path. The new
+            // window starts focused (and thus becomes ACTIVE_BEDIT)
+            // so subsequent Ctrl+R / Ctrl+S act on it.
+            use windows::Win32::UI::WindowsAndMessaging::GetParent;
+            let mdi_client = unsafe { GetParent(state.hwnd) }.unwrap_or_default();
+            let frame = unsafe { GetParent(mdi_client) }.unwrap_or_default();
+            if !mdi_client.is_invalid() {
+                open(frame, mdi_client);
+            }
             return;
         }
         0x08 => {
