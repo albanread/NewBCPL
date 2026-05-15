@@ -1943,9 +1943,16 @@ impl<'a> Lowerer<'a> {
             Expr::StringLit { value, .. } => Value::Const(Const::String(value.clone())),
             Expr::Null { .. } => Value::Const(Const::Null),
             Expr::CharLit { lexeme, .. } => {
-                // For now, keep char literals as their lexeme via the
-                // string-table; codegen can decode the BCPL escape.
-                Value::Const(Const::String(lexeme.clone()))
+                // Decode the BCPL char literal to its integer byte
+                // value at IR time. `BCPL syntax.md` §1.4 says a
+                // character constant evaluates to the integer code of
+                // the character; our user guide §2.6 fixes that to a
+                // UTF-8 byte for our dialect. Escape forms per §1.3:
+                //   *N / *n → 10   *T / *t → 9    *S / *s → 32
+                //   *B / *b → 8    *P / *p → 12   *C / *c → 13
+                //   *"      → 34   **      → 42
+                // Anything else is a literal one-byte body.
+                Value::Const(Const::Int(decode_char_lexeme(lexeme)))
             }
             Expr::Ident { name, .. } => self.lower_ident(name, e.hint()),
             Expr::Binary { op, lhs, rhs, .. } => {
@@ -2877,6 +2884,45 @@ pub fn mangle_method(class_name: &str, method_name: &str) -> String {
 /// collapses to just `start`. Returns the inner expressions in
 /// source order; `width` is `None` when omitted (the language
 /// defaults that to one bit).
+/// Decode a BCPL character-literal lexeme (with the surrounding
+/// quotes still attached, e.g. `'A'`, `'*N'`, `'**'`) to its
+/// integer byte value. The eight escape forms are listed in
+/// `BCPL syntax.md` §1.3 and apply to character constants per §1.4;
+/// anything else is the literal byte of the body. UTF-8 multibyte
+/// glyphs can't appear in a char literal — the lexer's
+/// `lex_character` only consumes a single body byte, so a multibyte
+/// sequence would have failed to lex before reaching us.
+fn decode_char_lexeme(lexeme: &str) -> i64 {
+    // Strip the opening `'` and trailing `'`; what's left is the
+    // body (1 byte for a plain char, 2 bytes for an escape).
+    let bytes = lexeme.as_bytes();
+    if bytes.len() < 3 || bytes[0] != b'\'' || bytes[bytes.len() - 1] != b'\'' {
+        // Malformed lexeme — return 0 rather than panic. Sema/lex
+        // should have rejected this earlier; we don't want a bad
+        // lexeme to crash codegen.
+        return 0;
+    }
+    let body = &bytes[1..bytes.len() - 1];
+    match body {
+        [b'*', b'n'] | [b'*', b'N'] => 10,
+        [b'*', b't'] | [b'*', b'T'] => 9,
+        [b'*', b's'] | [b'*', b'S'] => 32,
+        [b'*', b'b'] | [b'*', b'B'] => 8,
+        [b'*', b'p'] | [b'*', b'P'] => 12,
+        [b'*', b'c'] | [b'*', b'C'] => 13,
+        [b'*', b'"'] => 34,
+        [b'*', b'*'] => 42,
+        [b'*', b'\''] => 39,
+        // Single literal byte — return as i64.
+        [c] => *c as i64,
+        // Unrecognised escape — return the second byte as-is so we
+        // don't silently corrupt the value. A future extension might
+        // add more escapes here.
+        [b'*', c] => *c as i64,
+        _ => 0,
+    }
+}
+
 fn bitfield_split(rhs: &Expr) -> (&Expr, Option<&Expr>) {
     if let Expr::Binary {
         op: BinaryOp::Bitfield,

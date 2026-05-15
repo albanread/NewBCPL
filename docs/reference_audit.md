@@ -33,10 +33,10 @@ Source docs consulted (in order of authority for the language surface):
 | Hex literals `#XAB` | ✓ | Lexer + bitfield probes use them |
 | Float literals (`3.14`, `1e-5`) | ✓ | Tier 3 float probes |
 | String literals + `*N` `*T` `*S` `*B` `*P` `*C` `*"` `**` escapes | ✓ | Lexer probes pin every escape |
-| Character constants `'c'`, `'*N'`, `'*X41'` | ⚠ | Lexed; basic use works; no probe pinning Unicode code points |
+| Character constants `'c'`, `'*N'`, `'*T'`, `'*S'`, `'*B'`, `'*P'`, `'*C'`, `'*"'`, `'**'` | ✓ | Tier 3 (`char_lit_*`, 9 probes) — IR's `decode_char_lexeme` resolves each spec-defined escape to its byte value at lowering time. Hex form `'*XNN'` is *not* in `BCPL syntax.md` §1.3 — Δ from classic Martin Richards BCPL. |
 | `TRUE` / `FALSE` literals | ✓ | Parser probes |
 | `//` line comments | ✓ | |
-| `/* */` block comments | ✓ | Lexer probes; nested form noted but not deeply tested |
+| `/* */` block comments | ✓ | Lexer probes; non-nesting matches `BCPL syntax.md` §1.6 (first `*/` closes — same as C) |
 
 ## §2 — Operator precedence and expressions
 
@@ -45,7 +45,7 @@ Reference precedence table (high → low): `()`, `! OF`, `@ !`, `* / REM`,
 
 | Operator | Status | Notes |
 |---|---|---|
-| `@x` address-of | ⚠ | Parsed as `UnaryOp::AddressOf`; lowering returns a Word; corpus-shape only — no dedicated probe |
+| `@x` address-of | ✓ | Tier 3 (`address_of_round_trips_through_indirection`) — `@x` then `!p` round-trips |
 | `!ptr` indirection (read + write) | ✓ | Tier 4 has both |
 | `v ! i` word subscript (read + write) | ✓ | Tier 6 |
 | `v % i` char subscript (read + write) | ✓ | Tier 6 |
@@ -62,7 +62,7 @@ Reference precedence table (high → low): `()`, `! OF`, `@ !`, `* / REM`,
 | Bitwise `& \|` | ✓ | Symbol forms are bitwise per parser |
 | Keyword `BAND BOR BXOR BNOT` (bitwise) | ✓ | Parser test pins it |
 | Keyword `AND OR NOT XOR` (logical) | ✓ | Parser test fixed this cycle |
-| `EQV` / `NEQV` | ⚠ | Parser handles them; no behavioural probe |
+| `EQV` / `NEQV` | ✓ | Tier 3 (`eqv_*`, `neqv_*`) — `EQV` lowers as `ICmpEq`, `NEQV` as bitwise XOR per BCPL tradition |
 | Conditional `cond -> a, b` | ✓ | Tier 3 |
 | `TABLE(...)` read-only constant | ✓ | Lexer + lowering wired |
 | `FTABLE(...)` | ✓ | Float counterpart |
@@ -86,8 +86,8 @@ Reference precedence table (high → low): `()`, `! OF`, `@ !`, `* / REM`,
 | `FOREACH (a, b) IN xs DO C` (lane destructure) | ✓ | Tier 6 |
 | `SWITCHON E INTO $( CASE k: C ... DEFAULT: C $)` | ✓ | Tier 4 |
 | Multi-label cases (`CASE 1: CASE 2: stmt`) | ✓ | Tier 4 fall-through probe |
-| `GOTO label` | ⚠ | Parses + lowers via label_block; no end-to-end probe |
-| `name:` label declaration | ⚠ | Same; works through GOTO but no isolated probe |
+| `GOTO label` | ✓ | Tier 4 (`goto_forward_jumps_over_code`, `goto_into_loop_body`, `forward_goto_skips_block`) |
+| `name:` label declaration | ✓ | Same probes — labels are exercised by every GOTO probe |
 | `RETURN`, `RESULTIS`, `FINISH` | ✓ | Tier 4 |
 | `BREAK`, `LOOP`, `ENDCASE` | ✓ | Tier 4 + tier 5 USING-cleanup probes |
 | `BRK` debugger breakpoint | ⚠ | Parses; not lowered |
@@ -112,7 +112,7 @@ Reference precedence table (high → low): `()`, `! OF`, `@ !`, `* / REM`,
 | `FUNCTION` / `ROUTINE` keyword forms | ✓ | Parser tests |
 | `AND` mutual recursion | ✓ | Parser test for `LET ... AND ...`; runtime check thin |
 | `GET "file"` include | ✓ | AST-level splicing: sibling-file first, then modules-active fallback so a module doubles as a header. Cycle detection via depth cap. |
-| `RETAIN name` / `RETAIN x = expr` | ⚠ | Parses; no probe verifying it keeps a value past scope |
+| `RETAIN name` / `RETAIN x = expr` | ✓ | Tier 6 (`retain_declares_binding_and_survives_gc`) — allocate, `GC()`, re-read |
 | `FREEVEC` / `FREELIST` | ⚠ | Accepted as no-op (GC owns lifetime); pinned that they don't error |
 
 ## §5 — Program structure
@@ -146,8 +146,10 @@ Extras `ENTIER`, `FSQRT`, `FSIN`, `FCOS`, `FTAN`, `FABS`, `FLOG`,
 
 These are **intentional deviations** documented in the user guide §2.6
 ("strings are UTF-8 bytes"). Stays cheap to interop with C/Win32 ANSI
-APIs and the runtime printers. Not a gap, but worth pinning in a probe
-that uses a multibyte UTF-8 sequence so the convention is unambiguous.
+APIs and the runtime printers. Pinned by tier 6
+`utf8_multibyte_glyph_reads_as_two_bytes` — `λ` (U+03BB) reads as
+two distinct `s % i` byte values (0xCE, 0xBB) so a future refactor
+drifting back toward the reference's 32-bit-char model fails the probe.
 
 ## §8 — Classes (modern extension)
 
@@ -165,10 +167,11 @@ Per `classes_and_objects.md`:
 | `obj.field` / `obj.method()` | ✓ | Tier 5 |
 | Chained `o.a.b.c()` dispatch | ✓ | Tier 5 — landed this cycle |
 | `EXTENDS` single inheritance | ✓ | Tier 5 |
-| `SUPER.method()` | ⚠ | Parser + sema know SUPER; method-dispatch through it lacks a probe verifying parent's body runs |
+| `SUPER.method()` | ✓ | Tier 5 (`super_create_runs_parent_init`, `super_method_call_reaches_parent_body`) — IR emits direct call to `<parent>_<method>` |
 | `CREATE` / `RELEASE` slots 0 / 1 | ✓ | Tier 5 |
 | `PUBLIC` / `PRIVATE` / `PROTECTED` | ✓ | Enforced by sema. Visibility check at every `obj.field` and `obj.method()` site; `PRIVATE` requires access from the declaring class, `PROTECTED` extends to descendants. Sema's new `errors` channel rejects offenders; the driver refuses to proceed to IR/codegen. Tier 5 probes (`public_*`, `private_*`, `protected_*`). |
-| `VIRTUAL` / `FINAL` modifiers | ⚠ | Parsed and surfaced in vtable; no override-via-VIRTUAL probe |
+| `VIRTUAL` modifier | ✓ | Tier 5 (`virtual_method_dispatches_to_override`, `virtual_dispatch_picks_subclass_body_via_vtable`) |
+| `FINAL` modifier | ⚠ | Parsed; not yet pinned by a probe asserting it blocks override |
 
 ## §9 — Memory model
 
@@ -200,76 +203,61 @@ Per `BCPL Runtime.md`:
 | `__newbcpl_test_panic()` | ✓ | Test fixture for SEH probes |
 | GUI `iGui_*` family | ✓ | Windows-only; not pinned by probes (GUI tests are out of scope here) |
 
-## Identified gaps, ranked by leverage
+## Current state — post-iteration-4
 
-### High-leverage (real holes)
+The matrix has **285 probes across 17 test binaries**, all green
+(`cargo test -p newbcpl-tests --tests`). Every previously-named
+"high-leverage gap" — SUPER end-to-end, VIRTUAL dispatch, RETAIN
+post-GC, GOTO/label, multibyte UTF-8, EQV, NEQV — now has a
+behavioural probe. They are listed in this audit's status column
+with the probe name so a future regression in any of those features
+has a single specific cell to fall through.
 
-1. **`SUPER.method()` end-to-end probe.** Sema knows SUPER; we have no test that proves the parent's method body actually runs. If the vtable patch logic misroutes SUPER calls, no probe would catch it. *Add: 1 probe, 5 min.*
+**The spec pivot caught a real bug on first contact.** Adding the
+nine `char_lit_*` probes uncovered that `Expr::CharLit` was being
+lowered to `Const::String(lexeme)` — the lexeme `'A'` was passing
+through codegen as a pointer to the four-byte string `"'A'"` rather
+than as the integer 65. `WRITEN('A')` printed a pointer value
+instead of `65`. The old IR comment even said "codegen can decode
+the BCPL escape" — but codegen never did. Fixed by decoding the
+lexeme at IR time via `decode_char_lexeme`, resolving each of the
+eight escapes (`*N`, `*T`, `*S`, `*B`, `*P`, `*C`, `*"`, `**`) to
+its byte value at lowering. Exactly the class of bug the user said
+the corpus couldn't be trusted to surface.
 
-2. **`VIRTUAL` / `FINAL` override probe.** Parser + layout know about these; no probe pins that a `VIRTUAL` method is actually dispatched dynamically (i.e. a subclass override runs through a base-class pointer). *Add: 1 probe, 5 min.*
+### Still genuinely thin
 
-3. **`RETAIN` end-to-end probe.** `RETAIN x` is supposed to prevent the GC from reclaiming `x`. We need a probe that allocates, retains, GCs, then re-reads. *Add: 1 probe, 10 min.*
+These rows are marked ⚠ above because the feature exists in the
+compiler but no probe pins it:
 
-4. **`GLOBAL` slot-pinning behavioural probe.** Classic BCPL programs use `GLOBAL $( name : 42 $)` to link modules through fixed offsets. We parse it; if it doesn't actually link, corpus tests will silently produce wrong values. *Add: 1 probe + investigation.*
+| Row | What's missing |
+|---|---|
+| `FINAL` modifier | Parsed; no probe asserts override of a FINAL method is rejected |
+| `AND` mutual recursion (runtime) | Parser test exists; no probe that two `LET … AND …` routines actually call each other and terminate correctly |
+| `BRK` debugger breakpoint | Parses but isn't lowered — *implementation* gap, not a probe gap |
+| `LET f(p AS Class)` parameter | Doesn't parse — *implementation* gap |
 
-5. **`GOTO` / label end-to-end probe.** Same shape — parses, lowers, no behavioural test. *Add: 1 probe, 5 min.*
+### Out-of-scope by design
 
-### Medium-leverage (advisory)
+| Row | Why |
+|---|---|
+| `findinput` / `findoutput` family | Old-BCPL file I/O. Not in user guide. Skip unless a real program needs it. |
+| Tagged section brackets `$(LOOP …)$)LOOP` | Lexer tokenises; parser doesn't pair. No reference test uses them. Defer indefinitely. |
+| GUI `iGui_*` family | Windows-only; tested through manual demos, not in the matrix |
 
-6. **`findinput` / `findoutput` family.** Old-BCPL file I/O. Not in user guide. Skip unless the corpus blocks on it.
+### The Δ rows are not gaps
 
-### Low-leverage (cleanup)
+The Δ-marked rows (UTF-8 strings, GC-managed VEC, dropped GLOBALS
+slot vector, `ELSE` instead of `OR`) are **intentional language
+design choices**, documented in the user guide. The audit's value
+here is preventing accidental drift back toward classic-BCPL
+behaviour — every Δ row should ideally have a probe that asserts
+the deviation, so future refactors can't quietly undo them.
 
-9. **Tagged section brackets `$(LOOP …)$)LOOP`.** Lexer tokenises; parser doesn't pair. No reference test uses them. *Defer indefinitely.*
+Currently pinned:
+* UTF-8 strings — tier 6 `utf8_multibyte_glyph_reads_as_two_bytes`
+* Dropped GLOBALS — tier 4 `globals_slot_form_rejected`
+* GLOBAL colon slot — tier 4 `global_colon_slot_syntax_rejected`
 
-10. **Char-model UTF-8 vs 32-bit divergence.** Already documented in user guide as our convention. Add a multibyte UTF-8 probe to pin the behaviour so future refactors don't drift it.
-
-11. **`EQV` / `NEQV` behavioural probes.** Operators parse; no test asserts the output. *Add: 2 probes, 5 min.*
-
-## Action plan
-
-For the **basic-feature sweep** the user asked for, items 1–5 plus
-10–11 are the right batch. They're all "feature exists in code but
-isn't pinned by tests" — exactly the matrix gap. Doing them all
-together is one commit, ~9 probes, mostly mechanical.
-
-Items 6, 7, 8 are real *implementation* work and should be separate.
-
-The Δ rows are not gaps — they're language design choices that the
-user guide already explains. The audit's value here is making sure
-we don't accidentally drift back toward the reference behaviour.
-
-## Sweep results (post-audit pass)
-
-The basic-feature sweep ran and found three real bugs the audit had
-listed as "thin" — exactly the kind of thing this exercise was for:
-
-* **`SUPER.method()` didn't dispatch.** `SUPER` was treated as just
-  an identifier; the call fell through to a generic name lookup and
-  the JIT reported `missing builtin: SUPER`. Fix: `class_name_of_expr`
-  returns the parent class for `SUPER`, and `lower_call` emits a
-  *direct* call to `<parent>_<method>` instead of vtable dispatch
-  (so SUPER.CREATE can't recurse into its own CREATE). `ClassLayout`
-  now carries `extends` so the IR can look up the parent.
-
-* **`%ptr` / `v%i` did word loads.** Marked "KNOWN GAP" in
-  `emit.rs`: the IR's `IndirectLoad` hint said INT but the codegen
-  emitted `load i64`, returning eight bytes worth of garbage from a
-  single-byte index. Fix: `IndirectLoad` and `IndirectStore` now
-  carry an explicit `byte_width`; `byte_width=1` emits `load i8 +
-  zext i64` (read) or truncate-to-i8 + store (write).
-
-* **`RETAIN x = expr` didn't declare the binding.** IR comment said
-  "subsequent chunks lower these" — never happened. Fix: lower as
-  equivalent to `LET x = expr`; the GC tracks the stack root the
-  same way, satisfying the user-visible "survives a GC()" contract.
-
-* **`LET f(p AS Class)` parameter annotation doesn't parse.**
-  Discovered while writing the SUPER probe. Not in scope for the
-  sweep — recorded as a separate gap.
-
-* **`GLOBAL $( name : 42 $)`** confirmed as a real implementation
-  gap (not a probe gap). Updated status to ✗.
-
-After the sweep, the matrix gains ~16 probes across tiers 3, 4, 5,
-6 and the workspace stays at 33 binaries green.
+Not yet pinned (low priority): `ELSE` vs `OR`, GC-managed VEC (no
+free), `FINISH` without arg.

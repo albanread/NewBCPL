@@ -465,3 +465,106 @@ fn address_of_round_trips_through_indirection() {
         "99",
     );
 }
+
+// ─── Character literals + escape forms ────────────────────────────
+//
+// `BCPL syntax.md` §1.3-1.4 names eight escape sequences inside
+// character literals: `*N` `*T` `*S` `*B` `*P` `*C` `*"` `**`.
+// A plain `'A'` evaluates to the integer value of the character
+// (65, since strings/chars are UTF-8 bytes in our dialect — see
+// user guide §2.6 for the deviation from the reference's 32-bit
+// model). Each escape resolves to its canonical byte value; if a
+// future lexer refactor drops one of these the corresponding probe
+// fails with a clean stdout diff.
+
+#[test]
+fn char_lit_plain_ascii() {
+    // `'A'` is the literal byte 0x41 = 65.
+    expect(
+        "char_lit_plain_ascii",
+        "LET START() BE $( WRITEN('A') $)\n",
+        "65",
+    );
+}
+
+#[test]
+fn char_lit_escape_newline() {
+    // `'*N'` = 10 (LF).
+    expect(
+        "char_lit_escape_newline",
+        "LET START() BE $( WRITEN('*N') $)\n",
+        "10",
+    );
+}
+
+#[test]
+fn char_lit_escape_tab() {
+    // `'*T'` = 9.
+    expect(
+        "char_lit_escape_tab",
+        "LET START() BE $( WRITEN('*T') $)\n",
+        "9",
+    );
+}
+
+#[test]
+fn char_lit_escape_space() {
+    // `'*S'` = 32. Not strictly an escape (a literal space works
+    // too), but the spec names it — pin the canonical value.
+    expect(
+        "char_lit_escape_space",
+        "LET START() BE $( WRITEN('*S') $)\n",
+        "32",
+    );
+}
+
+#[test]
+fn char_lit_escape_backspace() {
+    // `'*B'` = 8.
+    expect(
+        "char_lit_escape_backspace",
+        "LET START() BE $( WRITEN('*B') $)\n",
+        "8",
+    );
+}
+
+#[test]
+fn char_lit_escape_newpage() {
+    // `'*P'` = 12 (form feed).
+    expect(
+        "char_lit_escape_newpage",
+        "LET START() BE $( WRITEN('*P') $)\n",
+        "12",
+    );
+}
+
+#[test]
+fn char_lit_escape_carriage_return() {
+    // `'*C'` = 13.
+    expect(
+        "char_lit_escape_carriage_return",
+        "LET START() BE $( WRITEN('*C') $)\n",
+        "13",
+    );
+}
+
+#[test]
+fn char_lit_escape_double_quote() {
+    // `'*"'` = 34. The escape is needed inside string literals but
+    // the spec extends it to char constants for consistency.
+    expect(
+        "char_lit_escape_double_quote",
+        "LET START() BE $( WRITEN('*\"') $)\n",
+        "34",
+    );
+}
+
+#[test]
+fn char_lit_escape_asterisk() {
+    // `'**'` = 42. The doubled-star self-escape.
+    expect(
+        "char_lit_escape_asterisk",
+        "LET START() BE $( WRITEN('**') $)\n",
+        "42",
+    );
+}
