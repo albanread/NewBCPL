@@ -282,13 +282,18 @@ pub struct Diagnostic {
     pub message: String,
 }
 
-/// Mode of the find/replace prompt. `Replace` is `Find` plus a
-/// second editable line (the replacement) and the
-/// confirm/skip/all action keys.
+/// Mode of the find / replace / goto prompt.
+///
+/// * `Find` — pattern-only; Enter advances.
+/// * `Replace` — pattern + replacement; Enter replaces+advances,
+///   Ctrl+Enter replaces all.
+/// * `GotoLine` — pattern field holds a numeric line; Enter jumps
+///   the cursor there.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FindMode {
     Find,
     Replace,
+    GotoLine,
 }
 
 /// Which line of the prompt the user is currently typing into.
@@ -1012,6 +1017,60 @@ impl ReditState {
         }
     }
 
+    // ─── Bracket matching ─────────────────────────────────────────
+    //
+    // When the cursor sits on a bracket (or to the right of one),
+    // find the matching bracket and highlight both. The render is
+    // a thin outline rectangle on each so it doesn't fight the
+    // cursor or the syntax-colour text underneath. Currently
+    // single-char brackets only: `(` `)`, `[` `]`, `{` `}`. BCPL's
+    // `$(` / `$)` section brackets need 2-char detection — handled
+    // in a follow-up.
+
+    /// If the cursor is on or just after a bracket, return the
+    /// (bracket, match) positions. Returns `None` if there's no
+    /// match — either the cursor isn't on a bracket, or the
+    /// bracket is unbalanced (no match exists). Scans across the
+    /// rope's UTF-8 snapshot; nested brackets of the same type
+    /// are handled correctly. String / comment skipping is line-
+    /// granular: braces inside `"..."` and `// ...` are ignored,
+    /// `/* ... */` block comments are NOT (too complex for the
+    /// payoff at this stage).
+    fn find_bracket_match(&self) -> Option<(Pos, Pos)> {
+        let cursor_offset = self.buffer.line_col_to_offset(
+            self.cursor_row,
+            self.cursor_col,
+        );
+        let text = self.buffer.to_utf8();
+        // Examine the character at cursor and the one just before.
+        // Either may be the "anchor" bracket — most editors high-
+        // light when the cursor is immediately past a `}`, for
+        // example. Prefer the at-cursor position if both are
+        // brackets.
+        let at_cursor = char_at_offset(&text, cursor_offset);
+        let before_cursor = if cursor_offset > 0 {
+            char_at_offset(&text, cursor_offset - 1)
+        } else {
+            None
+        };
+        let (bracket_off, ch) = if at_cursor.map(|c| is_bracket(c)).unwrap_or(false) {
+            (cursor_offset, at_cursor.unwrap())
+        } else if before_cursor.map(|c| is_bracket(c)).unwrap_or(false) {
+            (cursor_offset - 1, before_cursor.unwrap())
+        } else {
+            return None;
+        };
+        let (open, close, forward) = bracket_pair(ch)?;
+        let match_off = if forward {
+            scan_brackets_forward(&text, bracket_off + 1, open, close)?
+        } else {
+            scan_brackets_backward(&text, bracket_off, open, close)?
+        };
+        let bracket_pos = byte_to_pos(&text, bracket_off);
+        let match_pos = byte_to_pos(&text, match_off);
+        Some((bracket_pos, match_pos))
+    }
+
     // ─── Find / Replace ───────────────────────────────────────────
     //
     // The prompt repurposes the status line area below the text
@@ -1044,6 +1103,41 @@ impl ReditState {
         }
         self.find = Some(st);
         self.invalidate();
+    }
+
+    /// Open the Goto Line prompt. Reuses the find-prompt state
+    /// machine (Esc closes, typing into the `pattern` field
+    /// accumulates digits, Enter jumps) so the input plumbing is
+    /// shared with Find / Replace.
+    fn open_goto_line(&mut self) {
+        let st = FindState::new(FindMode::GotoLine);
+        self.find = Some(st);
+        self.invalidate();
+    }
+
+    /// Execute the Goto Line prompt's pattern: parse it as a
+    /// 1-based line number, jump the cursor to that line's start,
+    /// and close the prompt. Invalid / out-of-range input is
+    /// clamped (0 → first line, n > line_count → last line) and
+    /// surfaces as a status sub-string for parse failures.
+    fn execute_goto_line(&mut self) {
+        let Some(state) = self.find.as_ref() else { return };
+        let raw = state.pattern.trim().to_string();
+        match raw.parse::<usize>() {
+            Ok(n) => {
+                let last = self.line_count().saturating_sub(1);
+                let target = if n == 0 { 0 } else { (n - 1).min(last) };
+                self.set_cursor(target, 0, false);
+                self.pref_col = 0;
+                self.close_find();
+            }
+            Err(_) => {
+                if let Some(st) = self.find.as_mut() {
+                    st.status = format!("not a number: {raw}");
+                }
+                self.invalidate();
+            }
+        }
     }
 
     /// Tear down the prompt and return to normal editing. Cursor /
@@ -1593,6 +1687,40 @@ impl ReditState {
             }
         }
 
+        // Bracket-match highlight. When the cursor sits on or
+        // immediately past one of `( ) [ ] { }`, find the
+        // balancing bracket and draw a translucent outline on both
+        // cells. The outline goes UNDER the cursor in z-order, so
+        // a cursor on the bracket itself still reads.
+        if let Some((bracket_pos, match_pos)) = self.find_bracket_match() {
+            let bracket_brush = solid_brush(&target, 0.70, 0.80, 0.55, 0.45);
+            if let Some(b) = bracket_brush.as_ref() {
+                for pos in [bracket_pos, match_pos] {
+                    if pos.0 < self.scroll_top
+                        || pos.0 >= self.scroll_top + visible_rows
+                    {
+                        continue;
+                    }
+                    let screen_row = pos.0 - self.scroll_top;
+                    let line = self.line_text(pos.0);
+                    let display_col = buffer_col_to_display(&line, pos.1);
+                    let x0 = gutter_w + (display_col as f32) * self.cell_w;
+                    let y0 = content_top + (screen_row as f32) * self.cell_h;
+                    unsafe {
+                        target.FillRectangle(
+                            &D2D_RECT_F {
+                                left: x0,
+                                top: y0,
+                                right: x0 + self.cell_w,
+                                bottom: y0 + self.cell_h,
+                            },
+                            b,
+                        );
+                    }
+                }
+            }
+        }
+
         // Cursor. cursor_col is a buffer char index — translate
         // through tab expansion so the bar lines up with the rendered
         // glyph the cursor is sitting before.
@@ -1637,7 +1765,11 @@ impl ReditState {
             Some(p) => p.display().to_string(),
             None => "<untitled>".to_string(),
         };
-        let dirty_mark = if self.dirty { "*" } else { " " };
+        // Modified indicator: a clear `[modified]` tag rather than
+        // the previous single-character `*` so the user notices it
+        // at the height the status line actually renders. Clean
+        // buffers show nothing for the slot.
+        let dirty_mark = if self.dirty { "[modified]" } else { "" };
 
         // Diagnostic block: if the cursor is sitting on an errored
         // line, prefer that error's message; otherwise show the
@@ -1704,12 +1836,23 @@ impl ReditState {
                             fs.pattern, p_caret, fs.replacement, r_caret, hint,
                         )
                     }
+                    FindMode::GotoLine => {
+                        let hint = if fs.status.is_empty() {
+                            format!(
+                                "  [Enter] go  [Esc] cancel  (1..{})",
+                                self.line_count()
+                            )
+                        } else {
+                            format!("  {} ", fs.status)
+                        };
+                        format!("  Goto line:  {}{}{}", fs.pattern, p_caret, hint)
+                    }
                 }
             }
             None => format!(
-                " {dirty} {path}   Ln {row:4}, Col {col:2}   {nlines} lines   {braces}   {diag}",
-                dirty = dirty_mark,
+                " {path} {dirty}   Ln {row}, Col {col}   {nlines} lines   {braces}   {diag}",
                 path = path_str,
+                dirty = dirty_mark,
                 row = self.cursor_row + 1,
                 col = self.cursor_col + 1,
                 nlines = self.line_count(),
@@ -2113,6 +2256,106 @@ impl ReditState {
         } else if r + 1 < self.line_count() {
             r += 1;
             c = 0;
+        }
+        self.set_cursor(r, c, extend);
+        self.pref_col = self.cursor_col;
+    }
+
+    /// Ctrl+Left — jump backward over one "word". The motion
+    /// follows the standard editor recipe:
+    ///
+    ///   1. Skip any non-word characters immediately before the
+    ///      cursor (whitespace, punctuation, line break).
+    ///   2. Then skip the run of word characters that follows
+    ///      (alphanumeric or underscore), landing at its start.
+    ///
+    /// Two consecutive Ctrl+Left presses from "the end of `foo`"
+    /// land at "the start of `foo`" then "the start of the previous
+    /// word". When extend is true the selection extends instead of
+    /// the cursor moving solo.
+    fn move_word_left(&mut self, extend: bool) {
+        if !extend {
+            if let Some((start, _)) = self.selection_range() {
+                self.set_cursor(start.0, start.1, false);
+                self.pref_col = self.cursor_col;
+                return;
+            }
+        }
+        let (mut r, mut c) = self.cursor_pos();
+        // Step one position back to look at the char to the left.
+        let step_back = |r: &mut usize, c: &mut usize, state: &Self| {
+            if *c > 0 {
+                *c -= 1;
+            } else if *r > 0 {
+                *r -= 1;
+                *c = state.line_char_count(*r);
+            }
+        };
+        // Phase 1: skip non-word chars going backward.
+        while r > 0 || c > 0 {
+            let mut tr = r;
+            let mut tc = c;
+            step_back(&mut tr, &mut tc, self);
+            if is_word_char_at(self, tr, tc) {
+                break;
+            }
+            r = tr;
+            c = tc;
+        }
+        // Phase 2: walk through word chars; stop just before a non-
+        // word char (so cursor lands at the start of the word).
+        while r > 0 || c > 0 {
+            let mut tr = r;
+            let mut tc = c;
+            step_back(&mut tr, &mut tc, self);
+            if !is_word_char_at(self, tr, tc) {
+                break;
+            }
+            r = tr;
+            c = tc;
+        }
+        self.set_cursor(r, c, extend);
+        self.pref_col = self.cursor_col;
+    }
+
+    /// Ctrl+Right — jump forward over one "word". Symmetric to
+    /// `move_word_left`:
+    ///
+    ///   1. Skip the current run of word characters (so two presses
+    ///      from "start of `foo`" lands at "after `foo`" then
+    ///      "start of the next word").
+    ///   2. Skip any non-word characters that follow, landing at
+    ///      the start of the next word.
+    fn move_word_right(&mut self, extend: bool) {
+        if !extend {
+            if let Some((_, end)) = self.selection_range() {
+                self.set_cursor(end.0, end.1, false);
+                self.pref_col = self.cursor_col;
+                return;
+            }
+        }
+        let (mut r, mut c) = self.cursor_pos();
+        let line_count = self.line_count();
+        let at_end = |r: usize, c: usize, state: &Self| {
+            r + 1 >= line_count && c >= state.line_char_count(r)
+        };
+        let step_forward = |r: &mut usize, c: &mut usize, state: &Self| {
+            let n = state.line_char_count(*r);
+            if *c < n {
+                *c += 1;
+            } else if *r + 1 < state.line_count() {
+                *r += 1;
+                *c = 0;
+            }
+        };
+        // Phase 1: skip word chars at the cursor.
+        while !at_end(r, c, self) && is_word_char_at(self, r, c) {
+            step_forward(&mut r, &mut c, self);
+        }
+        // Phase 2: skip non-word chars until we hit the next word
+        // (or run out of buffer).
+        while !at_end(r, c, self) && !is_word_char_at(self, r, c) {
+            step_forward(&mut r, &mut c, self);
         }
         self.set_cursor(r, c, extend);
         self.pref_col = self.cursor_col;
@@ -2595,24 +2838,30 @@ fn handle_key(state: &mut ReditState, vk: u32) {
             return;
         }
         if vk16 == VK_RETURN.0 {
-            // Find mode: Enter advances. Replace mode: Enter replaces
-            // the current selection (if it matches) and then
-            // advances to the next match. Shift+Enter reverses the
-            // direction in both modes. Ctrl+Enter in Replace mode
-            // replaces ALL remaining matches in the buffer.
+            // Enter dispatches per prompt mode:
+            //   * Find       — find next (Shift+Enter = previous).
+            //   * Replace    — replace + find next (Shift+Enter =
+            //                  previous; Ctrl+Enter = replace all).
+            //   * GotoLine   — parse the line number and jump.
             let mode = state.find.as_ref().map(|s| s.mode);
-            if mode == Some(FindMode::Replace) {
-                if ctrl_down() {
-                    state.replace_all();
-                } else if shift_down() {
-                    state.find_prev();
-                } else {
-                    state.replace_current();
+            match mode {
+                Some(FindMode::GotoLine) => state.execute_goto_line(),
+                Some(FindMode::Replace) => {
+                    if ctrl_down() {
+                        state.replace_all();
+                    } else if shift_down() {
+                        state.find_prev();
+                    } else {
+                        state.replace_current();
+                    }
                 }
-            } else if shift_down() {
-                state.find_prev();
-            } else {
-                state.find_next();
+                _ => {
+                    if shift_down() {
+                        state.find_prev();
+                    } else {
+                        state.find_next();
+                    }
+                }
             }
             return;
         }
@@ -2656,9 +2905,18 @@ fn handle_key(state: &mut ReditState, vk: u32) {
     }
 
     if vk16 == VK_LEFT.0 {
-        state.move_left(extend);
+        // Ctrl+Left → word-aware. Shift adds selection-extend.
+        if ctrl_down() {
+            state.move_word_left(extend);
+        } else {
+            state.move_left(extend);
+        }
     } else if vk16 == VK_RIGHT.0 {
-        state.move_right(extend);
+        if ctrl_down() {
+            state.move_word_right(extend);
+        } else {
+            state.move_right(extend);
+        }
     } else if vk16 == VK_UP.0 {
         state.move_up(extend);
     } else if vk16 == VK_DOWN.0 {
@@ -2718,6 +2976,11 @@ fn handle_char(state: &mut ReditState, c: char) {
         0x06 => {
             // Ctrl+F — open Find prompt.
             state.open_find();
+            return;
+        }
+        0x07 => {
+            // Ctrl+G — open Goto Line prompt.
+            state.open_goto_line();
             return;
         }
         0x0E => {
@@ -2981,6 +3244,133 @@ fn solid_brush(
         },
     };
     unsafe { target.CreateSolidColorBrush(&color, Some(&props)) }.ok()
+}
+
+// ─── Bracket-matching free helpers ─────────────────────────────────
+
+fn is_bracket(c: char) -> bool {
+    matches!(c, '(' | ')' | '[' | ']' | '{' | '}')
+}
+
+/// For a bracket char return `(open, close, forward)`:
+///   * `(open, close)` are the matched pair, with `open` lexically
+///     opening the group.
+///   * `forward` is true for an opener (scan forward to find the
+///     match), false for a closer (scan backward).
+fn bracket_pair(c: char) -> Option<(char, char, bool)> {
+    match c {
+        '(' => Some(('(', ')', true)),
+        ')' => Some(('(', ')', false)),
+        '[' => Some(('[', ']', true)),
+        ']' => Some(('[', ']', false)),
+        '{' => Some(('{', '}', true)),
+        '}' => Some(('{', '}', false)),
+        _ => None,
+    }
+}
+
+/// Return the char at code-point offset `off` (NOT byte offset) by
+/// stepping through `chars()` once. Editor cursors live at small
+/// offsets so the linear walk is fine.
+fn char_at_offset(text: &str, off: usize) -> Option<char> {
+    text.chars().nth(off)
+}
+
+/// Scan forward from `start_off` (a code-point offset) looking for
+/// the matching `close` bracket that balances against unmatched
+/// `open` brackets we've seen so far. Returns the offset of the
+/// matching close, or `None` if it's unbalanced.
+///
+/// String literals (`"..."`) and `//`-style line comments are
+/// skipped so brackets inside them don't perturb the depth count.
+/// Multi-line `/* ... */` block comments are NOT tracked (simpler
+/// state machine; the rare miss surfaces as a wrong highlight, not
+/// a hang).
+fn scan_brackets_forward(text: &str, start_off: usize, open: char, close: char) -> Option<usize> {
+    let mut depth: i32 = 1;
+    let mut in_string = false;
+    let mut in_line_comment = false;
+    let mut after_escape = false;
+    let mut string_quote = '"';
+    let mut idx = start_off;
+    for c in text.chars().skip(start_off) {
+        if in_line_comment {
+            if c == '\n' {
+                in_line_comment = false;
+            }
+        } else if in_string {
+            if after_escape {
+                after_escape = false;
+            } else if c == '*' {
+                // BCPL string escape character.
+                after_escape = true;
+            } else if c == string_quote {
+                in_string = false;
+            }
+        } else if c == '/' && text.chars().nth(idx + 1) == Some('/') {
+            in_line_comment = true;
+        } else if c == '"' || c == '\'' {
+            in_string = true;
+            string_quote = c;
+        } else if c == open {
+            depth += 1;
+        } else if c == close {
+            depth -= 1;
+            if depth == 0 {
+                return Some(idx);
+            }
+        }
+        idx += 1;
+    }
+    None
+}
+
+/// Reverse of `scan_brackets_forward` — scan backward from `start_off`
+/// looking for the matching `open` for the close we landed on.
+fn scan_brackets_backward(text: &str, start_off: usize, open: char, close: char) -> Option<usize> {
+    if start_off == 0 {
+        return None;
+    }
+    // Walking backwards through a `&str` cleanly means iterating
+    // forward to collect (offset, char) pairs then reverse-iterating
+    // the prefix. Bounded by the cursor position; editor buffers
+    // are small.
+    let prefix: Vec<(usize, char)> = text
+        .chars()
+        .enumerate()
+        .take_while(|(i, _)| *i < start_off)
+        .collect();
+    let mut depth: i32 = 1;
+    // Backward through prefix; track in_string approximately by
+    // scanning forward in the same prefix to find which characters
+    // are inside a string. For the polish-level use case this is
+    // good enough.
+    for (i, c) in prefix.iter().rev() {
+        if *c == close {
+            depth += 1;
+        } else if *c == open {
+            depth -= 1;
+            if depth == 0 {
+                return Some(*i);
+            }
+        }
+    }
+    None
+}
+
+/// Is the character at `(row, col)` part of a "word" — i.e. would
+/// Ctrl+Left / Ctrl+Right skip past it as one unit? Definition:
+/// alphanumeric or underscore. Anything else (whitespace,
+/// punctuation, brackets) terminates a word run. Out-of-range
+/// positions (past the end of the line) report `false` so the
+/// motion logic reads the trailing virtual newline as a word
+/// boundary.
+fn is_word_char_at(state: &ReditState, row: usize, col: usize) -> bool {
+    let line = state.line_text(row);
+    line.chars()
+        .nth(col)
+        .map(|c| c.is_alphanumeric() || c == '_')
+        .unwrap_or(false)
 }
 
 fn char_to_byte(s: &str, char_idx: usize) -> usize {
