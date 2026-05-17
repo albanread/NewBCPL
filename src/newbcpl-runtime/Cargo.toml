@@ -6,6 +6,17 @@ edition = "2024"
 [dependencies]
 serde_json = "1"
 
+# NewAudio (2026-05-16) — game-focused SFX synth and ABC → MIDI
+# playback. `newaudio-core` is pure Rust (preset SFX, tone / noise /
+# FM, ADSR, WAV I/O); `newaudio-abc` is pure Rust (ABC parser +
+# Standard MIDI File writer). Both compile everywhere so the
+# `audio` shim layer's slot bookkeeping works on Linux/macOS too —
+# only live playback is Windows-only. Source lives at
+# `E:\NewAudio\NewAudio\`; ported into NewBCPL after NewFB shipped
+# the same surface (mirror `newfb-runtime/src/audio.rs`).
+newaudio-core = { path = "../../../NewAudio/NewAudio/crates/newaudio-core" }
+newaudio-abc  = { path = "../../../NewAudio/NewAudio/crates/newaudio-abc" }
+
 # bcpl-wingui sits next to newbcpl-runtime in the workspace but its
 # builtins are loaded the same way as the runtime's own — the
 # runtime's `builtins::builtin_addresses()` table includes the
@@ -16,6 +27,12 @@ path = "../bcpl-wingui"
 
 [target.'cfg(windows)'.dependencies]
 windows-numerics = "0.3"
+
+# NewAudio Windows runtime — `waveOut` PCM mixer + `midiOut`
+# scheduler. Provides live playback for the `audio` module on
+# Windows. On other targets the shims still register sounds and
+# parse ABC, they just don't make noise.
+newaudio-win = { path = "../../../NewAudio/NewAudio/crates/newaudio-win" }
 
 [target.'cfg(windows)'.dependencies.windows]
 version = "0.62"

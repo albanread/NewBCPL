@@ -15,9 +15,9 @@
 use std::collections::HashMap;
 
 use newbcpl_parser::{
-    BinaryOp, Block, ClassDecl, ClassMemberKind, ClassMethod, ClassMethodBody, Decl, Expr,
-    FunctionDecl, LetDecl, Program, RoutineDecl, Span, Stmt, SwitchCase, TypeConstructorKind,
-    UnaryOp,
+    AsmProcDecl, BinaryOp, Block, ClassDecl, ClassMemberKind, ClassMethod, ClassMethodBody, Decl,
+    Expr, FunctionDecl, LetDecl, Program, RoutineDecl, Span, Stmt, SwitchCase,
+    TypeConstructorKind, UnaryOp,
 };
 use newbcpl_sema::{ClassLayout, SemaOutput, TypeHint};
 
@@ -33,6 +33,7 @@ pub fn lower(program: &Program, sema: &SemaOutput, module_name: &str) -> Module 
             Decl::Routine(r) => lowerer.lower_routine(r),
             Decl::Function(f) => lowerer.lower_function(f),
             Decl::Class(c) => lowerer.lower_class(c),
+            Decl::AsmProc(a) => lowerer.lower_asm_proc(a),
             // Top-level decls that don't produce IR functions
             // (GET / MANIFEST / STATIC / GLOBAL) are skipped — GLOBALs
             // are surfaced as `Module::globals` (collected below) for
@@ -56,11 +57,13 @@ pub fn lower(program: &Program, sema: &SemaOutput, module_name: &str) -> Module 
         functions: lowerer.functions,
         layouts: sema.layouts.clone(),
         globals,
+        asm_procs: lowerer.asm_procs,
     }
 }
 
 struct Lowerer<'a> {
     functions: Vec<Function>,
+    asm_procs: Vec<new_asm::AsmProc>,
     current: Option<Builder>,
     layouts: &'a [ClassLayout],
     /// `MANIFEST` constants from sema. Lookup in `lower_ident` for
@@ -329,6 +332,7 @@ impl<'a> Lowerer<'a> {
     ) -> Self {
         Self {
             functions: Vec::new(),
+            asm_procs: Vec::new(),
             current: None,
             layouts,
             manifests,
@@ -518,6 +522,34 @@ impl<'a> Lowerer<'a> {
 
         self.current_class = None;
         self.finish_function();
+    }
+
+    /// Lower an `ASM { }` procedure declaration.
+    ///
+    /// No IR function is created — the body goes directly into the
+    /// `asm_procs` list, which `newbcpl-llvm` will emit as a
+    /// `module asm` blob plus a matching `declare`.
+    fn lower_asm_proc(&mut self, a: &AsmProcDecl) {
+        let params = a
+            .params
+            .iter()
+            .zip(a.param_annotations.iter())
+            .map(|(name, ann)| new_asm::AsmParam {
+                name: name.clone(),
+                ty: annotation_to_asm_type(ann.as_deref()),
+            })
+            .collect();
+        let return_type = if a.is_function {
+            annotation_to_asm_ret_type(a.return_annotation.as_deref())
+        } else {
+            new_asm::AsmRetType::Void
+        };
+        self.asm_procs.push(new_asm::AsmProc {
+            name: a.name.clone(),
+            params,
+            return_type,
+            body: a.body.clone(),
+        });
     }
 
     fn start_function(&mut self, name: &str, params: &[String], return_hint: TypeHint) {
@@ -784,9 +816,6 @@ impl<'a> Lowerer<'a> {
                     hint: TypeHint::Word,
                 });
             }
-            // SWITCHON / FOREACH / labels etc. — subsequent
-            // IR-grow chunks lower these.
-            _ => {}
         }
     }
 
@@ -2983,6 +3012,51 @@ pub fn mangle_method(class_name: &str, method_name: &str) -> String {
 /// collapses to just `start`. Returns the inner expressions in
 /// source order; `width` is `None` when omitted (the language
 /// defaults that to one bit).
+/// Map an `AS Type` annotation string to the ABI register class used
+/// by ASM-procedure parameters. Packed-SIMD scalar types (PAIR, FPAIR,
+/// QUAD, etc.) travel as `i64` words in BCPL's calling convention, so
+/// they fold to `Word` here. Unknown / missing annotations default to
+/// `Word` — that gives a plain integer-register slot, which is what
+/// you want for pointers and untyped data.
+///
+/// Matching is case-insensitive: the parser preserves the source
+/// spelling so `AS FLOAT` and `AS Float` produce different annotation
+/// strings, but the canonical type name does not depend on case.
+fn annotation_to_asm_type(ann: Option<&str>) -> new_asm::AsmType {
+    let Some(s) = ann else {
+        return new_asm::AsmType::Word;
+    };
+    if s.eq_ignore_ascii_case("FLOAT") {
+        new_asm::AsmType::Float
+    } else if s.eq_ignore_ascii_case("FQUAD") {
+        new_asm::AsmType::FQuad
+    } else if s.eq_ignore_ascii_case("FOCT") {
+        new_asm::AsmType::FOct
+    } else {
+        new_asm::AsmType::Word
+    }
+}
+
+/// Map a return-type annotation string to the matching ABI return
+/// register class. Same case-insensitive matching rules as the
+/// parameter variant; the additional `Void` case is reached only
+/// from the `BE ASM` (no-return) lowering path, so it never appears
+/// as a user-written annotation here.
+fn annotation_to_asm_ret_type(ann: Option<&str>) -> new_asm::AsmRetType {
+    let Some(s) = ann else {
+        return new_asm::AsmRetType::Word;
+    };
+    if s.eq_ignore_ascii_case("FLOAT") {
+        new_asm::AsmRetType::Float
+    } else if s.eq_ignore_ascii_case("FQUAD") {
+        new_asm::AsmRetType::FQuad
+    } else if s.eq_ignore_ascii_case("FOCT") {
+        new_asm::AsmRetType::FOct
+    } else {
+        new_asm::AsmRetType::Word
+    }
+}
+
 /// Decode a BCPL character-literal lexeme (with the surrounding
 /// quotes still attached, e.g. `'A'`, `'*N'`, `'**'`) to its
 /// integer byte value. The eight escape forms are listed in

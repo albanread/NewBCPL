@@ -31,6 +31,13 @@ pub mod igui;
 #[cfg(windows)]
 pub mod igui_builtins;
 
+/// BCPL `Sound_*` / `Music_*` runtime — game-focused SFX synth and
+/// ABC → MIDI playback, backed by NewAudio. Slot bookkeeping and
+/// synthesis work on every target; live waveOut / midiOut playback
+/// is Windows-only. Mirrors the surface NewFB ships in
+/// `newfb-runtime/src/audio.rs`.
+pub mod audio;
+
 /// `BRK` statement runtime — the signal-safe state dumper invoked
 /// when user code reaches a `BRK` debugger breakpoint. Kept in its
 /// own module so the Win32 import surface stays out of the much

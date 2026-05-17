@@ -1045,5 +1045,334 @@ The output is
 
 ---
 
+## Appendix D — Extended Multimedia Support
+
+The runtime ships a slot-based audio surface backed by NewAudio: game
+SFX presets, custom oscillator / noise / FM synthesis, baked-in
+effect chains, and ABC-notation music. Synthesis and parsing work on
+every target; live `waveOut` / `midiOut` playback is Windows-only,
+and on other targets `play` calls degrade to silent no-ops while the
+slot tables still respond consistently.
+
+The user-facing names live in `modules-active/audio.bcl`. After the
+loader's `<stem>_<routine>` mangling they appear as `audio_coin`,
+`audio_play`, `audio_music_load`, … The wrappers forward to the raw
+`Sound_*` / `Music_*` runtime builtins; either spelling works in
+source.
+
+### D.1 The Slot Model
+
+A *slot* is a small integer the program picks for itself. Each
+synthesis call (`audio_coin`, `audio_tone`, …) registers a buffer at
+its slot; `audio_play(slot, volume, pan)` plays it. Rebinding a slot
+frees the previous buffer first, so
+
+```bcpl
+audio_coin(1, 1.0, 0.4)         // slot 1 holds a coin SFX
+audio_play(1, 1.0, 0.0)         // ...play it...
+audio_zap(1, 880.0, 0.2)        // ...then replace it with a zap
+```
+
+leaks nothing across the rebinding. Music slots are independent of
+sound slots; `audio_music_load(10, ...)` does not collide with
+`audio_coin(10, ...)`.
+
+Volumes are floats in `[0, 1]`; clipped at the boundaries. Pan is
+`-1.0` (left) to `1.0` (right), `0.0` centred. Like the GUI surface,
+audio arguments must be float literals — `1.0`, not `1` — because
+the Win64 ABI routes them through XMM registers.
+
+### D.2 SFX Presets
+
+Each preset takes `(slot, p1, duration)` and renders into the slot.
+
+```
+    audio_beep(slot, frequency,   dur)     // pure tone
+    audio_coin(slot, pitch,       dur)     // bright pickup chime
+    audio_jump(slot, power,       dur)     // platformer hop
+    audio_explode(slot, size,     dur)
+    audio_big_explode(slot, size, dur)
+    audio_small_explode(slot, intensity, dur)
+    audio_distant_explode(slot, distance, dur)
+    audio_metal_explode(slot, shrapnel,   dur)
+    audio_zap(slot, frequency,    dur)     // laser zap
+    audio_shoot(slot, power,      dur)
+    audio_powerup(slot, intensity, dur)
+    audio_hurt(slot, severity,    dur)
+    audio_click(slot, sharpness,  dur)     // UI click
+    audio_bang(slot, intensity,   dur)
+    audio_blip(slot, pitch,       dur)
+    audio_pickup(slot, brightness, dur)
+```
+
+Sweep helpers take an extra frequency argument:
+
+```
+    audio_sweep_up(slot,   start_hz, end_hz, dur)
+    audio_sweep_down(slot, start_hz, end_hz, dur)
+```
+
+`audio_random_beep(slot, seed, dur)` is deterministic: the same seed
+reproduces the same chime, useful as a per-object cue.
+
+### D.3 Custom Synthesis
+
+For programs that want finer control than the presets give:
+
+```
+    audio_tone(slot, freq, dur, waveform)
+    audio_note(slot, midi, dur, waveform,
+               attack, decay, sustain, release)
+    audio_noise(slot, noise_type, dur)
+    audio_fm(slot, carrier_hz, modulator_hz, mod_index, dur)
+```
+
+`waveform` is an integer code: `0` Sine, `1` Square, `2` Sawtooth,
+`3` Triangle, `4` Noise, `5` Pulse. `noise_type` is `0` White, `1`
+Pink, `2` Brown. `midi` is a standard MIDI pitch number (60 = middle
+C). ADSR envelope values are seconds for attack / decay / release;
+sustain is a `[0, 1]` level.
+
+### D.4 Effect Chains
+
+These render a tone and bake an effect into the buffer at
+registration time. Live per-voice effects are a future addition.
+
+```
+    audio_reverb(slot, freq, dur, wf, room_size, damping, wet)
+    audio_delay(slot,  freq, dur, wf, delay_time, feedback, mix)
+    audio_distort(slot, freq, dur, wf, drive, tone_color, level)
+    audio_filter_tone(slot, freq, dur, wf, filter_type, cutoff, resonance)
+    audio_filter_note(slot, midi, dur, wf,
+                      a, d, s, r,
+                      filter_type, cutoff, resonance)
+```
+
+`filter_type` codes: `0` None, `1` LowPass, `2` HighPass, `3`
+BandPass. `room_size`, `damping`, `wet`, `feedback`, `mix`, `drive`,
+`tone_color`, `level`, `resonance` are all unit-interval floats;
+`delay_time` is seconds; `cutoff` is in Hz.
+
+### D.5 Playback and Control
+
+```
+    audio_play(slot, volume, pan)        -> 0 on success
+    audio_stop_all()                     -> 0
+    audio_free(slot)                     -> 0 or AUDIO_ERR_UNKNOWN_SLOT
+    audio_free_all()                     -> 0
+    audio_set_volume(level)              -> 0   (SFX bus, [0,1])
+    audio_get_volume()                   -> f64
+    audio_count()                        -> populated slot count
+    audio_playing(slot)                  -> 1 if a voice is active
+    audio_duration(slot)                 -> seconds, 0.0 if empty
+```
+
+`audio_play` returns `0` on success, `2` for an unknown slot, `3` if
+no audio device is available. The slot bank is unaffected by
+`stop_all` — replay with `audio_play` later.
+
+### D.6 Music — ABC Notation
+
+```
+    audio_music_load(slot, abc_string)   -> 0 or AUDIO_ERR_PARSE
+    audio_music_play(slot, volume)       -> 0 or unknown-slot / no-device
+    audio_music_stop_all()
+    audio_music_pause_all()
+    audio_music_resume_all()
+    audio_music_free(slot)
+    audio_music_free_all()
+    audio_music_set_volume(level)        -> 0   (music bus)
+    audio_music_get_volume()             -> f64
+    audio_music_count()                  -> populated tune count
+    audio_music_state()                  -> 0 stopped, 1 playing, 2 paused
+    audio_music_playing(slot)            -> 1 if the tune is active
+    audio_music_tempo(slot)              -> BPM, 0.0 if unknown
+```
+
+ABC strings must fit on one source line (BCPL forbids newlines
+inside string literals); use `*N` between header lines and the body.
+The parser is forgiving — most ABC tunes from `abcnotation.com` load
+without modification.
+
+### D.7 A Sound Program
+
+```bcpl
+LET START() BE $(
+    audio_set_volume(0.8)
+
+    audio_coin(1, 1.0, 0.4)
+    audio_play(1, 1.0, 0.0)
+    SLEEP(1000)
+
+    audio_music_load(10,
+      "X:1*NT:Lead*NM:4/4*NL:1/8*NQ:1/4=160*NK:C*NC E G c | c G E C |")
+    audio_music_play(10, 1.0)
+    SLEEP(4000)
+$)
+```
+
+`SLEEP(ms)` is a portable runtime builtin; the program waits out
+each cue before returning. `examples/sound-test.bcl` is the same
+shape, slightly fuller. The Rust-side surface lives in
+`src/newbcpl-runtime/src/audio.rs` and tracks NewFB's
+`newfb-runtime/src/audio.rs` byte-for-byte at the engine level.
+
+---
+
+## Appendix E — ASM Procedures
+
+A procedure body that is `ASM { … }` instead of a BCPL expression
+or statement contains raw Win64 Intel-syntax assembly. The driver
+appends it to the LLVM module as a `module asm` blob, MCJIT
+assembles and links it, and BCPL call sites bind to the resulting
+symbol through an LLVM `declare` whose argument and return types
+follow the declared parameter list.
+
+There is no parameter-name substitution. The author writes the
+Win64 ABI registers directly. The compiler's only job is to wire
+the LLVM `declare` so the call sites pass arguments in the right
+registers and read the return value from the right place.
+
+### E.1 Syntax
+
+```
+    LET  name(p0, p1, …) [AS RetType]  =  ASM { body }   // function
+    LET  name(p0, p1, …)               BE ASM { body }   // routine
+```
+
+Each parameter may carry an optional `AS Type` annotation
+(`FLOAT`, `FQUAD`, `FOCT`). Anything else — or no annotation —
+makes the parameter a plain Word (integer / pointer / packed
+SIMD scalar). The trailing `AS RetType` annotation, allowed only
+on the `=` (function) form, picks the return-value register;
+omit it and the function returns a Word in `rax`.
+
+The body is the raw source text between the braces, preserved
+verbatim — whitespace and incidental punctuation pass through to
+the assembler unchanged. `//` and `;` line comments inside the
+body work the way GAS Intel syntax expects them to.
+
+### E.2 The Win64 ABI in One Table
+
+Parameter slots are numbered from zero. Each slot's annotation
+picks the register file the value travels in:
+
+```
+    Slot | Word (int/ptr)            | Float (f64) / FQuad     | FOct
+    -----+---------------------------+-------------------------+--------
+    0    | rcx                       | xmm0                    | ymm0
+    1    | rdx                       | xmm1                    | ymm1
+    2    | r8                        | xmm2                    | ymm2
+    3    | r9                        | xmm3                    | ymm3
+    4+   | qword ptr [rsp+40+8N]     | xmmword ptr [rsp+40+8N] | ymmword ptr [rsp+40+8N]
+```
+
+Return values: Word goes in `rax`; Float in `xmm0`; FQuad
+(`<4 x f32>`) in `xmm0`; FOct (`<8 x f32>`) in `ymm0`. Routines
+(`BE ASM`) return nothing — the caller never inspects `rax`.
+
+Caller-saved registers (`rax`, `rcx`, `rdx`, `r8`–`r11`,
+`xmm0`–`xmm5`) are free to clobber. Callee-saved registers
+(`rbx`, `rsi`, `rdi`, `r12`–`r15`, `xmm6`–`xmm15`) must be
+preserved across the call — if the body touches any, push and
+pop them yourself.
+
+### E.3 Three Worked Examples
+
+A two-word integer multiply that returns through `rax`:
+
+```bcpl
+LET fastmul(a, b) = ASM {
+    mov rax, rcx
+    imul rax, rdx
+    ret
+}
+```
+
+A no-return routine that takes one word and silently returns:
+
+```bcpl
+LET sink(x) BE ASM {
+    ret
+}
+```
+
+A floating-point add whose return value travels through `xmm0`:
+
+```bcpl
+LET fadd(a AS FLOAT, b AS FLOAT) AS FLOAT = ASM {
+    addsd xmm0, xmm1
+    ret
+}
+```
+
+In every case the BCPL call site looks like a normal function or
+routine call — `fastmul(6, 7)`, `sink(99)`, `fadd(1.5, 2.25)`.
+
+### E.4 Five-Plus Parameters
+
+The first four slots live in registers. Slot 4 lives at
+`[rsp+40]`, slot 5 at `[rsp+48]`, and so on — the 32-byte
+shadow-home space at `[rsp+0]`..`[rsp+24]` is reserved by Win64
+for the callee's use, and arguments start above it. Sum of five
+words:
+
+```bcpl
+LET sum5(a, b, c, d, e) = ASM {
+    mov rax, rcx
+    add rax, rdx
+    add rax, r8
+    add rax, r9
+    add rax, qword ptr [rsp+40]
+    ret
+}
+```
+
+### E.5 Labels and Loops
+
+Local labels survive the brace-balanced body scanner. Lines that
+end in `:` stay at column 0 in the emitted asm; instructions are
+indented. A naive counted-loop summing 1..n:
+
+```bcpl
+LET sumn(n) = ASM {
+    xor rax, rax
+.loop:
+    add rax, rcx
+    dec rcx
+    jnz .loop
+    ret
+}
+```
+
+### E.6 What This Buys You
+
+ASM procedures are an escape hatch — most BCPL programs never
+need one. They are useful when:
+
+- A SIMD kernel needs a specific instruction sequence LLVM does
+  not pick (manual `vbroadcast` / `vfmadd231ps` chains, etc.).
+- You want to read or write a control-flow register (`mxcsr`,
+  `xcr0`) the BCPL surface has no spelling for.
+- A profile pins a hot inner loop and the IR is leaving cycles
+  on the table.
+
+For everything else, write the BCPL — the JIT is good at the
+common cases and the ASM bodies are opaque to sema, so a typo
+in the body is reported by the assembler, not by the compiler.
+
+The end-to-end pipeline is in `src/new-asm` (the shared register
+type / module-asm builder used by every NewLang sibling), with
+the BCPL wiring split across `src/newbcpl-parser/src/parser.rs`
+(`scan_asm_body`), `src/newbcpl-ir/src/lower.rs`
+(`lower_asm_proc` / `annotation_to_asm_type`), and
+`src/newbcpl-llvm/src/emit.rs` (`declare_asm_proc`, pass 1b for
+declares, pass 4 for bodies). The integration probes are
+`tests/newbcpl-tests/tests/asm_probes.rs`; the example programs
+are `examples/asm-smoke.bcl`, `examples/asm-routine.bcl`, and
+`examples/asm-float.bcl`.
+
+---
+
 *Read this guide once for shape, then again with the compiler running.
 NewBCPL is small enough to fit in one head, and that is the point.*

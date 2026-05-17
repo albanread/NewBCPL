@@ -1,0 +1,22 @@
+// asm-float.bcl — float parameters and return value, both in XMM.
+//
+// Annotating each parameter `AS FLOAT` tells the LLVM `declare`
+// the param is f64, which under the Win64 ABI routes it through
+// `xmm0` / `xmm1` / `xmm2` / `xmm3` (one register per slot, like
+// the integer side but in the XMM file). The trailing `AS FLOAT`
+// after the parameter list does the same job for the *return*
+// value: f64 in `xmm0`.
+//
+// Slot 0 (a) → xmm0, slot 1 (b) → xmm1. We don't need a leading
+// MOV — `a` already lives in xmm0, the return register.
+
+LET fadd(a AS FLOAT, b AS FLOAT) AS FLOAT = ASM {
+    addsd xmm0, xmm1
+    ret
+}
+
+LET START() BE $(
+    WRITES("1.5 + 2.25 = ")
+    FWRITE(fadd(1.5, 2.25))
+    NEWLINE()
+$)

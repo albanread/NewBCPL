@@ -144,6 +144,8 @@ const KEYWORDS: &[&str] = &[
     "AS", "POINTER",
     "DEFER", "BRK",
     "PAIR", "FPAIR", "QUAD", "FQUAD", "OCT", "FOCT",
+    // Inline / procedure-body assembly.
+    "ASM",
 ];
 
 fn is_keyword(word: &str) -> bool {
@@ -462,6 +464,21 @@ impl<'a> Lexer<'a> {
         let start_offset = self.pos.offset;
         self.advance(); // #
         let is_hex = matches!(self.peek(), Some(b'X' | b'x'));
+        // Bare `#` not followed by a digit or hex prefix — emit it as
+        // a Symbol so that incidental `#` characters inside an ASM
+        // body tokenise cleanly. The parser captures the body text
+        // via source offsets (not by reconstructing it from tokens),
+        // so the Symbol is consumed immediately by `scan_asm_body`'s
+        // brace counter and the raw bytes survive into the assembler
+        // verbatim. A common use is the GAS-style line-comment
+        // `# this is a comment` inside an ASM body.
+        if !is_hex && !matches!(self.peek(), Some(b'0'..=b'9')) {
+            return Ok(Token {
+                kind: TokenKind::Symbol,
+                lexeme: self.slice_from(start_offset).to_string(),
+                span: self.span_from(start),
+            });
+        }
         if is_hex {
             self.advance();
             let mut saw_digit = false;

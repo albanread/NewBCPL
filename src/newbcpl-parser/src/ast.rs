@@ -138,6 +138,43 @@ pub enum Decl {
     Global(NamedBindingsDecl),
     /// `CLASS Name [EXTENDS Base] [MANAGED] $( … $)` — see manifesto §5.
     Class(ClassDecl),
+    /// `LET name(params) = ASM { … }` or `LET name(params) BE ASM { … }`.
+    AsmProc(AsmProcDecl),
+}
+
+/// An ASM procedure or routine declaration.
+///
+/// The body is the raw source text between the `{` and `}` delimiters,
+/// preserved verbatim. There is no parameter-name substitution: the
+/// author writes Win64 ABI registers (`rcx`, `rdx`, `r8`, `r9`,
+/// `xmm0`, …) directly. The parameter list still matters because it
+/// determines the matching LLVM `declare`'s argument types, which in
+/// turn pin down which slot — and therefore which Win64 register —
+/// each parameter arrives in.
+#[derive(Debug, Clone)]
+pub struct AsmProcDecl {
+    pub name: String,
+    pub params: Vec<String>,
+    /// Optional `AS Type` annotations in the same positions as
+    /// `params`. Drives the LLVM `declare`'s argument register class
+    /// (integer vs XMM vs YMM) per `annotation_to_asm_type` in the IR
+    /// lowering pass.
+    pub param_annotations: Vec<Option<String>>,
+    /// Optional `AS Type` annotation on the return value, parsed
+    /// from the `LET name(params) AS Type = ASM { … }` form. `None`
+    /// means the function returns a plain Word (i64 in `rax`); the
+    /// only non-`Word` types that travel out of an ASM proc cleanly
+    /// are `FLOAT` (f64 in `xmm0`), `FQUAD` (`<4 x f32>` in `xmm0`),
+    /// and `FOCT` (`<8 x f32>` in `ymm0`). Ignored for `BE ASM`
+    /// routines — they have no return value.
+    pub return_annotation: Option<String>,
+    /// `true` = `= ASM { }` (function, returns a value in rax/xmm0).
+    /// `false` = `BE ASM { }` (routine, return value ignored).
+    pub is_function: bool,
+    /// Raw Intel-syntax text between `{` and `}`, emitted verbatim
+    /// into the `module asm` blob by `new_asm::build_module_asm_string`.
+    pub body: String,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone)]
@@ -781,6 +818,7 @@ impl Decl {
             Decl::Static(s) => s.span,
             Decl::Global(g) => g.span,
             Decl::Class(c) => c.span,
+            Decl::AsmProc(a) => a.span,
         }
     }
 }

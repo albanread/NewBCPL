@@ -77,3 +77,7 @@ path = "tests/sema_corpus.rs"
 [[test]]
 name = "user_guide"
 path = "tests/user_guide.rs"
+
+[[test]]
+name = "asm_probes"
+path = "tests/asm_probes.rs"

@@ -199,6 +199,17 @@ pub unsafe extern "C-unwind" fn TIMER_DISPLAY(elapsed: i64) -> i64 {
     0
 }
 
+/// `SLEEP(ms)` — block the calling thread for at least `ms`
+/// milliseconds. Negative or zero values return immediately. Used
+/// to wait out an SFX or music cue; works on every platform because
+/// `std::thread::sleep` is portable.
+pub unsafe extern "C-unwind" fn SLEEP(ms: i64) -> i64 {
+    if ms > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(ms as u64));
+    }
+    0
+}
+
 // ─── SIMD pairwise reducers (PAIR-only for now) ──────────────────
 //
 // `PAIRWISE_*` takes a packed-i64 PAIR (two i32 lanes) and folds
@@ -1340,6 +1351,7 @@ pub fn builtin_addresses() -> &'static [Builtin] {
             builtin!(TIMER_START),
             builtin!(TIMER_END),
             builtin!(TIMER_DISPLAY),
+            builtin!(SLEEP),
             builtin!(PAIRWISE_MIN),
             builtin!(PAIRWISE_MAX),
             builtin!(PAIRWISE_ADD),
@@ -1488,6 +1500,215 @@ pub fn builtin_addresses() -> &'static [Builtin] {
             v.push(Builtin {
                 name: "iGui_TextShowCaret",
                 address: g::iGui_TextShowCaret as *const () as usize,
+            });
+        }
+        // NewAudio shims — slot bookkeeping and synthesis work
+        // everywhere; live waveOut / midiOut output is Windows-only
+        // and gated inside the shim. The names match
+        // `crate::audio::Sound_*` / `Music_*`. Registered
+        // unconditionally so cross-platform tests can still observe
+        // the slot table.
+        {
+            use crate::audio as a;
+            v.push(Builtin {
+                name: "Sound_Beep",
+                address: a::Sound_Beep as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "Sound_Coin",
+                address: a::Sound_Coin as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "Sound_Jump",
+                address: a::Sound_Jump as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "Sound_Explode",
+                address: a::Sound_Explode as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "Sound_BigExplode",
+                address: a::Sound_BigExplode as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "Sound_SmallExplode",
+                address: a::Sound_SmallExplode as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "Sound_DistantExplode",
+                address: a::Sound_DistantExplode as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "Sound_MetalExplode",
+                address: a::Sound_MetalExplode as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "Sound_Zap",
+                address: a::Sound_Zap as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "Sound_Shoot",
+                address: a::Sound_Shoot as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "Sound_Powerup",
+                address: a::Sound_Powerup as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "Sound_Hurt",
+                address: a::Sound_Hurt as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "Sound_Click",
+                address: a::Sound_Click as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "Sound_Bang",
+                address: a::Sound_Bang as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "Sound_Blip",
+                address: a::Sound_Blip as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "Sound_Pickup",
+                address: a::Sound_Pickup as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "Sound_SweepUp",
+                address: a::Sound_SweepUp as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "Sound_SweepDown",
+                address: a::Sound_SweepDown as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "Sound_RandomBeep",
+                address: a::Sound_RandomBeep as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "Sound_Tone",
+                address: a::Sound_Tone as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "Sound_Note",
+                address: a::Sound_Note as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "Sound_Noise",
+                address: a::Sound_Noise as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "Sound_FM",
+                address: a::Sound_FM as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "Sound_Reverb",
+                address: a::Sound_Reverb as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "Sound_Delay",
+                address: a::Sound_Delay as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "Sound_Distort",
+                address: a::Sound_Distort as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "Sound_FilterTone",
+                address: a::Sound_FilterTone as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "Sound_FilterNote",
+                address: a::Sound_FilterNote as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "Sound_Play",
+                address: a::Sound_Play as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "Sound_StopAll",
+                address: a::Sound_StopAll as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "Sound_Free",
+                address: a::Sound_Free as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "Sound_FreeAll",
+                address: a::Sound_FreeAll as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "Sound_SetVolume",
+                address: a::Sound_SetVolume as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "Sound_GetVolume",
+                address: a::Sound_GetVolume as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "Sound_Count",
+                address: a::Sound_Count as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "Sound_Playing",
+                address: a::Sound_Playing as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "Sound_Duration",
+                address: a::Sound_Duration as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "Music_Load",
+                address: a::Music_Load as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "Music_Play",
+                address: a::Music_Play as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "Music_StopAll",
+                address: a::Music_StopAll as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "Music_PauseAll",
+                address: a::Music_PauseAll as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "Music_ResumeAll",
+                address: a::Music_ResumeAll as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "Music_Free",
+                address: a::Music_Free as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "Music_FreeAll",
+                address: a::Music_FreeAll as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "Music_SetVolume",
+                address: a::Music_SetVolume as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "Music_GetVolume",
+                address: a::Music_GetVolume as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "Music_Count",
+                address: a::Music_Count as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "Music_State",
+                address: a::Music_State as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "Music_Playing",
+                address: a::Music_Playing as *const () as usize,
+            });
+            v.push(Builtin {
+                name: "Music_Tempo",
+                address: a::Music_Tempo as *const () as usize,
             });
         }
         // Lowercase aliases: every builtin whose name has at least

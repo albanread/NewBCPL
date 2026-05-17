@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+new-asm = { path = "../../../new-asm" }
 newbcpl-ir = { path = "../newbcpl-ir" }
 newbcpl-parser = { path = "../newbcpl-parser" }
 newbcpl-runtime = { path = "../newbcpl-runtime" }

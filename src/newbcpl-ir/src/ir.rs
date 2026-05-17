@@ -31,6 +31,18 @@ pub struct Module {
     /// initializer when sema can constant-fold it; `None` falls
     /// back to a zero-init slot.
     pub globals: Vec<GlobalDecl>,
+    /// `ASM { }` procedure definitions.  Each is emitted as a
+    /// `module asm` blob plus a matching `declare` in the LLVM IR.
+    pub asm_procs: Vec<new_asm::AsmProc>,
+}
+
+impl Module {
+    /// True if `name` is an ASM-body procedure (not a regular LLVM
+    /// function).  Used by the JIT missing-symbol check to avoid
+    /// flagging legitimate `declare`s whose bodies live in `module asm`.
+    pub fn is_asm_proc(&self, name: &str) -> bool {
+        self.asm_procs.iter().any(|p| p.name == name)
+    }
 }
 
 /// One `GLOBAL` binding promoted to a module-level slot.

@@ -1,0 +1,23 @@
+// asm-smoke.bcl — smallest possible ASM procedure: integer multiply.
+//
+// Run with:
+//   cargo run -p newbcpl-driver -- run examples/asm-smoke.bcl
+//
+// `LET name(...) = ASM { ... }` defines a value-producing function
+// whose body is Win64-ABI Intel-syntax assembly. Parameter `a`
+// arrives in `rcx` (slot 0); `b` arrives in `rdx` (slot 1); the
+// result lives in `rax`. The driver assembles the body into the
+// JIT module via `module asm`, then resolves the `declare` against
+// it at link time.
+
+LET fastmul(a, b) = ASM {
+    mov rax, rcx
+    imul rax, rdx
+    ret
+}
+
+LET START() BE $(
+    WRITES("6 * 7 = ")
+    WRITEN(fastmul(6, 7))
+    NEWLINE()
+$)

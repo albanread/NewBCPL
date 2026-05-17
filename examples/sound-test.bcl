@@ -1,0 +1,46 @@
+// sound-test.bcl — exercise the audio runtime.
+//
+//   cargo run -p newbcpl-driver -- run examples/sound-test.bcl
+//
+// Mirrors NewFB's play_coin.bas / play_lead.bas: synthesises a coin
+// SFX into slot 1, plays it, waits out the duration, then loads an
+// ABC tune into slot 10 and plays four bars of lead.
+//
+// `audio_*` names come from the BCPL wrapper module
+// `modules-active/audio.bcl`, which forwards to the runtime's
+// `Sound_*` / `Music_*` shims (see newbcpl-runtime/src/audio.rs).
+//
+// Headless hosts without an audio device will still execute every
+// call — registration and parsing succeed, the playback shim
+// silently no-ops.
+
+LET START() BE $(
+    // Set the SFX bus volume; programs that don't care can skip this.
+    audio_set_volume(0.8)
+
+    // ── Coin pickup ────────────────────────────────────────────────
+    //
+    // Slot 1, pitch 1.0, duration 0.4 s. Stash, play centred, then
+    // SLEEP a little longer than the buffer length so the sound
+    // finishes before we exit.
+    audio_coin(1, 1.0, 0.4)
+    WRITES("playing coin...*N")
+    audio_play(1, 1.0, 0.0)
+    SLEEP(1000)
+    WRITES("coin done*N")
+
+    // ── Music ──────────────────────────────────────────────────────
+    //
+    // ABC notation, on one line. BCPL strings can't span source
+    // lines, so the parser sees the header lines joined by `*N`
+    // escapes — which the lexer's `*`-escape pass turns back into
+    // real newlines before the ABC parser sees them.
+    audio_music_set_volume(1.0)
+    audio_music_load(10,
+      "X:1*NT:Lead Test*NM:4/4*NL:1/8*NQ:1/4=160*NV:1 program=80*NK:C*NC E G c | c G E C |")
+
+    WRITES("playing lead...*N")
+    audio_music_play(10, 1.0)
+    SLEEP(4000)
+    WRITES("lead done*N")
+$)

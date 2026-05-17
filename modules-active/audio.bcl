@@ -1,0 +1,167 @@
+// audio.bcl — BCPL convenience wrappers over the runtime's audio surface.
+//
+// Loaded automatically by the driver from `modules-active/`. After
+// auto-prefix, the top-level routines become `audio_coin`,
+// `audio_play`, `audio_music_load`, ... — the names a BCPL program
+// calls.
+//
+// Two slot banks live behind these wrappers: one for short SFX
+// (registered by `Sound_Coin`, `Sound_Zap`, ...) and one for ABC
+// music (registered by `Music_Load`). Each is indexed by a small
+// integer slot the program picks itself; rebinding a slot frees the
+// old asset first.
+//
+// Float args are f64 in BCPL. Pass float literals (`1.0`, not `1`)
+// — the runtime signatures use Win64's XMM-register float
+// convention and integer arguments would arrive in the wrong
+// registers. Integer slot / waveform / filter-type args stay as
+// plain integers.
+//
+// Waveform codes (for `audio_tone`, `audio_note`, ...):
+//   0 = Sine, 1 = Square, 2 = Sawtooth, 3 = Triangle,
+//   4 = Noise, 5 = Pulse.
+// Noise codes (for `audio_noise`):
+//   0 = White, 1 = Pink, 2 = Brown.
+// Filter codes (for `audio_filter_tone` / `audio_filter_note`):
+//   0 = None, 1 = LowPass, 2 = HighPass, 3 = BandPass.
+//
+// Return values are status codes (0 = OK, non-zero = error kind)
+// for everything except the duration / volume / tempo getters which
+// return floats.
+
+// ─── Preset SFX ─────────────────────────────────────────────────────
+//
+// Each one synthesises a short buffer and stashes it in `slot`.
+// Replay with `audio_play(slot, volume, pan)`.
+
+LET beep(slot, frequency, duration)         = Sound_Beep(slot, frequency, duration)
+LET coin(slot, pitch, duration)             = Sound_Coin(slot, pitch, duration)
+LET jump(slot, power, duration)             = Sound_Jump(slot, power, duration)
+LET explode(slot, size, duration)           = Sound_Explode(slot, size, duration)
+LET big_explode(slot, size, duration)       = Sound_BigExplode(slot, size, duration)
+LET small_explode(slot, intensity, duration) = Sound_SmallExplode(slot, intensity, duration)
+LET distant_explode(slot, distance, duration) = Sound_DistantExplode(slot, distance, duration)
+LET metal_explode(slot, shrapnel, duration) = Sound_MetalExplode(slot, shrapnel, duration)
+LET zap(slot, frequency, duration)          = Sound_Zap(slot, frequency, duration)
+LET shoot(slot, power, duration)            = Sound_Shoot(slot, power, duration)
+LET powerup(slot, intensity, duration)      = Sound_Powerup(slot, intensity, duration)
+LET hurt(slot, severity, duration)          = Sound_Hurt(slot, severity, duration)
+LET click(slot, sharpness, duration)        = Sound_Click(slot, sharpness, duration)
+LET bang(slot, intensity, duration)         = Sound_Bang(slot, intensity, duration)
+LET blip(slot, pitch, duration)             = Sound_Blip(slot, pitch, duration)
+LET pickup(slot, brightness, duration)      = Sound_Pickup(slot, brightness, duration)
+
+// Frequency-sweep helpers.
+LET sweep_up(slot, start_freq, end_freq, duration)
+    = Sound_SweepUp(slot, start_freq, end_freq, duration)
+LET sweep_down(slot, start_freq, end_freq, duration)
+    = Sound_SweepDown(slot, start_freq, end_freq, duration)
+
+// Deterministic-random retro beep — same seed reproduces the same
+// chime, useful as an "object N picked up" cue.
+LET random_beep(slot, seed, duration)
+    = Sound_RandomBeep(slot, seed, duration)
+
+// ─── Custom synthesis ───────────────────────────────────────────────
+
+// Pure tone at `freq` for `duration` seconds with the given waveform.
+LET tone(slot, freq, duration, waveform)
+    = Sound_Tone(slot, freq, duration, waveform)
+
+// Held note at a MIDI pitch with an ADSR envelope.
+LET note(slot, midi, duration, waveform, attack, decay, sustain, release)
+    = Sound_Note(slot, midi, duration, waveform, attack, decay, sustain, release)
+
+// Coloured noise burst (white / pink / brown).
+LET noise(slot, noise_type, duration)
+    = Sound_Noise(slot, noise_type, duration)
+
+// Simple sine-sine FM. `mod_index` is in radians.
+LET fm(slot, carrier_hz, modulator_hz, mod_index, duration)
+    = Sound_FM(slot, carrier_hz, modulator_hz, mod_index, duration)
+
+// ─── Baked-in effect chains ─────────────────────────────────────────
+//
+// Each renders a tone and applies the named effect at registration
+// time. Real-time per-voice effects are a future addition.
+
+LET reverb(slot, frequency, duration, waveform, room_size, damping, wet)
+    = Sound_Reverb(slot, frequency, duration, waveform, room_size, damping, wet)
+
+LET delay(slot, frequency, duration, waveform, delay_time, feedback, mix)
+    = Sound_Delay(slot, frequency, duration, waveform, delay_time, feedback, mix)
+
+LET distort(slot, frequency, duration, waveform, drive, tone_color, level)
+    = Sound_Distort(slot, frequency, duration, waveform, drive, tone_color, level)
+
+LET filter_tone(slot, frequency, duration, waveform, filter_type, cutoff, resonance)
+    = Sound_FilterTone(slot, frequency, duration, waveform, filter_type, cutoff, resonance)
+
+LET filter_note(slot, midi, duration, waveform,
+                attack, decay, sustain, release,
+                filter_type, cutoff, resonance)
+    = Sound_FilterNote(slot, midi, duration, waveform,
+                       attack, decay, sustain, release,
+                       filter_type, cutoff, resonance)
+
+// ─── Playback / control ─────────────────────────────────────────────
+
+// Play the sound bound to `slot`. `volume` is 0.0..=1.0; `pan` is
+// -1.0 (left) to 1.0 (right), 0.0 = centre. Returns 0 on success,
+// non-zero on unknown-slot / no-device.
+LET play(slot, volume, pan) = Sound_Play(slot, volume, pan)
+
+// Silence every active SFX voice. The slot bank is untouched.
+LET stop_all() = Sound_StopAll()
+
+// Drop the buffer at `slot` (or every buffer).
+LET free(slot) = Sound_Free(slot)
+LET free_all() = Sound_FreeAll()
+
+// SFX bus volume — clamped to [0, 1].
+LET set_volume(level) = Sound_SetVolume(level)
+LET get_volume() = Sound_GetVolume()
+
+// Number of populated SFX slots.
+LET count() = Sound_Count()
+
+// 1 if at least one voice is currently playing `slot`, 0 otherwise.
+LET playing(slot) = Sound_Playing(slot)
+
+// Buffer duration in seconds, or 0.0 if the slot is empty. Useful
+// for `SLEEP (FIX (1000.0 *. audio_duration(slot)))` to wait out
+// the sound.
+LET duration(slot) = Sound_Duration(slot)
+
+// ─── Music (ABC notation → MIDI) ────────────────────────────────────
+//
+// `audio_music_load(slot, abc)` parses ABC and binds the resulting
+// MIDI asset to `slot`. `audio_music_play(slot, volume)` starts
+// playback on the system MIDI output. `volume` is 0.0..=1.0.
+//
+// On non-Windows targets parsing and slot bookkeeping still work
+// (so unit tests stay consistent), but `play` is a silent no-op.
+
+LET music_load(slot, abc_string) = Music_Load(slot, abc_string)
+LET music_play(slot, volume) = Music_Play(slot, volume)
+
+LET music_stop_all() = Music_StopAll()
+LET music_pause_all() = Music_PauseAll()
+LET music_resume_all() = Music_ResumeAll()
+
+LET music_free(slot) = Music_Free(slot)
+LET music_free_all() = Music_FreeAll()
+
+LET music_set_volume(level) = Music_SetVolume(level)
+LET music_get_volume() = Music_GetVolume()
+
+LET music_count() = Music_Count()
+
+// Global playback state: 0 = STOPPED, 1 = PLAYING, 2 = PAUSED.
+LET music_state() = Music_State()
+
+// 1 if `slot`'s tune is currently active (playing or paused).
+LET music_playing(slot) = Music_Playing(slot)
+
+// Tempo in BPM of the tune at `slot`. 0.0 for unknown slots.
+LET music_tempo(slot) = Music_Tempo(slot)

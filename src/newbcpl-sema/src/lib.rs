@@ -800,6 +800,27 @@ impl Sema {
                 };
                 self.functions.insert(r.name.clone(), info);
             }
+            Decl::AsmProc(a) => {
+                // `LET f(…) = ASM { … }` is a value-producing function;
+                // `LET f(…) BE ASM { … }` is a no-return routine. Both
+                // report TypeHint::Word for the return value — the body
+                // is opaque to sema, so we trust the FFI declaration the
+                // IR/LLVM pass will emit.
+                let kind = if a.is_function {
+                    FunctionKind::Function
+                } else {
+                    FunctionKind::Routine
+                };
+                let info = FunctionInfo {
+                    name: a.name.clone(),
+                    kind,
+                    params: a.params.clone(),
+                    result: TypeHint::Word,
+                    result_class_name: None,
+                    span: a.span,
+                };
+                self.functions.insert(a.name.clone(), info);
+            }
             _ => {}
         }
     }
@@ -1046,6 +1067,22 @@ impl Sema {
                 }
             }
             Decl::Class(c) => self.analyze_class_body(c),
+            Decl::AsmProc(a) => {
+                self.declare(&a.name, TypeHint::Function, None, a.span);
+                let kind = if a.is_function {
+                    FunctionKind::Function
+                } else {
+                    FunctionKind::Routine
+                };
+                self.function_log.push(FunctionInfo {
+                    name: a.name.clone(),
+                    kind,
+                    params: a.params.clone(),
+                    result: TypeHint::Word,
+                    result_class_name: None,
+                    span: a.span,
+                });
+            }
         }
     }
 

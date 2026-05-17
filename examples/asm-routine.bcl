@@ -1,0 +1,17 @@
+// asm-routine.bcl — `BE ASM` is the no-return routine form.
+//
+// `LET name(...) BE ASM { ... }` is a routine: the body runs for
+// side effects, the caller ignores anything left in rax. Useful for
+// vectorised pokes, MMIO, or any procedure that exists for its
+// effect rather than its value.
+
+LET sink(x) BE ASM {
+    // x is in rcx; we don't need it. Just return so the JIT
+    // unwinds cleanly back to BCPL.
+    ret
+}
+
+LET START() BE $(
+    sink(99)
+    WRITES("BE ASM ok*N")
+$)

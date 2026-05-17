@@ -58,12 +58,15 @@ impl ParseError {
 
 pub fn parse_source(source: &str) -> Result<Program, ParseError> {
     let tokens = lex_source(source).map_err(ParseError::from_lex)?;
-    Parser::new(tokens).parse_program()
+    Parser::new(tokens, source).parse_program()
 }
 
 pub(crate) struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    /// Raw source bytes — used by `scan_asm_body` to extract the body
+    /// text by offset rather than reconstructing it from tokens.
+    source: String,
     /// Nesting depth of `.|…|` lane-access brackets currently open.
     /// While > 0 the binary-operator dispatcher refuses to consume `|`
     /// (which would otherwise eat the closing delimiter as a logical
@@ -80,10 +83,11 @@ pub(crate) struct Parser {
 }
 
 impl Parser {
-    fn new(tokens: Vec<Token>) -> Self {
+    fn new(tokens: Vec<Token>, source: &str) -> Self {
         Self {
             tokens,
             pos: 0,
+            source: source.to_string(),
             lane_depth: 0,
             pending_decls: std::collections::VecDeque::new(),
         }
@@ -1029,28 +1033,62 @@ impl Parser {
                 }
             }
             self.expect_sym(")")?;
+            // Optional return-type annotation: `… AS Type =`. Only
+            // meaningful for ASM procedures (where it picks the
+            // return register). Regular functions / routines parse
+            // it for grammar uniformity but ignore the result —
+            // sema infers their return type from the body.
+            let return_annotation = self.parse_optional_as_annotation();
             if self.check_sym("=") {
                 self.eat();
-                let body = self.parse_expr()?;
-                let end = body.span().end;
-                self.pending_decls.push_back(Decl::Function(FunctionDecl {
-                    name,
-                    params,
-                    param_annotations,
-                    body,
-                    span: SourceSpan { start, end },
-                }));
+                if self.check_kw("ASM") {
+                    self.eat();
+                    let (body, end) = self.scan_asm_body()?;
+                    self.pending_decls.push_back(Decl::AsmProc(AsmProcDecl {
+                        name,
+                        params,
+                        param_annotations,
+                        return_annotation,
+                        is_function: true,
+                        body,
+                        span: SourceSpan { start, end },
+                    }));
+                } else {
+                    let body = self.parse_expr()?;
+                    let end = body.span().end;
+                    self.pending_decls.push_back(Decl::Function(FunctionDecl {
+                        name,
+                        params,
+                        param_annotations,
+                        body,
+                        span: SourceSpan { start, end },
+                    }));
+                }
             } else if self.check_kw("BE") {
                 self.eat();
-                let body = self.parse_stmt()?;
-                let end = body.span().end;
-                self.pending_decls.push_back(Decl::Routine(RoutineDecl {
-                    name,
-                    params,
-                    param_annotations,
-                    body: Box::new(body),
-                    span: SourceSpan { start, end },
-                }));
+                if self.check_kw("ASM") {
+                    self.eat();
+                    let (body, end) = self.scan_asm_body()?;
+                    self.pending_decls.push_back(Decl::AsmProc(AsmProcDecl {
+                        name,
+                        params,
+                        param_annotations,
+                        return_annotation: None,
+                        is_function: false,
+                        body,
+                        span: SourceSpan { start, end },
+                    }));
+                } else {
+                    let body = self.parse_stmt()?;
+                    let end = body.span().end;
+                    self.pending_decls.push_back(Decl::Routine(RoutineDecl {
+                        name,
+                        params,
+                        param_annotations,
+                        body: Box::new(body),
+                        span: SourceSpan { start, end },
+                    }));
+                }
             } else {
                 let span = self.peek().span;
                 let lex = self.peek().lexeme.clone();
@@ -1063,6 +1101,70 @@ impl Parser {
             }
         }
         Ok(())
+    }
+
+    /// Scan an `ASM { … }` body after the `ASM` keyword has been consumed.
+    ///
+    /// Expects `{`, then walks tokens with a depth counter until the
+    /// matching `}` so that nested `{…}` (e.g. macro bodies a future
+    /// preprocessor might emit) survive verbatim. Returns
+    /// `(body_text, closing_brace_end_position)` where `body_text` is
+    /// the raw source slice between the braces — not a reconstruction
+    /// from tokens, because we need to preserve the user's exact
+    /// whitespace and any incidental punctuation for the assembler.
+    ///
+    /// The BCPL lexer still tokenises the body bytes (we walk those
+    /// tokens to find the closing brace). Two constraints follow:
+    ///
+    /// 1. The body must be lexer-clean: an unmatched `"` or `*N`
+    ///    outside a string literal still errors at lex time.
+    /// 2. `//` and `/* … */` BCPL comments inside the body survive
+    ///    into the assembler — GAS Intel syntax accepts `//` as a
+    ///    line comment so this is usually harmless. Use `;` for
+    ///    NASM-style comments if you prefer; GAS accepts that too.
+    fn scan_asm_body(&mut self) -> Result<(String, newbcpl_lexer::SourcePosition), ParseError> {
+        let open = self.expect_sym("{")?;
+        let body_start = open.span.end.offset;
+        let mut depth = 1usize;
+        let mut close_start = body_start;
+        let mut end_pos = open.span.end;
+
+        while !self.is_at_end() {
+            let tok = self.peek().clone();
+            match tok.lexeme.as_str() {
+                "{" => {
+                    depth += 1;
+                    end_pos = tok.span.end;
+                    self.eat();
+                }
+                "}" => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close_start = tok.span.start.offset;
+                        end_pos = tok.span.end;
+                        self.eat();
+                        break;
+                    }
+                    end_pos = tok.span.end;
+                    self.eat();
+                }
+                _ => {
+                    end_pos = tok.span.end;
+                    self.eat();
+                }
+            }
+        }
+
+        if depth != 0 {
+            let span = self.peek().span;
+            return Err(ParseError::new(
+                "unterminated ASM body — missing closing `}`",
+                span,
+            ));
+        }
+
+        let body = self.source[body_start..close_start].to_string();
+        Ok((body, end_pos))
     }
 
     fn parse_let_decl(&mut self) -> Result<Decl, ParseError> {
@@ -1089,8 +1191,26 @@ impl Parser {
                 }
             }
             self.expect_sym(")")?;
+            // Optional return-type annotation: `… AS Type =`. See
+            // the matching note in `consume_mutual_recursion_chain`
+            // — regular functions / routines ignore it, ASM procs
+            // use it to pick the return register class.
+            let return_annotation = self.parse_optional_as_annotation();
             if self.check_sym("=") {
                 self.eat();
+                if self.check_kw("ASM") {
+                    self.eat();
+                    let (body, end) = self.scan_asm_body()?;
+                    return Ok(Decl::AsmProc(AsmProcDecl {
+                        name: first_name,
+                        params,
+                        param_annotations,
+                        return_annotation,
+                        is_function: true,
+                        body,
+                        span: SourceSpan { start, end },
+                    }));
+                }
                 let body = self.parse_expr()?;
                 let end = body.span().end;
                 let first = Decl::Function(FunctionDecl {
@@ -1105,6 +1225,19 @@ impl Parser {
             }
             if self.check_kw("BE") {
                 self.eat();
+                if self.check_kw("ASM") {
+                    self.eat();
+                    let (body, end) = self.scan_asm_body()?;
+                    return Ok(Decl::AsmProc(AsmProcDecl {
+                        name: first_name,
+                        params,
+                        param_annotations,
+                        return_annotation: None,
+                        is_function: false,
+                        body,
+                        span: SourceSpan { start, end },
+                    }));
+                }
                 let body = self.parse_stmt()?;
                 let end = body.span().end;
                 let first = Decl::Routine(RoutineDecl {

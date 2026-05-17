@@ -10,10 +10,10 @@ use std::fmt::Write;
 use std::path::Path;
 
 pub use ast::{
-    BinaryOp, Block, ClassDecl, ClassMember, ClassMemberKind, ClassMethod, ClassMethodBody, Decl,
-    Expr, FunctionDecl, GetDirective, LetDecl, LetKind, NamedBinding, NamedBindingsDecl, Program,
-    RoutineDecl, Span, Stmt, SwitchCase, TypeConstructorKind, TypeHint, UnaryOp, Visibility,
-    unknown_hint,
+    AsmProcDecl, BinaryOp, Block, ClassDecl, ClassMember, ClassMemberKind, ClassMethod,
+    ClassMethodBody, Decl, Expr, FunctionDecl, GetDirective, LetDecl, LetKind, NamedBinding,
+    NamedBindingsDecl, Program, RoutineDecl, Span, Stmt, SwitchCase, TypeConstructorKind,
+    TypeHint, UnaryOp, Visibility, unknown_hint,
 };
 pub use parser::{ParseError, parse_source};
 
@@ -114,6 +114,10 @@ fn pretty_print_decl(decl: &Decl, level: usize, out: &mut String) {
             for m in &c.members {
                 pretty_print_class_member(m, level + 1, out);
             }
+        }
+        Decl::AsmProc(a) => {
+            let kind = if a.is_function { "asm-function" } else { "asm-procedure" };
+            writeln!(out, "{kind} {} ({})", a.name, a.params.join(", ")).unwrap();
         }
     }
 }

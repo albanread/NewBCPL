@@ -274,6 +274,7 @@ fn run_program_ir(ir: &IrModule, modules_dir: Option<&Path>) -> Result<i64, Stri
             // are resolved by LLVM itself, not by our table.
             if !name.starts_with("llvm.")
                 && !newbcpl_runtime::builtins::is_builtin(&name)
+                && !ir.is_asm_proc(&name)
             {
                 missing.push(name);
             }

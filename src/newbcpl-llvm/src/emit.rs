@@ -124,6 +124,18 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
         for f in &ir.functions {
             self.declare_function(f);
         }
+        // Pass 1b: declare every ASM procedure with its correct
+        // typed signature *before* any function body is emitted.
+        // Function bodies (pass 3 below) auto-declare unresolved
+        // callees via the default `i64 fn(i64, …, i64)` path in
+        // `declare_extern`; without this pre-pass, an ASM proc that
+        // returns f64 or takes XMM-routed FLOAT params would get
+        // the wrong type the first time a caller is lowered, and
+        // pass 4 would silently skip it (already present in
+        // `by_name`).
+        for proc in &ir.asm_procs {
+            self.declare_asm_proc(proc);
+        }
         // Pass 2: emit a mutable, externally-linked vtable global
         // per class with vtable slots. Following NewCP's recipe
         // (see `newcp-llvm/src/module.rs` and `jit.rs`): MCJIT's
@@ -146,6 +158,23 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
         // functions since ValueIds and BlockIds are function-local.
         for f in &ir.functions {
             self.emit_function(f);
+        }
+        // Pass 4: emit each ASM procedure body as a `module asm`
+        // blob. The matching `declare`s went out in pass 1b above so
+        // pass 3's call sites typecheck against the right signature;
+        // here we only append the bodies. Inkwell 0.9 exposes
+        // `set_inline_assembly` (which replaces); we use
+        // `LLVMAppendModuleInlineAsm` directly so multiple ASM
+        // procs accumulate.
+        for proc in &ir.asm_procs {
+            let asm_str = new_asm::build_module_asm_string(proc);
+            unsafe {
+                inkwell::llvm_sys::core::LLVMAppendModuleInlineAsm(
+                    self.module.as_mut_ptr(),
+                    asm_str.as_ptr() as *const std::ffi::c_char,
+                    asm_str.len(),
+                );
+            }
         }
     }
 
@@ -336,6 +365,58 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
 
     // ─── declarations ───────────────────────────────────────────
 
+    /// Emit a `declare` for an ASM procedure so callers in the same
+    /// module can type-check calls. The body lives in the `module asm`
+    /// blob appended in pass 4 of `emit_module`; the assembler resolves
+    /// `<name>:` against this `declare` at MCJIT link time.
+    ///
+    /// No `uwtable` attribute is set: a `declare` has no body LLVM can
+    /// emit unwind info for, and the runtime assembler does not emit
+    /// `.pdata` / `.xdata` for our hand-written stubs. Programs that
+    /// want a Windows SEH-unwindable hot loop should write a proper
+    /// BCPL function and call out to ASM for inner kernels.
+    fn declare_asm_proc(&mut self, proc: &new_asm::AsmProc) {
+        if self.by_name.contains_key(&proc.name) {
+            return;
+        }
+        let param_types: Vec<BasicMetadataTypeEnum> = proc
+            .params
+            .iter()
+            .map(|p| self.asm_type_to_basic(p.ty).into())
+            .collect();
+        let fn_type = match proc.return_type {
+            new_asm::AsmRetType::Word => self.context.i64_type().fn_type(&param_types, false),
+            new_asm::AsmRetType::Float => self.context.f64_type().fn_type(&param_types, false),
+            new_asm::AsmRetType::FQuad => self
+                .context
+                .f32_type()
+                .vec_type(4)
+                .fn_type(&param_types, false),
+            new_asm::AsmRetType::FOct => self
+                .context
+                .f32_type()
+                .vec_type(8)
+                .fn_type(&param_types, false),
+            new_asm::AsmRetType::Void => self.context.void_type().fn_type(&param_types, false),
+        };
+        let fv = self
+            .module
+            .add_function(&proc.name, fn_type, Some(Linkage::External));
+        self.by_name.insert(proc.name.clone(), fv);
+    }
+
+    /// Map an `AsmType` register class to the matching LLVM basic type.
+    /// Mirrors the parameter side of `declare_asm_proc` so the
+    /// `declare` and the call-site coercions in `coerce_arg` agree.
+    fn asm_type_to_basic(&self, ty: new_asm::AsmType) -> BasicTypeEnum<'ctx> {
+        match ty {
+            new_asm::AsmType::Word => self.context.i64_type().into(),
+            new_asm::AsmType::Float => self.context.f64_type().into(),
+            new_asm::AsmType::FQuad => self.context.f32_type().vec_type(4).into(),
+            new_asm::AsmType::FOct => self.context.f32_type().vec_type(8).into(),
+        }
+    }
+
     fn declare_function(&mut self, f: &IrFunction) -> FunctionValue<'ctx> {
         if let Some(&existing) = self.by_name.get(&f.name) {
             return existing;
@@ -506,6 +587,115 @@ impl<'ctx, 'l> Emitter<'ctx, 'l> {
             //   iGui_TextSetPen(id, fg, bg)       -> i64
             //   iGui_TextResetPen(id)             -> i64
             //   iGui_TextShowCaret(id, visible)   -> i64
+
+            // NewAudio shims in newbcpl-runtime/src/audio.rs. Slot
+            // and waveform-code arguments are i64; frequencies,
+            // durations, volumes, envelope params are f64 (so Win64
+            // routes them through XMM registers). Match arms below
+            // are grouped by parameter shape.
+
+            // Preset SFX: (slot, p1, p2) -> i64.
+            "Sound_Beep"
+            | "Sound_Coin"
+            | "Sound_Jump"
+            | "Sound_Explode"
+            | "Sound_BigExplode"
+            | "Sound_SmallExplode"
+            | "Sound_DistantExplode"
+            | "Sound_MetalExplode"
+            | "Sound_Zap"
+            | "Sound_Shoot"
+            | "Sound_Powerup"
+            | "Sound_Hurt"
+            | "Sound_Click"
+            | "Sound_Bang"
+            | "Sound_Blip"
+            | "Sound_Pickup" => {
+                i64_t.fn_type(&[i64_t.into(), f64_t.into(), f64_t.into()], false)
+            }
+            // Sweeps: (slot, start_freq, end_freq, duration) -> i64.
+            "Sound_SweepUp" | "Sound_SweepDown" => i64_t.fn_type(
+                &[i64_t.into(), f64_t.into(), f64_t.into(), f64_t.into()],
+                false,
+            ),
+            // (slot, seed, duration) -> i64.
+            "Sound_RandomBeep" => {
+                i64_t.fn_type(&[i64_t.into(), i64_t.into(), f64_t.into()], false)
+            }
+            // (slot, freq, duration, waveform) -> i64.
+            "Sound_Tone" => i64_t.fn_type(
+                &[i64_t.into(), f64_t.into(), f64_t.into(), i64_t.into()],
+                false,
+            ),
+            // (slot, midi, duration, waveform, a, d, s, r) -> i64.
+            "Sound_Note" => i64_t.fn_type(
+                &[
+                    i64_t.into(), i64_t.into(), f64_t.into(), i64_t.into(),
+                    f64_t.into(), f64_t.into(), f64_t.into(), f64_t.into(),
+                ],
+                false,
+            ),
+            // (slot, noiseType, duration) -> i64.
+            "Sound_Noise" => {
+                i64_t.fn_type(&[i64_t.into(), i64_t.into(), f64_t.into()], false)
+            }
+            // (slot, carrier, modulator, modIndex, duration) -> i64.
+            "Sound_FM" => i64_t.fn_type(
+                &[
+                    i64_t.into(), f64_t.into(), f64_t.into(), f64_t.into(),
+                    f64_t.into(),
+                ],
+                false,
+            ),
+            // (slot, freq, duration, waveform, p1, p2, p3) -> i64.
+            "Sound_Reverb" | "Sound_Delay" | "Sound_Distort" => i64_t.fn_type(
+                &[
+                    i64_t.into(), f64_t.into(), f64_t.into(), i64_t.into(),
+                    f64_t.into(), f64_t.into(), f64_t.into(),
+                ],
+                false,
+            ),
+            // (slot, freq, duration, waveform, filterType, cutoff,
+            //  resonance) -> i64.
+            "Sound_FilterTone" => i64_t.fn_type(
+                &[
+                    i64_t.into(), f64_t.into(), f64_t.into(), i64_t.into(),
+                    i64_t.into(), f64_t.into(), f64_t.into(),
+                ],
+                false,
+            ),
+            // (slot, midi, duration, waveform, a, d, s, r,
+            //  filterType, cutoff, resonance) -> i64.
+            "Sound_FilterNote" => i64_t.fn_type(
+                &[
+                    i64_t.into(), i64_t.into(), f64_t.into(), i64_t.into(),
+                    f64_t.into(), f64_t.into(), f64_t.into(), f64_t.into(),
+                    i64_t.into(), f64_t.into(), f64_t.into(),
+                ],
+                false,
+            ),
+            // (slot, volume, pan) -> i64.
+            "Sound_Play" => {
+                i64_t.fn_type(&[i64_t.into(), f64_t.into(), f64_t.into()], false)
+            }
+            // (volume) -> i64.
+            "Sound_SetVolume" | "Music_SetVolume" => i64_t.fn_type(&[f64_t.into()], false),
+            // () -> f64.
+            "Sound_GetVolume" | "Music_GetVolume" => f64_t.fn_type(&[], false),
+            // (slot) -> f64.
+            "Sound_Duration" | "Music_Tempo" => f64_t.fn_type(&[i64_t.into()], false),
+            // (slot, abc_string_ptr) -> i64.
+            "Music_Load" => i64_t.fn_type(&[i64_t.into(), ptr_t.into()], false),
+            // (slot, volume) -> i64.
+            "Music_Play" => i64_t.fn_type(&[i64_t.into(), f64_t.into()], false),
+
+            // All-i64 audio shims fall through to the default below:
+            //   Sound_StopAll(), Sound_Free(slot), Sound_FreeAll(),
+            //   Sound_Count(), Sound_Playing(slot),
+            //   Music_StopAll() / PauseAll() / ResumeAll(),
+            //   Music_Free(slot), Music_FreeAll(),
+            //   Music_Count(), Music_State(), Music_Playing(slot).
+
             // Default: i64 fn(i64, ..., i64).
             _ => {
                 let args: Vec<BasicMetadataTypeEnum> =
