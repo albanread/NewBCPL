@@ -1,5 +1,8 @@
 # NewBCPL
 
+**Under development, and incomplete**
+This is a JIT not designed to create executable files yet.
+
 NewBCPL is a recreation of the modern BCPL dialect prototyped at [github.com/albanread/NBCPL](https://github.com/albanread/NBCPL). Built on Rust + LLVM, targeted at `x86_64-pc-windows-msvc`, with an integrated Direct2D + DirectWrite GUI in the spirit of [NewCP's iGui](../NewCP/NewCP/README.md).
 
 The design contract is in [`docs/manifesto.md`](docs/manifesto.md); the K&R-style user guide is [`docs/user_guide.md`](docs/user_guide.md). The reference implementation under `reference/` is the language specification this workspace builds against.
