@@ -90,6 +90,6 @@ newbcpl-driver bootstrap                (loader status)
 
 ## Lineage
 
-The original NBCPL is developed at [github.com/albanread/NBCPL](https://github.com/albanread/NBCPL), targeting Apple Silicon ARM64. NewBCPL is its Windows-first, LLVM-backed successor by the same author. Sister project: [NewCP](../NewCP/NewCP/README.md), recreating Component Pascal on the same toolchain.
+The original NBCPL is developed at [github.com/albanread/NBCPL](https://github.com/albanread/NBCPL), targeting Apple Silicon ARM64. NewBCPL is its Windows-first, LLVM-backed successor.
 
-The author wrote production BCPL on TRIPOS / 68000 minicomputers; the surface aesthetic comes from that era. NewBCPL is not affiliated with any historical BCPL implementation.
+ 
